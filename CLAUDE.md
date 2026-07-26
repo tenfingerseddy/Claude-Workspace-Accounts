@@ -42,6 +42,40 @@ directory is correct behaviour, and blocking there would prevent the user from e
 blocks on genuine identity mismatch, `warn` binds and never blocks, `off` disables the binding. The UI
 does not ask — it uses `claudeAccountGuard.defaultLockMode`.
 
+### Identity verification barely works, and nothing may depend on it
+
+Verified by hand against Claude Code 2.1.220's bundled binary: `claude auth status` stops reporting
+account identity whenever `CLAUDE_CONFIG_DIR` is set — **even when set to the directory that was
+already the default**. `subscriptionType` survives; `email`, `orgId` and `orgName` come back `null`.
+There has never been an `accountId` field.
+
+```
+$ claude auth status                                    -> "email":"someone@example.com","orgId":"..."
+$ CLAUDE_CONFIG_DIR=<the same default dir> claude auth status  -> "email":null,"orgId":null
+```
+
+Since binding always sets `CLAUDE_CONFIG_DIR`, `compareIdentity` yields `unverifiable` for every bound
+profile, so mismatch can never actually be detected and `enforce` is in practice identical to `warn`.
+
+This shipped as a hard failure: `AuthVerifier.verify()` always set the variable, so every verification
+returned no identity, and `confirmIdentity` rejected any result lacking an email or account ID — which
+made "Register Current Account" **impossible**, and left profiles without `expectedIdentity`, which the
+old lock command then filtered out. Three layers, one root cause.
+
+Rules that follow:
+
+- **Never gate registration, binding, or any user action on identity being available.** Signed-in with
+  no identity details is a normal, registrable state, not an error.
+- Verify **without** setting `CLAUDE_CONFIG_DIR` when the profile is the ambient default, which is the
+  one case where real identity is obtainable.
+- Keep `compareIdentity` and the mismatch paths — they are correct and will start working if the CLI
+  reports those fields again. Just never depend on them.
+- Say so in the UI and docs. Do not imply Account Guard can detect a bound directory being
+  re-authenticated as somebody else, because on this CLI it cannot.
+
+Whether this is intended CLI behaviour or an upstream bug is unknown — `subscriptionType` surviving
+while `email` does not looks more like a bug. Either way, build for its absence.
+
 ### What this is not
 
 With fail-open behaviour this is a convenience and safety mechanism, **not a security boundary**. It

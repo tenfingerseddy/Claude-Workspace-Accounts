@@ -28,4 +28,12 @@ describe("dashboard message validation", () => {
     expect(parseDashboardMessage({ type: "switchProfile", profileId: "../secret" })).toBeUndefined();
     expect(parseDashboardMessage({ type: "execute", command: "rm" })).toBeUndefined();
   });
+
+  it("accepts the collection-fix action the empty state offers", () => {
+    expect(parseDashboardMessage({ type: "collectionAction" }))
+      .toEqual({ type: "collectionAction" });
+    expect(parseDashboardMessage({ type: "collectionAction", command: "calc.exe" }))
+      .toEqual({ type: "collectionAction" });
+    expect(parseDashboardMessage({ type: "retry" })).toEqual({ type: "retry" });
+  });
 });

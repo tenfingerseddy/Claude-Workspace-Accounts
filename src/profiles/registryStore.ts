@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { CollectionDegradationReason } from "../core/models.js";
 import type {
   AccountProfile,
   CollectorRegistration,
@@ -20,11 +21,26 @@ export interface SupportPaths {
   handoffs: string;
 }
 
-export function resolveSupportPaths(fallbackRoot: string): SupportPaths {
+export interface SupportPathOptions {
+  /** Only consulted when %LOCALAPPDATA% is unavailable, which on Windows is essentially never. */
+  fallbackRoot: string;
+  /**
+   * An explicit support root, overriding %LOCALAPPDATA%.
+   *
+   * Anything that must not touch a real installation has to pass this. The earlier signature took
+   * only a fallback root and silently discarded it whenever %LOCALAPPDATA% was set, so a test that
+   * passed a temporary directory still resolved to the developer's own registry — and duly
+   * corrupted it. Requiring the override to be named makes that mistake impossible to make quietly.
+   */
+  root?: string;
+}
+
+export function resolveSupportPaths(options: SupportPathOptions): SupportPaths {
   const localAppData = process.env.LOCALAPPDATA;
-  const root = localAppData
-    ? path.join(localAppData, "ClaudeAccountGuard")
-    : path.join(fallbackRoot, "shared");
+  const root = options.root
+    ?? (localAppData
+      ? path.join(localAppData, "ClaudeAccountGuard")
+      : path.join(options.fallbackRoot, "shared"));
   return {
     root,
     registry: path.join(root, "registry.json"),
@@ -209,10 +225,72 @@ function validateRegistry(value: unknown): SharedRegistryDocument {
   return value as unknown as SharedRegistryDocument;
 }
 
+/**
+ * Cross-process write coordination.
+ *
+ * The in-process queue only serialises writers inside one extension host. Multiple VS Code windows
+ * read-modify-write the whole document, so an older read could clobber a newer collector
+ * registration or profile edit — atomic rename protects a reader from half-written JSON but does
+ * nothing about a lost update, and the wrapper then finds no collector or a stale one.
+ *
+ * Two defences, in order. A lock file makes the read-modify-write sequence mutually exclusive; a
+ * revision check catches the lost update anyway if the lock had to be bypassed. Both are bounded:
+ * contention must never be able to stop the extension from activating, so every path here fails
+ * open and proceeds rather than throwing.
+ */
+const LOCK_STALE_AFTER_MS = 5_000;
+const LOCK_MAX_WAIT_MS = 2_000;
+const LOCK_RETRY_DELAY_MS = 25;
+const MUTATE_MAX_ATTEMPTS = 5;
+
+type WriteDiagnostics = Partial<Record<CollectionDegradationReason, number>>;
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+function isProcessAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+export type CreateProfileOutcome = "created" | "duplicate_id" | "duplicate_config_dir";
+
 export class ProfileRegistry {
   private queue: Promise<unknown> = Promise.resolve();
+  private readonly diagnostics: WriteDiagnostics = {};
 
   public constructor(public readonly paths: SupportPaths) {}
+
+  private get lockPath(): string {
+    return `${this.paths.registry}.lock`;
+  }
+
+  private note(reason: CollectionDegradationReason): void {
+    this.diagnostics[reason] = (this.diagnostics[reason] ?? 0) + 1;
+  }
+
+  /**
+   * Hand over the contention counters and reset them. The collector mirrors these into the usage
+   * database on each heartbeat so that lock contention and lost updates are visible in diagnostics
+   * instead of being absorbed silently.
+   */
+  public drainWriteDiagnostics(): WriteDiagnostics {
+    const drained = { ...this.diagnostics };
+    for (const key of Object.keys(this.diagnostics)) {
+      delete this.diagnostics[key as CollectionDegradationReason];
+    }
+    return drained;
+  }
 
   public async initialize(): Promise<void> {
     await Promise.all([
@@ -253,6 +331,76 @@ export class ProfileRegistry {
       } else {
         document.profiles.push(profile);
       }
+    });
+  }
+
+  /**
+   * Create a profile, refusing duplicates inside the mutation lock.
+   *
+   * Uniqueness has to be decided here rather than by the caller: a caller checks, then puts
+   * prompts and a `claude auth status` probe between the check and the write, which is long
+   * enough for another window to register the same configuration directory.
+   */
+  public async createProfile(profile: AccountProfile): Promise<CreateProfileOutcome> {
+    let outcome: CreateProfileOutcome = "created";
+    await this.mutate((document) => {
+      outcome = "created";
+      if (document.profiles.some((candidate) => candidate.id === profile.id)) {
+        outcome = "duplicate_id";
+        return;
+      }
+      const existing = document.profiles.find((candidate) =>
+        candidate.configDirNormalized === profile.configDirNormalized);
+      if (existing) {
+        outcome = "duplicate_config_dir";
+        return;
+      }
+      document.profiles.push(profile);
+    });
+    return outcome;
+  }
+
+  /**
+   * Merge a few fields into one stored profile, inside the mutation lock.
+   *
+   * Whole-object upserts of a profile read before a prompt silently discarded whatever
+   * another window wrote in the meantime — identity confirmation and telemetry enablement
+   * erased each other. Only the named fields are touched here.
+   */
+  public async patchProfile(
+    profileId: string,
+    patch: Partial<Omit<AccountProfile, "id">>
+  ): Promise<boolean> {
+    let applied = false;
+    await this.mutate((document) => {
+      applied = false;
+      const index = document.profiles.findIndex((candidate) => candidate.id === profileId);
+      const current = document.profiles[index];
+      if (index < 0 || !current) {
+        return;
+      }
+      const next: AccountProfile = { ...current, ...patch, id: current.id };
+      for (const [field, value] of Object.entries(patch)) {
+        if (value === undefined) {
+          delete (next as unknown as Record<string, unknown>)[field];
+        }
+      }
+      document.profiles[index] = next;
+      applied = true;
+    });
+    return applied;
+  }
+
+  /** Merge a few integration fields, inside the mutation lock, for the same reason. */
+  public async patchIntegration(patch: Partial<WrapperIntegration>): Promise<void> {
+    await this.mutate((document) => {
+      const next: WrapperIntegration = { ...document.integration, ...patch };
+      for (const [field, value] of Object.entries(patch)) {
+        if (value === undefined) {
+          delete (next as unknown as Record<string, unknown>)[field];
+        }
+      }
+      document.integration = next;
     });
   }
 
@@ -319,15 +467,116 @@ export class ProfileRegistry {
   }
 
   private async mutate(mutator: (document: SharedRegistryDocument) => void): Promise<void> {
-    const operation = this.queue.then(async () => {
-      const document = await this.read();
-      mutator(document);
-      document.revision += 1;
-      document.updatedAt = new Date().toISOString();
-      await this.write(document);
-    });
+    const operation = this.queue.then(() => this.mutateAcrossProcesses(mutator));
     this.queue = operation.catch(() => undefined);
     await operation;
+  }
+
+  private async mutateAcrossProcesses(
+    mutator: (document: SharedRegistryDocument) => void
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= MUTATE_MAX_ATTEMPTS; attempt += 1) {
+      const lock = await this.acquireLock();
+      try {
+        const document = await this.read();
+        const baseRevision = document.revision;
+        mutator(document);
+        document.revision = baseRevision + 1;
+        document.updatedAt = new Date().toISOString();
+        await this.write(document);
+        // Confirm our revision is the one on disk. Under the lock this always holds; when the lock
+        // had to be bypassed, this is what turns a silent lost update into a retry.
+        if ((await this.read()).revision === document.revision) {
+          return;
+        }
+        this.note("registry_write_conflict");
+      } finally {
+        // Validation and I/O failures propagate through here untouched: a malformed registry must
+        // stay fail-closed, and retrying an invalid mutation five times would only delay the error.
+        await lock.release();
+      }
+      if (attempt < MUTATE_MAX_ATTEMPTS) {
+        this.note("registry_write_retried");
+        await delay(LOCK_RETRY_DELAY_MS * attempt + Math.floor(Math.random() * 20));
+      }
+    }
+    this.note("registry_write_failed");
+    throw new Error(
+      "The shared registry is being changed by another VS Code window; the update was not applied."
+    );
+  }
+
+  /**
+   * Take the cross-process lock, or give up and proceed without it.
+   *
+   * `held: false` is a deliberate outcome, not a failure: blocking activation on a lock another
+   * process may never release would be far worse than one racy write that the revision check will
+   * catch and retry.
+   */
+  private async acquireLock(): Promise<{ held: boolean; release: () => Promise<void> }> {
+    const deadline = Date.now() + LOCK_MAX_WAIT_MS;
+    let contended = false;
+    for (;;) {
+      try {
+        // "wx" fails if the file exists, which is the atomic test-and-set this needs.
+        const handle = await open(this.lockPath, "wx", 0o600);
+        try {
+          await handle.writeFile(
+            JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }),
+            "utf8"
+          );
+        } finally {
+          await handle.close();
+        }
+        if (contended) {
+          this.note("registry_lock_contended");
+        }
+        return {
+          held: true,
+          release: async () => {
+            await rm(this.lockPath, { force: true }).catch(() => undefined);
+          }
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          // Cannot create a lock at all (read-only directory, antivirus). Proceed unlocked.
+          return { held: false, release: async () => undefined };
+        }
+        contended = true;
+        if (await this.stealIfStale()) {
+          continue;
+        }
+        if (Date.now() >= deadline) {
+          this.note("registry_lock_contended");
+          return { held: false, release: async () => undefined };
+        }
+        await delay(LOCK_RETRY_DELAY_MS);
+      }
+    }
+  }
+
+  /** Reclaim a lock whose owner has died or which is old enough that no live holder can be waiting. */
+  private async stealIfStale(): Promise<boolean> {
+    try {
+      const info = await stat(this.lockPath);
+      let owner: unknown;
+      try {
+        owner = (JSON.parse(await readFile(this.lockPath, "utf8")) as { pid?: unknown }).pid;
+      } catch {
+        owner = undefined;
+      }
+      const expired = Date.now() - info.mtimeMs > LOCK_STALE_AFTER_MS;
+      const ownerGone = owner !== undefined && owner !== process.pid && !isProcessAlive(owner);
+      if (!expired && !ownerGone) {
+        return false;
+      }
+      await rm(this.lockPath, { force: true });
+      this.note("registry_lock_stolen");
+      return true;
+    } catch {
+      // Someone else won the race to remove it; retrying the create is the correct next step.
+      return false;
+    }
   }
 
   private async write(document: SharedRegistryDocument): Promise<void> {

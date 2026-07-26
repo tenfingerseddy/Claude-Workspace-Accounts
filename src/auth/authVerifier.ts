@@ -3,6 +3,8 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import * as vscode from "vscode";
 import type { AccountProfile, AuthVerification } from "../core/models.js";
+import { normalizeWindowsPath } from "../core/paths.js";
+import { defaultConfigDirectory, shouldInheritAmbientConfig } from "./authEnvironment.js";
 import { parseAuthStatus } from "./authSchema.js";
 
 interface CacheEntry {
@@ -122,7 +124,7 @@ export class AuthVerifier {
     const result = await runProcess(
       binary,
       ["auth", "status"],
-      { ...process.env, CLAUDE_CONFIG_DIR: profile.configDir },
+      this.environmentFor(profile),
       15_000
     );
     let verification: AuthVerification;
@@ -160,6 +162,28 @@ export class AuthVerifier {
       verification
     });
     return verification;
+  }
+
+  /**
+   * The environment for one probe.
+   *
+   * For the account the CLI would use anyway, the variable is left unset so the response still
+   * carries an email and organization. For every other account it has to be set, and the
+   * response will be identity-free — that is a CLI behaviour, not a failure, and callers must
+   * treat it as a signed-in account they can use.
+   */
+  private environmentFor(profile: AccountProfile): NodeJS.ProcessEnv {
+    const ambient = shouldInheritAmbientConfig({
+      profileConfigDirNormalized: profile.configDirNormalized,
+      ambientConfigDir: process.env.CLAUDE_CONFIG_DIR,
+      defaultConfigDirNormalized: normalizeWindowsPath(defaultConfigDirectory())
+    });
+    if (!ambient) {
+      return { ...process.env, CLAUDE_CONFIG_DIR: profile.configDir };
+    }
+    const environment = { ...process.env };
+    delete environment.CLAUDE_CONFIG_DIR;
+    return environment;
   }
 
   public async login(profile: AccountProfile, token?: vscode.CancellationToken): Promise<void> {

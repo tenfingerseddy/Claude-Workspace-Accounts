@@ -8,7 +8,11 @@ export type DashboardMessage =
   | { type: "switchProfile"; profileId: string }
   | { type: "changeLock" }
   | { type: "refresh" }
-  | { type: "export"; profileId?: string };
+  | { type: "export"; profileId?: string }
+  /** Run the single fix the dashboard's collection diagnosis is offering. */
+  | { type: "collectionAction" }
+  /** Rebuild the panel after a failure, without re-verifying the account. */
+  | { type: "retry" };
 
 function validProfileId(value: unknown): value is string {
   return typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
@@ -61,6 +65,12 @@ export function parseDashboardMessage(value: unknown): DashboardMessage | undefi
   }
   if (message.type === "refresh") {
     return { type: "refresh" };
+  }
+  if (message.type === "collectionAction") {
+    return { type: "collectionAction" };
+  }
+  if (message.type === "retry") {
+    return { type: "retry" };
   }
   if (message.type === "export"
     && (message.profileId === undefined || validProfileId(message.profileId))) {

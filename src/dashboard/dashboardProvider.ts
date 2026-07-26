@@ -3,14 +3,46 @@ import * as vscode from "vscode";
 import type {
   DashboardData,
   DashboardDateBounds,
-  DashboardRange
+  DashboardRange,
+  SharedRegistryDocument
 } from "../core/models.js";
-import { compareIdentity } from "../core/identity.js";
+import { bindingIdentityState } from "../core/statusState.js";
+import type { CollectionDiagnosis, WrapperState } from "../commands/uxModel.js";
+import type { BindingIdentityState } from "../core/statusState.js";
 import type { WorkspaceLockService } from "../locks/workspaceLockService.js";
 import type { ProfileRegistry } from "../profiles/registryStore.js";
 import type { RuntimeProfileDetector } from "../profiles/runtimeProfileDetector.js";
 import type { UsageRepository } from "../storage/usageRepository.js";
 import { parseDashboardMessage } from "./dashboardMessages.js";
+
+/**
+ * The parts of the command controller the dashboard needs. Declared as an interface so the
+ * dashboard can explain and fix an empty state without importing the controller itself.
+ */
+export interface DashboardActions {
+  collectionDiagnosis(
+    document: SharedRegistryDocument,
+    selectedProfileId?: string
+  ): CollectionDiagnosis;
+  runCollectionAction(diagnosis: CollectionDiagnosis): Promise<void>;
+  wrapperState(): WrapperState;
+}
+
+interface DashboardPayload extends DashboardData {
+  setup: {
+    /** How the bound account's identity compares with the one recorded for it. */
+    identityState: BindingIdentityState;
+    /** The account this workspace is bound to, if any. */
+    boundProfileName?: string;
+    workspaceLabel?: string;
+    /** True when the account in play here is one Account Guard knows about. */
+    runtimeRegistered: boolean;
+    runtimeConfigDir: string;
+    wrapperState: WrapperState;
+    profileTelemetryEnabled: boolean;
+    collection: CollectionDiagnosis;
+  };
+}
 
 const PROFILE_STATE_KEY = "dashboard.selectedProfileId";
 const RANGE_STATE_KEY = "dashboard.range";
@@ -32,6 +64,7 @@ function localDate(offsetDays = 0): string {
 
 export class DashboardProvider implements vscode.Disposable {
   private panel?: vscode.WebviewPanel;
+  private actions?: DashboardActions;
   private selectedProfileId?: string;
   private range: DashboardRange;
   private threadScope: "main" | "all";
@@ -42,7 +75,8 @@ export class DashboardProvider implements vscode.Disposable {
     private readonly registry: ProfileRegistry,
     private readonly repository: UsageRepository,
     private readonly runtimeDetector: RuntimeProfileDetector,
-    private readonly lockService: WorkspaceLockService
+    private readonly lockService: WorkspaceLockService,
+    private readonly log: (message: string) => void = () => undefined
   ) {
     this.selectedProfileId = context.globalState.get<string>(PROFILE_STATE_KEY);
     this.range = context.globalState.get<DashboardRange>(
@@ -60,6 +94,11 @@ export class DashboardProvider implements vscode.Disposable {
       from: context.globalState.get<string>(CUSTOM_FROM_STATE_KEY, localDate(-6)),
       to: context.globalState.get<string>(CUSTOM_TO_STATE_KEY, localDate())
     };
+  }
+
+  /** Wired after commands are registered so the dashboard can offer the fix it names. */
+  public useController(actions: DashboardActions): void {
+    this.actions = actions;
   }
 
   public async open(profileId?: string): Promise<void> {
@@ -80,7 +119,13 @@ export class DashboardProvider implements vscode.Disposable {
       this.panel.iconPath = vscode.Uri.file(this.context.asAbsolutePath("resources/icon.svg"));
       this.panel.webview.html = this.html(this.panel.webview);
       this.panel.webview.onDidReceiveMessage(
-        (raw) => void this.receiveMessage(raw),
+        // A rejected action used to disappear entirely: the button appeared to do nothing.
+        (raw) => void this.receiveMessage(raw).catch((error: unknown) => {
+          this.log(`Dashboard action failed: ${error instanceof Error ? error.message : "unknown error"}`);
+          void vscode.window.showWarningMessage(
+            `That dashboard action did not complete: ${error instanceof Error ? error.message : "unknown error"}`
+          );
+        }),
         undefined,
         this.context.subscriptions
       );
@@ -93,14 +138,29 @@ export class DashboardProvider implements vscode.Disposable {
     await this.refresh();
   }
 
+  /**
+   * Push fresh data, or an explicit failure.
+   *
+   * Refreshes are fire-and-forget from several call sites, so a throw here used to leave
+   * the panel stuck on "Loading local account usage…" with no explanation at all.
+   */
   public async refresh(): Promise<void> {
     if (!this.panel) {
       return;
     }
-    await this.panel.webview.postMessage({
-      type: "dashboardData",
-      payload: await this.buildData()
-    });
+    let payload: DashboardPayload;
+    try {
+      payload = await this.buildData();
+    } catch (error) {
+      await this.panel.webview.postMessage({
+        type: "dashboardError",
+        message: error instanceof Error ? error.message : "Unknown error"
+      }).then(undefined, () => undefined);
+      return;
+    }
+    await this.panel.webview
+      .postMessage({ type: "dashboardData", payload })
+      .then(undefined, () => undefined);
   }
 
   public dispose(): void {
@@ -152,10 +212,24 @@ export class DashboardProvider implements vscode.Disposable {
       case "export":
         await vscode.commands.executeCommand("claudeAccountGuard.exportUsage", message.profileId);
         break;
+      case "retry":
+        await this.refresh();
+        break;
+      case "collectionAction": {
+        if (this.actions) {
+          const diagnosis = this.actions.collectionDiagnosis(
+            await this.registry.read(),
+            this.selectedProfileId
+          );
+          await this.actions.runCollectionAction(diagnosis);
+        }
+        await this.refresh();
+        break;
+      }
     }
   }
 
-  private async buildData(): Promise<DashboardData> {
+  private async buildData(): Promise<DashboardPayload> {
     const document = await this.registry.read();
     const runtime = this.runtimeDetector.detect(document.profiles);
     const selected = document.profiles.find((profile) => profile.id === this.selectedProfileId)
@@ -166,15 +240,22 @@ export class DashboardProvider implements vscode.Disposable {
     const requiredProfile = lock
       ? document.profiles.find((profile) => profile.id === lock.profileId)
       : undefined;
-    const runtimeVerification = runtime.profile
-      ? this.repository.latestAuthVerification(runtime.profile.id)
+    // The wrapper sets CLAUDE_CONFIG_DIR per launch, so the account in play here is the
+    // bound one when there is a binding, not whatever this window inherited.
+    const bound = lock && lock.mode !== "off" ? requiredProfile : undefined;
+    const activeProfile = bound ?? runtime.profile;
+    const runtimeVerification = activeProfile
+      ? this.repository.latestAuthVerification(activeProfile.id)
       : undefined;
-    const lockCompatible = !lock
-      || lock.mode === "off"
-      || (runtime.profile?.id === lock.profileId
-        && requiredProfile?.expectedIdentity !== undefined
-        && runtimeVerification !== undefined
-        && compareIdentity(requiredProfile.expectedIdentity, runtimeVerification) === "match");
+    // One shared status model: only a real mismatch is a problem. Signed-out and
+    // "the CLI reported no identity" both allow the launch, and the dashboard used to render
+    // them as a wrong account.
+    const identityState = bindingIdentityState({
+      lock,
+      boundProfile: bound,
+      verification: runtimeVerification
+    });
+    const lockCompatible = identityState !== "mismatch";
     const current = selected ? this.repository.latestStatusSnapshot(selected.id) : undefined;
     const health = selected ? this.repository.collectorHealth(selected.id) : {};
     const lastEventAge = health.lastEventAt ? Date.now() - Date.parse(health.lastEventAt) : Infinity;
@@ -183,7 +264,7 @@ export class DashboardProvider implements vscode.Disposable {
       generatedAt: new Date().toISOString(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       selectedProfileId: selected?.id,
-      runtimeProfileId: runtime.profile?.id,
+      runtimeProfileId: activeProfile?.id,
       range: this.range,
       customRange: this.customRange,
       threadScope: this.threadScope,
@@ -212,7 +293,7 @@ export class DashboardProvider implements vscode.Disposable {
         requiredEmail: requiredProfile?.expectedIdentity?.email,
         requiredOrganization: requiredProfile?.expectedIdentity?.organizationName
           ?? requiredProfile?.expectedIdentity?.organizationId,
-        runtimeProfileName: runtime.profile?.displayName,
+        runtimeProfileName: activeProfile?.displayName,
         runtimeEmail: runtimeVerification?.email,
         runtimeOrganization: runtimeVerification?.organizationName
           ?? runtimeVerification?.organizationId,
@@ -252,6 +333,21 @@ export class DashboardProvider implements vscode.Disposable {
               : "inactive",
         lastEventAt: health.lastEventAt,
         source: "Local status snapshots and privacy-minimized OpenTelemetry"
+      },
+      setup: {
+        identityState,
+        boundProfileName: bound?.displayName,
+        workspaceLabel: lock?.workspaceLabel,
+        runtimeRegistered: Boolean(activeProfile),
+        runtimeConfigDir: activeProfile?.configDir ?? runtime.configDir,
+        wrapperState: this.actions?.wrapperState() ?? "none",
+        profileTelemetryEnabled: selected?.telemetryEnabled === true,
+        collection: this.actions?.collectionDiagnosis(document, selected?.id) ?? {
+          state: current ? "active" : "awaiting_data",
+          headline: current ? "Collecting locally" : "Waiting for the first Claude response",
+          detail: "Collection state is unavailable in this window.",
+          action: "none"
+        }
       }
     };
   }
@@ -503,9 +599,17 @@ export class DashboardProvider implements vscode.Disposable {
     function render(data) {
       const selected = profile(data);
       if (!selected) {
-        app.innerHTML = '<div class="empty"><div><h1>No account profiles yet</h1><p>Use “Claude Account Guard: Add Account Profile” from the Command Palette.</p></div></div>';
+        app.innerHTML = \`<div class="empty"><div><h1>Nothing is being collected yet</h1>
+          <p>\${esc(data.setup.collection.headline)}</p>
+          <p class="meta">\${esc(data.setup.collection.detail)}</p>
+          \${data.setup.collection.actionLabel ? '<p><button id="collection-action">'+esc(data.setup.collection.actionLabel)+'</button></p>' : ''}
+        </div></div>\`;
+        document.getElementById('collection-action')?.addEventListener('click', () => vscode.postMessage({ type: 'collectionAction' }));
         return;
       }
+      const setupBanner = data.setup.collection.state === 'active'
+        ? ''
+        : \`<div class="lockline \${data.setup.collection.state === 'blocked' ? 'error' : ''}"><strong>\${esc(data.setup.collection.headline)}</strong><div class="meta">\${esc(data.setup.collection.detail)}</div>\${data.setup.collection.actionLabel ? '<div class="toolbar spaced"><button id="collection-action">'+esc(data.setup.collection.actionLabel)+'</button></div>' : ''}</div>\`;
       const models = [...new Set(data.daily.map(row => row.model).filter(Boolean))].sort();
       const workspaces = [...new Set(data.daily.map(row => row.workspaceLabel).filter(Boolean))].sort();
       if (modelFilter !== 'all' && !models.includes(modelFilter)) modelFilter = 'all';
@@ -520,13 +624,13 @@ export class DashboardProvider implements vscode.Disposable {
       const used = current?.contextWindow?.usedPercentage;
       const lock = data.lock
         ? data.lock.compatible
-          ? \`<div class="lockline"><strong>Workspace lock matches the account in play</strong> · \${esc(data.lock.workspaceLabel)} requires \${esc(data.lock.profileName || data.lock.profileId)} (\${esc(data.lock.mode)})</div>\`
-          : \`<div class="lockline error"><strong>Workspace account mismatch · \${esc(data.lock.mode)}</strong><div class="grid secondary-grid"><div><span class="meta">Required</span><br>\${esc(data.lock.profileName || data.lock.profileId)} · \${esc(data.lock.requiredEmail || 'identity unavailable')}\${data.lock.requiredOrganization ? ' · '+esc(data.lock.requiredOrganization) : ''}</div><div><span class="meta">Current runtime</span><br>\${esc(data.lock.runtimeProfileName || 'unregistered')} · \${esc(data.lock.runtimeEmail || 'identity unavailable')}\${data.lock.runtimeOrganization ? ' · '+esc(data.lock.runtimeOrganization) : ''}</div></div><div class="toolbar spaced"><button id="reopen-required">Reopen with \${esc(data.lock.profileName || data.lock.profileId)}</button><button class="secondary" id="change-lock">Change workspace lock</button></div></div>\`
-        : '<div class="lockline"><strong>Workspace unlocked</strong> · This dashboard selector does not change the account in play.</div>';
+          ? \`<div class="lockline"><strong>This workspace uses \${esc(data.lock.profileName || data.lock.profileId)}</strong>\${data.setup.identityState === 'unidentified' ? ' · this Claude version does not report which account it is' : data.setup.identityState === 'unconfirmed' ? ' · identity never confirmed' : data.setup.identityState === 'unverifiable' ? ' · sign-in state unknown' : ''} · Claude Code launched in \${esc(data.lock.workspaceLabel)} runs as this account (\${esc(data.lock.mode)} mode)</div>\`
+          : \`<div class="lockline error"><strong>Different Claude identity than confirmed · \${esc(data.lock.mode)}</strong><div class="grid secondary-grid"><div><span class="meta">Confirmed earlier</span><br>\${esc(data.lock.profileName || data.lock.profileId)} · \${esc(data.lock.requiredEmail || 'identity unavailable')}\${data.lock.requiredOrganization ? ' · '+esc(data.lock.requiredOrganization) : ''}</div><div><span class="meta">Identity that answered</span><br>\${esc(data.lock.runtimeProfileName || 'unregistered')} · \${esc(data.lock.runtimeEmail || 'identity unavailable')}\${data.lock.runtimeOrganization ? ' · '+esc(data.lock.runtimeOrganization) : ''}</div></div><div class="toolbar spaced"><button id="reopen-required">Re-check \${esc(data.lock.profileName || data.lock.profileId)}</button><button class="secondary" id="change-lock">Change this workspace’s account</button></div></div>\`
+        : '<div class="lockline"><strong>This workspace uses your default Claude account</strong> · Choosing an account here only changes what this dashboard shows.</div>';
       const successRate = data.reliability.requests ? Math.round((data.reliability.requests-data.reliability.errors)/data.reliability.requests*100) : 0;
       app.innerHTML = \`
         <header class="topline">
-          <div class="identity"><div class="marker" aria-hidden="true">\${esc(selected.marker)}</div><div><h1>\${esc(selected.displayName)} \${selected.id === data.runtimeProfileId ? '<span class="badge">Account in play</span>' : '<span class="badge">Dashboard scope</span>'}</h1><div class="subtle">\${esc(selected.email || 'Identity not yet confirmed')}\${selected.organization ? ' · '+esc(selected.organization) : ''}</div><div class="meta">\${esc(selected.authMethod || 'Authentication method unavailable')} · Verified \${esc(when(selected.lastVerifiedAt, data.timezone))} · Workspace \${esc(current?.workspaceLabel || data.lock?.workspaceLabel || 'unavailable')}</div></div></div>
+          <div class="identity"><div class="marker" aria-hidden="true">\${esc(selected.marker)}</div><div><h1>\${esc(selected.displayName)} \${selected.id === data.runtimeProfileId ? '<span class="badge">Used in this workspace</span>' : '<span class="badge">Viewing only</span>'}</h1><div class="subtle">\${esc(selected.email || 'Identity not yet confirmed')}\${selected.organization ? ' · '+esc(selected.organization) : ''}</div><div class="meta">\${esc(selected.authMethod || 'Authentication method unavailable')} · Verified \${esc(when(selected.lastVerifiedAt, data.timezone))} · Workspace \${esc(current?.workspaceLabel || data.lock?.workspaceLabel || 'unavailable')}</div></div></div>
           <div class="toolbar">
             <label>Account <select id="profile-select" aria-label="Dashboard account">\${data.profiles.map(p => \`<option value="\${esc(p.id)}" \${p.id === selected.id ? 'selected' : ''}>\${esc(p.displayName)}</option>\`).join('')}</select></label>
             <label>Range <select id="range-select" aria-label="Dashboard date range">\${['24h','7d','30d','custom'].map(value => \`<option value="\${value}" \${value === data.range ? 'selected' : ''}>\${value}</option>\`).join('')}</select></label>
@@ -534,10 +638,11 @@ export class DashboardProvider implements vscode.Disposable {
             <label>Activity <select id="thread-scope" aria-label="Main thread or all activity"><option value="main" \${data.threadScope === 'main' ? 'selected' : ''}>Main thread</option><option value="all" \${data.threadScope === 'all' ? 'selected' : ''}>All + auxiliary</option></select></label>
             <label>Model <select id="model-filter" aria-label="Filter activity by model"><option value="all">All models</option>\${models.map(value => \`<option value="\${esc(value)}">\${esc(value)}</option>\`).join('')}</select></label>
             <label>Workspace <select id="workspace-filter" aria-label="Filter activity by workspace"><option value="all">All workspaces</option>\${workspaces.map(value => \`<option value="\${esc(value)}">\${esc(value)}</option>\`).join('')}</select></label>
-            <button id="switch">Open workspace with this account</button>
+            <button id="switch">Use this account in this workspace</button>
             <button class="secondary" id="refresh">Verify now</button>
           </div>
         </header>
+        \${setupBanner}
         \${lock}
         <div class="grid summary">
           \${quotaCard('Five-hour window', 'fiveHour', data)}
@@ -594,7 +699,7 @@ export class DashboardProvider implements vscode.Disposable {
           <div class="mini"><div class="meta">Commits</div><div class="metric">\${num(totals.commits)}</div></div>
           <div class="mini"><div class="meta">Pull requests</div><div class="metric">\${num(totals.prs)}</div></div>
         </div><div class="disclaimer">Activity is not a measure of code quality or developer performance.</div></section>
-        <footer class="provenance"><div><strong>Collection \${esc(data.collection.status)}</strong><div class="meta">\${esc(data.collection.source)} · Last event \${esc(when(data.collection.lastEventAt, data.timezone))} · Times shown in \${esc(data.timezone)}</div></div><button class="secondary" id="export">Export local data</button></footer>
+        <footer class="provenance"><div><strong>\${esc(data.setup.collection.headline)}</strong><div class="meta">\${esc(data.setup.collection.detail)}</div><div class="meta">Account in play · \${esc(data.setup.runtimeRegistered ? ((data.profiles.find(p => p.id === data.runtimeProfileId)?.displayName || 'known') + (data.setup.boundProfileName ? ' (this workspace)' : ' (default)')) : 'not tracked ('+data.setup.runtimeConfigDir+')')} · Status-line bridge for that account · \${data.setup.profileTelemetryEnabled ? 'installed' : 'not installed'} · Claude Code integration · \${esc(data.setup.wrapperState === 'guard' ? 'on' : data.setup.wrapperState === 'foreign' ? 'another wrapper' : 'off')}</div><div class="meta">\${esc(data.collection.source)} · Last event \${esc(when(data.collection.lastEventAt, data.timezone))} · Times shown in \${esc(data.timezone)}</div></div><button class="secondary" id="export">Export local data</button></footer>
       \`;
       document.getElementById('profile-select')?.addEventListener('change', event => vscode.postMessage({ type: 'setProfile', profileId: event.target.value }));
       document.getElementById('range-select')?.addEventListener('change', event => vscode.postMessage({ type: 'setRange', range: event.target.value }));
@@ -620,8 +725,9 @@ export class DashboardProvider implements vscode.Disposable {
           render(data);
         });
       }
+      document.getElementById('collection-action')?.addEventListener('click', () => vscode.postMessage({ type: 'collectionAction' }));
       document.getElementById('switch')?.addEventListener('click', () => vscode.postMessage({ type: 'switchProfile', profileId: selected.id }));
-      document.getElementById('reopen-required')?.addEventListener('click', () => vscode.postMessage({ type: 'switchProfile', profileId: data.lock.profileId }));
+      document.getElementById('reopen-required')?.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
       document.getElementById('change-lock')?.addEventListener('click', () => vscode.postMessage({ type: 'changeLock' }));
       document.getElementById('refresh')?.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
       document.getElementById('export')?.addEventListener('click', () => vscode.postMessage({ type: 'export', profileId: selected.id }));
@@ -648,8 +754,26 @@ export class DashboardProvider implements vscode.Disposable {
         if (element instanceof HTMLElement) element.style.width = Number(element.dataset.width || 0) + '%';
       });
     }
+    const renderError = (message) => {
+      app.innerHTML = \`<div class="empty"><div><h1>The usage dashboard could not be built</h1>
+        <p class="meta">\${esc(message || 'Unknown error')}</p>
+        <p class="meta">Local usage storage or the account registry could not be read. Account switching and workspace locks are unaffected.</p>
+        <p><button id="retry">Try again</button></p>
+        <p class="meta">Run “Claude Account Guard: Show Diagnostics” for a redacted report.</p>
+      </div></div>\`;
+      document.getElementById('retry')?.addEventListener('click', () => vscode.postMessage({ type: 'retry' }));
+    };
     window.addEventListener('message', event => {
-      if (event.data?.type === 'dashboardData') render(event.data.payload);
+      if (event.data?.type === 'dashboardData') {
+        // A render fault must not leave the panel showing "Loading…" forever either.
+        try {
+          render(event.data.payload);
+        } catch (error) {
+          renderError(error && error.message ? error.message : String(error));
+        }
+      } else if (event.data?.type === 'dashboardError') {
+        renderError(event.data.message);
+      }
     });
   </script>
 </body>

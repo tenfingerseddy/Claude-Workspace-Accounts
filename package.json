@@ -1,7 +1,7 @@
 {
   "name": "claude-account-guard",
   "displayName": "Claude Account Guard",
-  "description": "Make the Claude Code account in play explicit, switch safely between isolated profiles, enforce workspace locks, and inspect local usage.",
+  "description": "Give each VS Code workspace its own Claude Code account, see which one is in play, and inspect locally collected usage.",
   "version": "0.1.0",
   "type": "module",
   "publisher": "ResonanceLattice-Semanticus",
@@ -29,8 +29,7 @@
     "ui"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:claudeAccountGuard.openMenu"
+    "onStartupFinished"
   ],
   "files": [
     "dist/**",
@@ -45,68 +44,155 @@
     "commands": [
       {
         "command": "claudeAccountGuard.openMenu",
-        "title": "Claude Account Guard: Open Account Menu",
+        "category": "Claude Account Guard",
+        "title": "Account Menu",
         "icon": "$(account)"
       },
       {
-        "command": "claudeAccountGuard.openDashboard",
-        "title": "Claude Account Guard: Open Usage Dashboard",
-        "icon": "$(graph)"
-      },
-      {
-        "command": "claudeAccountGuard.addProfile",
-        "title": "Claude Account Guard: Add Account Profile"
-      },
-      {
-        "command": "claudeAccountGuard.registerCurrentProfile",
-        "title": "Claude Account Guard: Register Current Account"
-      },
-      {
-        "command": "claudeAccountGuard.switchProfile",
-        "title": "Claude Account Guard: Switch Account Profile"
-      },
-      {
         "command": "claudeAccountGuard.lockWorkspace",
-        "title": "Claude Account Guard: Lock Workspace"
+        "category": "Claude Account Guard",
+        "title": "Use a Claude Account in This Workspace"
       },
       {
         "command": "claudeAccountGuard.unlockWorkspace",
-        "title": "Claude Account Guard: Remove Workspace Lock"
+        "category": "Claude Account Guard",
+        "title": "Use the Default Claude Account in This Workspace"
       },
       {
-        "command": "claudeAccountGuard.verifyAccount",
-        "title": "Claude Account Guard: Verify Account"
+        "command": "claudeAccountGuard.switchProfile",
+        "category": "Claude Account Guard",
+        "title": "Change This Workspace's Claude Account"
+      },
+      {
+        "command": "claudeAccountGuard.addProfile",
+        "category": "Claude Account Guard",
+        "title": "Add a Claude Account"
       },
       {
         "command": "claudeAccountGuard.login",
-        "title": "Claude Account Guard: Sign In"
+        "category": "Claude Account Guard",
+        "title": "Sign In to This Workspace's Claude Account"
       },
       {
-        "command": "claudeAccountGuard.manageProfiles",
-        "title": "Claude Account Guard: Manage Profiles"
+        "command": "claudeAccountGuard.verifyAccount",
+        "category": "Claude Account Guard",
+        "title": "Check This Workspace's Claude Identity"
+      },
+      {
+        "command": "claudeAccountGuard.updateExpectedIdentity",
+        "category": "Claude Account Guard",
+        "title": "Update This Workspace's Expected Claude Identity"
+      },
+      {
+        "command": "claudeAccountGuard.openDashboard",
+        "category": "Claude Account Guard",
+        "title": "Usage Dashboard",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "claudeAccountGuard.configureWrapper",
+        "category": "Claude Account Guard",
+        "title": "Connect to Claude Code"
+      },
+      {
+        "command": "claudeAccountGuard.disableWrapper",
+        "category": "Claude Account Guard",
+        "title": "Disconnect From Claude Code"
+      },
+      {
+        "command": "claudeAccountGuard.removeAllData",
+        "category": "Claude Account Guard",
+        "title": "Remove All Account Guard Data"
       },
       {
         "command": "claudeAccountGuard.diagnostics",
-        "title": "Claude Account Guard: Show Diagnostics"
+        "category": "Claude Account Guard",
+        "title": "Show Diagnostics"
       },
       {
-        "command": "claudeAccountGuard.deleteUsageData",
-        "title": "Claude Account Guard: Delete Local Usage Data"
+        "command": "claudeAccountGuard.registerCurrentProfile",
+        "category": "Claude Account Guard",
+        "title": "Track the Default Claude Account"
+      },
+      {
+        "command": "claudeAccountGuard.bindTerminal",
+        "category": "Claude Account Guard",
+        "title": "Use This Workspace's Account in Its Terminals"
+      },
+      {
+        "command": "claudeAccountGuard.enableUsageCollection",
+        "category": "Claude Account Guard",
+        "title": "Collect Usage for This Workspace's Account"
+      },
+      {
+        "command": "claudeAccountGuard.manageProfiles",
+        "category": "Claude Account Guard",
+        "title": "Manage Claude Accounts"
       },
       {
         "command": "claudeAccountGuard.exportUsage",
-        "title": "Claude Account Guard: Export Local Usage"
+        "category": "Claude Account Guard",
+        "title": "Export Local Usage"
+      },
+      {
+        "command": "claudeAccountGuard.deleteUsageData",
+        "category": "Claude Account Guard",
+        "title": "Delete Local Usage Data"
       }
     ],
     "menus": {
       "commandPalette": [
         {
-          "command": "claudeAccountGuard.openMenu",
-          "when": "workspaceFolderCount > 0"
+          "command": "claudeAccountGuard.updateExpectedIdentity",
+          "when": "claudeAccountGuard.hasProfiles"
         },
         {
-          "command": "claudeAccountGuard.openDashboard",
-          "when": "workspaceFolderCount > 0"
+          "command": "claudeAccountGuard.lockWorkspace",
+          "when": "workspaceFolderCount > 0 && !claudeAccountGuard.locked"
+        },
+        {
+          "command": "claudeAccountGuard.unlockWorkspace",
+          "when": "workspaceFolderCount > 0 && claudeAccountGuard.locked"
+        },
+        {
+          "command": "claudeAccountGuard.switchProfile",
+          "when": "workspaceFolderCount > 0 && claudeAccountGuard.locked"
+        },
+        {
+          "command": "claudeAccountGuard.login",
+          "when": "claudeAccountGuard.hasProfiles"
+        },
+        {
+          "command": "claudeAccountGuard.verifyAccount",
+          "when": "claudeAccountGuard.hasProfiles"
+        },
+        {
+          "command": "claudeAccountGuard.configureWrapper",
+          "when": "!claudeAccountGuard.wrapperConfigured"
+        },
+        {
+          "command": "claudeAccountGuard.registerCurrentProfile",
+          "when": "false"
+        },
+        {
+          "command": "claudeAccountGuard.bindTerminal",
+          "when": "false"
+        },
+        {
+          "command": "claudeAccountGuard.enableUsageCollection",
+          "when": "false"
+        },
+        {
+          "command": "claudeAccountGuard.manageProfiles",
+          "when": "false"
+        },
+        {
+          "command": "claudeAccountGuard.exportUsage",
+          "when": "false"
+        },
+        {
+          "command": "claudeAccountGuard.deleteUsageData",
+          "when": "false"
         }
       ]
     },
@@ -121,7 +207,7 @@
             "off"
           ],
           "default": "enforce",
-          "description": "Default mode for new workspace locks."
+          "description": "How a workspace's Claude account is applied. \"enforce\": set the account and stop the launch if the identity inside it does not match the one you confirmed. \"warn\": set the account and only report a mismatch. \"off\": record the choice without applying it."
         },
         "claudeAccountGuard.telemetry.enabled": {
           "type": "boolean",
@@ -179,7 +265,7 @@
         "claudeAccountGuard.wrapper.autoConfigure": {
           "type": "boolean",
           "default": true,
-          "description": "Configure the official Claude Code extension to use the stable Account Guard process wrapper."
+          "description": "Allow Account Guard to set the global claudeCode.claudeProcessWrapper setting, after asking you once. This is what applies a per-workspace Claude account and collects token usage, so per-workspace accounts do nothing while it is off. To undo an existing change, run \"Claude Account Guard: Disconnect From Claude Code\"."
         }
       }
     }
@@ -199,7 +285,8 @@
     "smoke:repository": "node --experimental-transform-types --experimental-loader ./scripts/typescript-loader.mjs scripts/smoke-repository.ts",
     "smoke:statusline": "node scripts/smoke-statusline.mjs",
     "smoke:wrapper": "node scripts/smoke-wrapper.mjs",
-    "test:e2e": "npm run build && npm run smoke:runtime && npm run smoke:core && npm run smoke:registry && npm run smoke:repository && npm run smoke:collector && npm run smoke:statusline && npm run smoke:wrapper",
+    "smoke:wrapper:args": "node scripts/smoke-wrapper-args.mjs",
+    "test:e2e": "npm run build && npm run smoke:runtime && npm run smoke:core && npm run smoke:registry && npm run smoke:repository && npm run smoke:collector && npm run smoke:statusline && npm run smoke:wrapper && npm run smoke:wrapper:args",
     "check": "npm run lint && npm run typecheck && npm test && npm run test:e2e",
     "package": "node scripts/package-vsix.mjs",
     "vscode:prepublish": "npm run build"

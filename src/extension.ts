@@ -1,12 +1,9 @@
 import * as vscode from "vscode";
 import { ClaudeBinaryResolver, AuthVerifier } from "./auth/authVerifier.js";
 import { CommandController } from "./commands/commandController.js";
-import { compareIdentity } from "./core/identity.js";
 import { workspaceHash } from "./core/paths.js";
 import { DashboardProvider } from "./dashboard/dashboardProvider.js";
 import { DiagnosticsProvider } from "./diagnostics/diagnosticsProvider.js";
-import { IsolatedWindowLauncher } from "./launcher/isolatedWindowLauncher.js";
-import { LaunchHandshakeService } from "./launcher/launchHandshakeService.js";
 import { WorkspaceLockService } from "./locks/workspaceLockService.js";
 import { ProfileRegistry, resolveSupportPaths } from "./profiles/registryStore.js";
 import { RuntimeProfileDetector } from "./profiles/runtimeProfileDetector.js";
@@ -38,7 +35,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return;
   }
 
-  const paths = resolveSupportPaths(context.globalStorageUri.fsPath);
+  const paths = resolveSupportPaths({ fallbackRoot: context.globalStorageUri.fsPath });
   const registry = new ProfileRegistry(paths);
   try {
     await registry.initialize();
@@ -64,17 +61,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   const wrapperIntegration = new WrapperIntegrationService(context, registry);
+  // Support files are copied outside the extension directory but nothing about how Claude
+  // Code launches changes here: the global wrapper setting is written only after explicit
+  // consent, and only when an enforced lock or local usage actually needs it.
   const supportFiles = await wrapperIntegration.installSupportFiles();
-  let wrapperConflict = false;
-  let wrapperFailure = false;
-  try {
-    const integration = await wrapperIntegration.configure(supportFiles.wrapperPath);
-    wrapperConflict = integration === "conflict";
-  } catch (error) {
-    wrapperFailure = true;
-    output.error(`Wrapper integration failed: ${error instanceof Error ? error.message : "unknown error"}`);
-  }
 
+  // Assigned once the collector plumbing further down exists. Commands must be able to
+  // restart collection the moment a profile is registered, deleted, or switched, instead
+  // of waiting for the next window reload.
+  let reconcileCollection: () => Promise<void> = async () => undefined;
   const runtimeDetector = new RuntimeProfileDetector();
   const binaryResolver = new ClaudeBinaryResolver();
   const authVerifier = new AuthVerifier(binaryResolver);
@@ -90,23 +85,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
   await updateWorkspaceKey();
-  const handshakes = new LaunchHandshakeService(paths);
-  const launcher = new IsolatedWindowLauncher(handshakes);
   const statusLineBridge = new StatusLineBridgeService(supportFiles.statusLineBridgePath);
   const dashboard = new DashboardProvider(
     context,
     registry,
     repository,
     runtimeDetector,
-    lockService
+    lockService,
+    (message) => output.warn(message)
   );
+  const describeIntegration = (): string => {
+    const configured = wrapperIntegration.configuredWrapper();
+    if (!configured) {
+      return "Not connected to Claude Code — per-workspace accounts are not applied";
+    }
+    return wrapperIntegration.isGuardWrapper(configured)
+      ? "Claude Code launches through Account Guard"
+      : `Another tool's wrapper is configured (${configured})`;
+  };
   const statusBar = new StatusBarController(
     registry,
     runtimeDetector,
     authVerifier,
     lockService,
     repository,
-    () => void dashboard.refresh()
+    () => void dashboard.refresh(),
+    describeIntegration,
+    (message) => output.warn(message)
   );
   const diagnostics = new DiagnosticsProvider(
     context,
@@ -123,40 +128,49 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     runtimeDetector,
     authVerifier,
     lockService,
-    launcher,
+    binaryResolver,
     statusLineBridge,
     repository,
     statusBar,
     dashboard,
-    diagnostics
+    diagnostics,
+    wrapperIntegration,
+    () => reconcileCollection(),
+    (message) => output.warn(message)
   );
   commands.register();
-  if (wrapperConflict) {
-    const choice = await vscode.window.showWarningMessage(
-      "Claude Code already uses another process wrapper. Account Guard can chain it after the workspace/account preflight.",
-      "Use Account Guard Wrapper",
-      "Open Diagnostics"
+  dashboard.useController(commands);
+  diagnostics.useController(commands);
+
+  // Self-healing: a global setting pointing at a wrapper that no longer exists breaks
+  // every Claude Code launch, which is exactly what uninstalling an earlier release left
+  // behind. Repair or clear it before anything else runs.
+  try {
+    await commands.repairIntegration();
+  } catch (error) {
+    output.error(
+      `Wrapper reconciliation failed: ${error instanceof Error ? error.message : "unknown error"}`
     );
-    if (choice === "Use Account Guard Wrapper") {
-      await wrapperIntegration.resolveConflict(supportFiles.wrapperPath);
-    } else if (choice === "Open Diagnostics") {
-      await diagnostics.show();
-    }
-  } else if (wrapperFailure) {
-    const choice = await vscode.window.showWarningMessage(
-      "Claude Account Guard could not configure the Claude process wrapper. Workspace locks are visible but cannot be fail-closed until this is resolved.",
-      "Open Diagnostics"
-    );
-    if (choice === "Open Diagnostics") {
-      await diagnostics.show();
-    }
   }
+  // Restore the integration only for users who already consented to it.
+  const integrationOutcome = await commands.ensureIntegration(
+    "Account Guard needs Claude Code to launch through it.",
+    { userInitiated: false, allowPrompt: false }
+  );
+  output.info(`Claude Code integration: ${integrationOutcome}.`);
   context.subscriptions.push(statusBar, dashboard);
   statusBar.start();
 
-  const document = await registry.read();
-  const runtime = runtimeDetector.detect(document.profiles);
   let collector: TelemetryCollector | undefined;
+  let collectorProfileId: string | undefined;
+  /**
+   * Start, stop, or re-target the local collector for whichever profile is active *now*.
+   *
+   * The runtime profile is re-detected on every call. Closing over a snapshot taken at
+   * activation meant that registering the account this window uses — the normal first
+   * step — left the collector stopped until the extension host happened to reload, so
+   * every usage table stayed empty and nothing said why.
+   */
   const reconcileCollector = async (): Promise<void> => {
     const enabled = vscode.workspace.getConfiguration("claudeAccountGuard")
       .get<boolean>("telemetry.enabled", true);
@@ -165,21 +179,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const currentRegistry = await registry.read();
     if (currentRegistry.integration.telemetryEnabled !== enabled
       || currentRegistry.integration.collectWorkspacePath !== collectWorkspacePath) {
-      await registry.setIntegration({
-        ...currentRegistry.integration,
-        telemetryEnabled: enabled,
-        collectWorkspacePath
-      });
+      // A field patch, applied inside the registry's lock: writing the whole integration
+      // object read a moment ago discards whatever another window recorded meanwhile.
+      await registry.patchIntegration({ telemetryEnabled: enabled, collectWorkspacePath });
     }
-    if (!runtime.profile || !enabled) {
-      if (collector) {
-        await collector.dispose();
-        collector = undefined;
-        if (runtimeServices) {
-          runtimeServices.collector = undefined;
-        }
-        output.info("Local usage collector stopped.");
+    // The collector must serve the account the wrapper will actually launch. The wrapper
+    // looks up the collector registration for the *bound* account, so choosing by ambient
+    // config dir alone left a bound workspace requesting a registration that never existed —
+    // with no way for the user to fix it, reload included.
+    const lock = await lockService.currentLock();
+    const boundProfile = lock && lock.mode !== "off"
+      ? currentRegistry.profiles.find((profile) => profile.id === lock.profileId)
+      : undefined;
+    const activeProfile = boundProfile
+      ?? runtimeDetector.detect(currentRegistry.profiles).profile;
+    const target = enabled ? activeProfile : undefined;
+    if (collector && (!target || collectorProfileId !== target.id)) {
+      await collector.dispose();
+      collector = undefined;
+      collectorProfileId = undefined;
+      if (runtimeServices) {
+        runtimeServices.collector = undefined;
       }
+      output.info("Local usage collector stopped.");
+    }
+    if (!target) {
       return;
     }
     if (!collector) {
@@ -188,58 +212,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void dashboard.refresh();
       });
       try {
-        const registration = await candidate.start(runtime.profile);
+        const registration = await candidate.start(target);
         collector = candidate;
+        collectorProfileId = target.id;
         if (runtimeServices) {
           runtimeServices.collector = collector;
         }
-        output.info(`Local collector listening on loopback port ${registration.port}.`);
+        output.info(
+          `Local collector listening on loopback port ${registration.port} for ${target.displayName}.`
+        );
       } catch (error) {
-        await candidate.dispose().catch(() => undefined);
+        await candidate.dispose().catch((failure: unknown) => output.error(
+          `Local collector cleanup failed: ${failure instanceof Error ? failure.message : "unknown error"}`
+        ));
         output.error(`Local collector failed: ${error instanceof Error ? error.message : "unknown error"}`);
         void vscode.window.showWarningMessage(
-          "Local Claude usage collection is unavailable. Account isolation and workspace locks remain active."
-        );
+          "Local usage collection could not start: Account Guard could not bind a loopback port for its collector. Quota snapshots from Claude's status line still work, and account switching and workspace locks are unaffected. Reload the window to retry.",
+          "Reload Window",
+          "Show Diagnostics"
+        ).then((choice) => choice === "Reload Window"
+          ? vscode.commands.executeCommand("workbench.action.reloadWindow")
+          : choice === "Show Diagnostics"
+            ? vscode.commands.executeCommand("claudeAccountGuard.diagnostics")
+            : undefined);
       }
     }
   };
+  reconcileCollection = reconcileCollector;
   await reconcileCollector();
 
   const initial = await statusBar.refresh(true);
-  if (initial?.runtime.profile && !initial.runtime.profile.expectedIdentity) {
+  if (initial?.requiredProfile && !initial.requiredProfile.expectedIdentity) {
+    // The account is applied either way; confirming its identity is what lets Account
+    // Guard notice later that the wrong Claude identity answered.
     void vscode.window.showInformationMessage(
-      `${initial.runtime.profile.displayName} needs a confirmed Claude identity before it can be used by enforced workspace locks.`,
-      "Sign In",
-      "Verify Account"
-    ).then((choice) => choice === "Sign In"
-      ? vscode.commands.executeCommand("claudeAccountGuard.login")
-      : choice === "Verify Account"
-        ? vscode.commands.executeCommand("claudeAccountGuard.verifyAccount")
-        : undefined);
-  }
-
-  if (process.env.CLAUDE_ACCOUNT_GUARD_LAUNCH_ID) {
-    const profile = initial?.runtime.profile;
-    const verification = initial?.verification;
-    const identityMatch = profile && verification
-      ? compareIdentity(profile.expectedIdentity, verification)
-      : "unverifiable";
-    const lockCompatible = !initial?.lock
-      || initial.lock.mode !== "enforce"
-      || initial.lock.profileId === profile?.id;
-    const ready = Boolean(
-      profile
-      && verification?.state === "signed_in"
-      && identityMatch === "match"
-      && lockCompatible
-      && initial?.status.kind !== "wrong_account"
-    );
-    await handshakes.completeFromEnvironment({
-      ready,
-      profileId: profile?.id,
-      workspace: (await lockService.currentWorkspace())?.label,
-      detail: ready ? "Runtime profile, identity, and workspace lock agree." : initial?.status.detail
-    });
+      `This workspace uses ${initial.requiredProfile.displayName}. Confirm its Claude identity once so Account Guard can warn you if that account changes.`,
+      "Confirm Identity",
+      "Not Now"
+    ).then((choice) => choice === "Confirm Identity"
+      ? vscode.commands.executeCommand("claudeAccountGuard.verifyAccount")
+      : undefined);
   }
 
   const refresh = () => {
@@ -249,7 +261,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     void dashboard.refresh();
   };
   context.subscriptions.push(
-    vscode.workspace.onDidChangeWorkspaceFolders(refresh),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      refresh();
+      void reconcileCollector().catch((error: unknown) => output.error(
+        `Local collection could not be reconciled after a workspace change: ${error instanceof Error ? error.message : "unknown error"}`
+      ));
+    }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("claudeAccountGuard")
         || event.affectsConfiguration("claudeCode.claudeProcessWrapper")) {
@@ -259,7 +276,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         );
         if (event.affectsConfiguration("claudeAccountGuard.telemetry.enabled")
           || event.affectsConfiguration("claudeAccountGuard.privacy.collectWorkspacePath")) {
-          void reconcileCollector();
+          void reconcileCollector().catch((error: unknown) => output.error(
+            `Local collection could not be reconciled after a settings change: ${error instanceof Error ? error.message : "unknown error"}`
+          ));
         }
         refresh();
       }
@@ -267,7 +286,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   runtimeServices = { collector, repository };
-  setTimeout(() => void commands.firstRun(), 800);
+  // Explains the extension once, and afterwards only speaks up when this window's Claude
+  // account is unregistered — the state in which nothing this extension shows can work.
+  void commands.firstRun().catch((error: unknown) => output.error(
+    `First-run guidance failed: ${error instanceof Error ? error.message : "unknown error"}`
+  ));
   output.info("Claude Account Guard is active.");
 }
 

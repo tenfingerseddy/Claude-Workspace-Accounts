@@ -1,7 +1,10 @@
 import type {
+  AccountProfile,
+  AuthVerification,
   GuardStatus,
   GuardStatusInput,
-  RateLimitWindow
+  RateLimitWindow,
+  WorkspaceLock
 } from "./models.js";
 import { compareIdentity } from "./identity.js";
 
@@ -52,6 +55,52 @@ export function selectUsage(
   })[0];
 }
 
+/**
+ * How a workspace's bound account compares with the identity recorded for it.
+ *
+ * One definition, used by the status bar, the dashboard and the diagnostics report, because
+ * three near-copies disagreed: two of them treated "signed out" and "cannot tell" as a wrong
+ * account, while the wrapper allows both and stops a launch only on a real mismatch.
+ */
+export type BindingIdentityState =
+  /** No account is bound to this workspace, or the binding is switched off. */
+  | "unbound"
+  /** Bound, but no identity was ever recorded. Legitimate: nothing is probed or blocked. */
+  | "unconfirmed"
+  /** The recorded identity answered. */
+  | "match"
+  /** A different identity answered. The only state that can stop a launch. */
+  | "mismatch"
+  /**
+   * Signed in, but the CLI reported no identity at all. This is the normal outcome for any
+   * account used through `CLAUDE_CONFIG_DIR` on current Claude Code versions, so it is a
+   * distinct, non-alarming state rather than a failure.
+   */
+  | "unidentified"
+  /** A probe failed or the account is signed out, so nothing can be compared. Never blocks. */
+  | "unverifiable";
+
+export function bindingIdentityState(input: {
+  lock?: Pick<WorkspaceLock, "mode"> | undefined;
+  boundProfile?: Pick<AccountProfile, "expectedIdentity"> | undefined;
+  verification?: Pick<AuthVerification, "state" | "email" | "accountId" | "organizationId">;
+}): BindingIdentityState {
+  if (!input.lock || input.lock.mode === "off" || !input.boundProfile) {
+    return "unbound";
+  }
+  if (!input.boundProfile.expectedIdentity) {
+    return "unconfirmed";
+  }
+  if (!input.verification || input.verification.state !== "signed_in") {
+    return "unverifiable";
+  }
+  if (!input.verification.email && !input.verification.accountId) {
+    return "unidentified";
+  }
+  const match = compareIdentity(input.boundProfile.expectedIdentity, input.verification);
+  return match === "mismatch" ? "mismatch" : match === "match" ? "match" : "unverifiable";
+}
+
 export function deriveGuardStatus(input: GuardStatusInput): GuardStatus {
   const runtimeName = input.runtime.profile?.displayName ?? "Unregistered";
   const requiredName = input.requiredProfile?.displayName ?? "unknown profile";
@@ -67,30 +116,29 @@ export function deriveGuardStatus(input: GuardStatusInput): GuardStatus {
   }
 
   if (activeLock) {
-    const runtimeMatches = input.runtime.profile?.id === activeLock.profileId;
-    const identityMatches = compareIdentity(
-      input.requiredProfile?.expectedIdentity,
-      input.verification ?? { state: "unavailable" }
-    );
-    const signedOutRuntime = runtimeMatches && input.verification?.state === "signed_out";
-    if (!signedOutRuntime && (!runtimeMatches || identityMatches !== "match")) {
+    // Only a real mismatch is reported as blocked. The wrapper applies the bound account
+    // itself, so the ambient configuration directory is irrelevant here, and it forwards the
+    // launch when the identity cannot be read — reporting either as "blocked" was a lie that
+    // sent people hunting for a problem that did not exist.
+    const identity = bindingIdentityState({
+      lock: activeLock,
+      boundProfile: input.requiredProfile,
+      verification: input.verification
+    });
+    if (identity === "mismatch") {
       if (activeLock.mode === "warn") {
         return {
           kind: "wrong_account_warning",
-          text: `$(warning) Claude · ${requiredName} required`,
+          text: `$(warning) Claude · ${requiredName} identity changed`,
           severity: "warning",
-          detail: !runtimeMatches
-            ? `Warning-only lock requires ${requiredName}; runtime profile is ${runtimeName}.`
-            : `Warning-only lock identity does not match ${requiredName}.`
+          detail: `A different Claude identity now answers in ${requiredName}. Launches are not stopped in warn mode.`
         };
       }
       return {
         kind: "wrong_account",
-        text: `$(error) Claude blocked · ${requiredName} required`,
+        text: `$(error) Claude blocked · ${requiredName} identity changed`,
         severity: "error",
-        detail: !runtimeMatches
-          ? `Workspace requires ${requiredName}; runtime profile is ${runtimeName}.`
-          : `The verified identity does not match ${requiredName}.`
+        detail: `A different Claude identity now answers in ${requiredName}, so launches in this workspace are stopped. Update the expected identity, or switch this workspace to warn.`
       };
     }
   }

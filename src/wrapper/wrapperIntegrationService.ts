@@ -158,17 +158,37 @@ export class WrapperIntegrationService {
     return "configured";
   }
 
-  public async resolveConflict(wrapperPath: string): Promise<void> {
+  /**
+   * Chain a third-party wrapper behind ours, after the user has agreed to it.
+   *
+   * `expectedUpstream` is the wrapper that was actually named in the consent prompt. Another window
+   * or another tool can change the setting while a modal is open, and chaining whatever happens to
+   * be there at write time would hand a bearer token and the bound account to a binary the user was
+   * never shown. So the disclosed value is re-checked here and the write is abandoned if it moved;
+   * the caller re-asks against the new value rather than guessing.
+   */
+  public async resolveConflict(
+    wrapperPath: string,
+    expectedUpstream: string | undefined
+  ): Promise<"chained" | "upstream_changed"> {
     const configuration = vscode.workspace.getConfiguration(CLAUDE_CODE_SECTION);
     const existing = this.configuredWrapper();
-    const document = await this.registry.read();
-    await this.registry.setIntegration({
-      ...document.integration,
+    const sameAsDisclosed = existing === undefined
+      ? expectedUpstream === undefined
+      : expectedUpstream !== undefined
+        && path.normalize(existing).toLowerCase() === path.normalize(expectedUpstream).toLowerCase();
+    if (!sameAsDisclosed) {
+      return "upstream_changed";
+    }
+    // patchIntegration deletes any field explicitly set to undefined, so only name
+    // upstreamWrapper when there is genuinely a new one to record. Omitting it leaves a
+    // previously recorded upstream in place, which is what disable() needs to restore.
+    const chained = existing && path.normalize(existing) !== path.normalize(wrapperPath)
+      ? existing
+      : undefined;
+    await this.registry.patchIntegration({
       wrapperPath,
-      upstreamWrapper:
-        existing && path.normalize(existing) !== path.normalize(wrapperPath)
-          ? existing
-          : document.integration.upstreamWrapper,
+      ...(chained ? { upstreamWrapper: chained } : {}),
       configuredAt: new Date().toISOString(),
       version: this.context.extension.packageJSON.version as string
     });
@@ -177,6 +197,7 @@ export class WrapperIntegrationService {
       wrapperPath,
       vscode.ConfigurationTarget.Global
     );
+    return "chained";
   }
 
   /**
