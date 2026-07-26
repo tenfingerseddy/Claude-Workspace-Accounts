@@ -2,9 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.Security.Cryptography;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace ClaudeAccountGuard.WrapperLauncher
 {
@@ -314,22 +312,46 @@ namespace ClaudeAccountGuard.WrapperLauncher
         private const int AuthStatusTimeoutMilliseconds = 60000;
         private const double CollectorFreshnessSeconds = 60;
 
-        private static readonly string SupportRoot = ResolveSupportRoot();
-
-        private static readonly string[] ExistingEndpointVariables =
+        /// <summary>
+        /// Any of these being set means the user already has an OpenTelemetry pipeline, or has
+        /// chosen a wire format the loopback collector cannot read. Injection is refused outright,
+        /// because a partial override produces a collector that listens and rejects everything.
+        ///
+        /// This is the C# half of a contract. The authoritative copy is
+        /// <c>FOREIGN_OTEL_VARIABLES</c> in <c>src/telemetry/otelEnvironment.ts</c>, and
+        /// <c>wrapperContract.test.ts</c> fails the build if the two ever disagree. It used to check
+        /// only the four endpoints and three exporter selections, so a user with
+        /// <c>OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http/protobuf</c> or
+        /// <c>OTEL_EXPORTER_OTLP_COMPRESSION=gzip</c> set did not trip the guard, was injected over,
+        /// and then had every single export rejected.
+        /// </summary>
+        private static readonly string[] ForeignOtelVariables =
         {
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
-        };
-
-        private static readonly string[] ExistingExporterVariables =
-        {
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+            "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
             "OTEL_METRICS_EXPORTER",
             "OTEL_LOGS_EXPORTER",
             "OTEL_TRACES_EXPORTER",
-            "OTEL_EXPORTER_OTLP_HEADERS"
+            "OTEL_EXPORTER_OTLP_CERTIFICATE",
+            "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+            "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+            "CLAUDE_CODE_CLIENT_CERT",
+            "CLAUDE_CODE_CLIENT_KEY",
+            "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"
         };
 
         public static int Main(string[] args)
@@ -418,13 +440,9 @@ namespace ClaudeAccountGuard.WrapperLauncher
         /// </summary>
         private static GuardResolution Resolve(LaunchTarget target)
         {
-            string currentDirectory = NormalizeGuardPath(Directory.GetCurrentDirectory());
-            string registryPath = SupportRoot == null
-                ? null
-                : Path.Combine(SupportRoot, "registry.json");
-            string cachePath = SupportRoot == null
-                ? null
-                : Path.Combine(SupportRoot, "binding-cache.json");
+            string currentDirectory = GuardPaths.Normalize(Directory.GetCurrentDirectory());
+            string registryPath = GuardSupport.RegistryPath;
+            string cachePath = GuardSupport.Combine("binding-cache.json");
 
             if (registryPath == null || !File.Exists(registryPath))
             {
@@ -433,17 +451,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
                 return GuardResolution.Unbound(null, null, null);
             }
 
-            JsonValue registry = null;
-            try
-            {
-                registry = JsonReader.Parse(File.ReadAllText(registryPath, new UTF8Encoding(false)));
-                ValidateRegistry(registry);
-            }
-            catch (Exception)
-            {
-                registry = null;
-            }
-
+            JsonValue registry = GuardRegistry.Load(registryPath);
             if (registry == null)
             {
                 // A registry that cannot be read must not quietly drop this workspace back
@@ -464,7 +472,16 @@ namespace ClaudeAccountGuard.WrapperLauncher
                 );
             }
 
-            string ambientProfileId = AmbientProfileId(registry);
+            // Which registered account the ambient environment already points at. Used only to
+            // attribute local usage when this workspace turns out not to be bound.
+            string ambientProfileId = GuardValues.Text(
+                GuardRegistry.FindProfileByConfigDirectory(
+                    registry,
+                    GuardPaths.Normalize(GuardRegistry.RuntimeConfigDirectory())
+                ) ?? JsonValue.Absent,
+                "id"
+            );
+
             JsonValue workspaceLock = ResolveWorkspaceLock(registry, currentDirectory);
             if (workspaceLock == null)
             {
@@ -473,32 +490,43 @@ namespace ClaudeAccountGuard.WrapperLauncher
                 return GuardResolution.Unbound(registry, ambientProfileId, null);
             }
 
-            JsonValue boundProfile = FindProfileById(registry, Text(workspaceLock, "profileId"));
+            JsonValue boundProfile = GuardRegistry.FindProfileById(
+                registry,
+                GuardValues.Text(workspaceLock, "profileId")
+            );
             if (boundProfile == null)
             {
                 BindingCache.Forget(cachePath, currentDirectory);
-                return GuardResolution.Unbound(registry, ambientProfileId, "required_profile_missing");
+                return GuardResolution.Unbound(
+                    registry,
+                    ambientProfileId,
+                    "required_profile_missing"
+                );
             }
-            string configDirectory = Text(boundProfile, "configDir");
-            if (IsBlank(configDirectory))
+            string configDirectory = GuardValues.Text(boundProfile, "configDir");
+            if (GuardValues.IsBlank(configDirectory))
             {
-                configDirectory = Text(boundProfile, "configDirNormalized");
+                configDirectory = GuardValues.Text(boundProfile, "configDirNormalized");
             }
-            if (IsBlank(configDirectory))
+            if (GuardValues.IsBlank(configDirectory))
             {
                 BindingCache.Forget(cachePath, currentDirectory);
-                return GuardResolution.Unbound(registry, ambientProfileId, "required_profile_missing");
+                return GuardResolution.Unbound(
+                    registry,
+                    ambientProfileId,
+                    "required_profile_missing"
+                );
             }
 
             JsonValue expected = boundProfile["expectedIdentity"];
             var binding = new WorkspaceBinding(
                 currentDirectory,
-                Text(boundProfile, "id"),
+                GuardValues.Text(boundProfile, "id"),
                 configDirectory,
-                Text(workspaceLock, "mode"),
-                Text(expected, "accountId"),
-                Text(expected, "email"),
-                Text(expected, "organizationId"),
+                GuardValues.Text(workspaceLock, "mode"),
+                GuardValues.Text(expected, "accountId"),
+                GuardValues.Text(expected, "email"),
+                GuardValues.Text(expected, "organizationId"),
                 null,
                 true
             );
@@ -508,7 +536,8 @@ namespace ClaudeAccountGuard.WrapperLauncher
             string outcome = Verify(target, binding);
             if (outcome == "identity_mismatch" && binding.Enforced)
             {
-                string displayName = Text(boundProfile, "displayName") ?? binding.ProfileId;
+                string displayName = GuardValues.Text(boundProfile, "displayName")
+                    ?? binding.ProfileId;
                 // The message has to name the way out, or the only remaining block becomes a
                 // dead end for the one user it was meant to protect.
                 throw new GuardBlockException(
@@ -526,21 +555,24 @@ namespace ClaudeAccountGuard.WrapperLauncher
         /// Points this launch - and every process it starts - at the bound account's isolated
         /// configuration directory. This is the whole per-workspace account switch: the CLI
         /// reads its credentials from <c>CLAUDE_CONFIG_DIR</c>, so setting it per launch keeps
-        /// two workspaces on two accounts without either one switching the other.
+        /// two workspaces on two accounts without either one switching the other. Claude's
+        /// status-line hook inherits it too, which is how the status-line bridge attributes
+        /// usage to the bound account instead of guessing.
         /// </summary>
         private static void ApplyBinding(WorkspaceBinding binding)
         {
             Environment.SetEnvironmentVariable(ConfigDirectoryVariable, binding.ConfigDirectory);
             // Secure storage is derived from its own variable when that is set, so an ambient
             // value would send credentials to the account this launch is not bound to.
-            if (!IsBlank(Environment.GetEnvironmentVariable(SecureStorageDirectoryVariable)))
+            if (!GuardValues.IsBlank(
+                Environment.GetEnvironmentVariable(SecureStorageDirectoryVariable)))
             {
                 Environment.SetEnvironmentVariable(
                     SecureStorageDirectoryVariable,
                     binding.ConfigDirectory
                 );
             }
-            if (!IsBlank(binding.ProfileId))
+            if (!GuardValues.IsBlank(binding.ProfileId))
             {
                 Environment.SetEnvironmentVariable(
                     "CLAUDE_ACCOUNT_GUARD_PROFILE_ID",
@@ -593,7 +625,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
 
             JsonValue account = auth["account"];
             JsonValue organization = auth["organization"];
-            string actualAccountId = FirstValue(
+            string actualAccountId = GuardValues.FirstValue(
                 auth["accountId"],
                 auth["account_id"],
                 auth["accountUuid"],
@@ -601,8 +633,8 @@ namespace ClaudeAccountGuard.WrapperLauncher
                 account["id"],
                 account["uuid"]
             );
-            string actualEmail = FirstValue(auth["email"], account["email"]);
-            string actualOrganizationId = FirstValue(
+            string actualEmail = GuardValues.FirstValue(auth["email"], account["email"]);
+            string actualOrganizationId = GuardValues.FirstValue(
                 auth["organizationId"],
                 auth["organization_id"],
                 auth["orgId"],
@@ -612,19 +644,24 @@ namespace ClaudeAccountGuard.WrapperLauncher
 
             // Nothing to compare against means the directory is signed in but the CLI told us
             // nothing identifying; that is unverifiable, not a mismatch.
-            if (IsBlank(actualAccountId) && IsBlank(actualEmail))
+            if (GuardValues.IsBlank(actualAccountId) && GuardValues.IsBlank(actualEmail))
             {
                 return "identity_unverifiable";
             }
 
             bool identityMatches = false;
-            if (!IsBlank(binding.ExpectedAccountId) && !IsBlank(actualAccountId))
+            if (!GuardValues.IsBlank(binding.ExpectedAccountId)
+                && !GuardValues.IsBlank(actualAccountId))
             {
-                identityMatches = Matches(binding.ExpectedAccountId, actualAccountId);
+                identityMatches = GuardValues.Matches(binding.ExpectedAccountId, actualAccountId);
             }
-            else if (!IsBlank(binding.ExpectedEmail) && !IsBlank(actualEmail))
+            else if (!GuardValues.IsBlank(binding.ExpectedEmail)
+                && !GuardValues.IsBlank(actualEmail))
             {
-                identityMatches = Matches(binding.ExpectedEmail.Trim(), actualEmail.Trim());
+                identityMatches = GuardValues.Matches(
+                    binding.ExpectedEmail.Trim(),
+                    actualEmail.Trim()
+                );
             }
             else
             {
@@ -634,45 +671,16 @@ namespace ClaudeAccountGuard.WrapperLauncher
             }
 
             if (identityMatches
-                && !IsBlank(binding.ExpectedOrganizationId)
-                && !IsBlank(actualOrganizationId))
+                && !GuardValues.IsBlank(binding.ExpectedOrganizationId)
+                && !GuardValues.IsBlank(actualOrganizationId))
             {
-                identityMatches = Matches(binding.ExpectedOrganizationId, actualOrganizationId);
+                identityMatches = GuardValues.Matches(
+                    binding.ExpectedOrganizationId,
+                    actualOrganizationId
+                );
             }
 
             return identityMatches ? null : "identity_mismatch";
-        }
-
-        private static void ValidateRegistry(JsonValue registry)
-        {
-            int? schemaVersion = registry["schemaVersion"].AsInteger();
-            if (!registry.IsObject
-                || schemaVersion == null
-                || schemaVersion.Value != 1
-                || !registry["profiles"].IsArray
-                || !registry["workspaceLocks"].IsArray
-                || !registry["collectors"].IsObject
-                || !registry["integration"].IsObject)
-            {
-                throw new JsonMalformedException("Unsupported or incomplete registry schema.");
-            }
-            foreach (JsonValue profile in registry["profiles"].Elements)
-            {
-                if (IsBlank(Text(profile, "id")) || IsBlank(Text(profile, "configDirNormalized")))
-                {
-                    throw new JsonMalformedException("Invalid account profile.");
-                }
-            }
-            foreach (JsonValue workspaceLock in registry["workspaceLocks"].Elements)
-            {
-                string mode = Text(workspaceLock, "mode");
-                if (IsBlank(Text(workspaceLock, "workspaceUri"))
-                    || IsBlank(Text(workspaceLock, "profileId"))
-                    || !(Matches(mode, "enforce") || Matches(mode, "warn") || Matches(mode, "off")))
-                {
-                    throw new JsonMalformedException("Invalid workspace lock.");
-                }
-            }
         }
 
         /// <summary>
@@ -686,12 +694,14 @@ namespace ClaudeAccountGuard.WrapperLauncher
         private static JsonValue ResolveWorkspaceLock(JsonValue registry, string currentDirectory)
         {
             string workspaceKey = Environment.GetEnvironmentVariable(WorkspaceKeyVariable);
-            if (!IsBlank(workspaceKey))
+            if (!GuardValues.IsBlank(workspaceKey))
             {
                 foreach (JsonValue candidate in registry["workspaceLocks"].Elements)
                 {
-                    if (Matches(Text(candidate, "workspaceKey"), workspaceKey)
-                        && !Matches(Text(candidate, "mode"), "off")
+                    if (GuardValues.Matches(
+                            GuardValues.Text(candidate, "workspaceKey"),
+                            workspaceKey)
+                        && !GuardValues.Matches(GuardValues.Text(candidate, "mode"), "off")
                         && LockMatchLength(candidate, currentDirectory) > 0)
                     {
                         return candidate;
@@ -703,7 +713,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
             int longest = 0;
             foreach (JsonValue candidate in registry["workspaceLocks"].Elements)
             {
-                if (Matches(Text(candidate, "mode"), "off"))
+                if (GuardValues.Matches(GuardValues.Text(candidate, "mode"), "off"))
                 {
                     continue;
                 }
@@ -723,14 +733,16 @@ namespace ClaudeAccountGuard.WrapperLauncher
             foreach (JsonValue candidate in workspaceLock["workspaceRootPathsNormalized"].Elements)
             {
                 string value = candidate.AsText();
-                if (!IsBlank(value))
+                if (!GuardValues.IsBlank(value))
                 {
                     paths.Add(value);
                 }
             }
             if (paths.Count == 0)
             {
-                paths.Add(Text(workspaceLock, "workspacePathNormalized") ?? string.Empty);
+                paths.Add(
+                    GuardValues.Text(workspaceLock, "workspacePathNormalized") ?? string.Empty
+                );
             }
             int longest = 0;
             foreach (string candidate in paths)
@@ -743,49 +755,6 @@ namespace ClaudeAccountGuard.WrapperLauncher
                 }
             }
             return longest;
-        }
-
-        /// <summary>
-        /// The registered profile the ambient environment already points at, used only to
-        /// attribute local usage on an unbound launch. No credential file is ever opened.
-        /// </summary>
-        private static string AmbientProfileId(JsonValue registry)
-        {
-            string configured = Environment.GetEnvironmentVariable(ConfigDirectoryVariable);
-            if (string.IsNullOrEmpty(configured))
-            {
-                string userProfile = Environment.GetEnvironmentVariable("USERPROFILE");
-                configured = Path.Combine(userProfile ?? string.Empty, ".claude");
-            }
-            string normalized = NormalizeGuardPath(configured);
-            if (IsBlank(normalized))
-            {
-                return null;
-            }
-            foreach (JsonValue profile in registry["profiles"].Elements)
-            {
-                if (Matches(Text(profile, "configDirNormalized"), normalized))
-                {
-                    return Text(profile, "id");
-                }
-            }
-            return null;
-        }
-
-        private static JsonValue FindProfileById(JsonValue registry, string profileId)
-        {
-            if (IsBlank(profileId))
-            {
-                return null;
-            }
-            foreach (JsonValue profile in registry["profiles"].Elements)
-            {
-                if (Matches(Text(profile, "id"), profileId))
-                {
-                    return profile;
-                }
-            }
-            return null;
         }
 
         /// <summary>
@@ -813,8 +782,11 @@ namespace ClaudeAccountGuard.WrapperLauncher
             {
                 if (resolution.Registry != null)
                 {
-                    string candidate = Text(resolution.Registry["integration"], "upstreamWrapper");
-                    if (!IsBlank(candidate) && File.Exists(candidate))
+                    string candidate = GuardValues.Text(
+                        resolution.Registry["integration"],
+                        "upstreamWrapper"
+                    );
+                    if (!GuardValues.IsBlank(candidate) && File.Exists(candidate))
                     {
                         upstream = candidate;
                     }
@@ -866,14 +838,22 @@ namespace ClaudeAccountGuard.WrapperLauncher
         ///
         /// Every guard here exists to keep collection opt-in and local: a registration older
         /// than a minute is treated as dead, the profile and the integration must both have
-        /// telemetry enabled, and a user who has configured any exporter of their own keeps
-        /// it - the guard will not silently redirect their telemetry. The five content flags
-        /// are forced off unconditionally so prompts, responses, tool detail and raw API
+        /// telemetry enabled, and a user who has configured any part of their own OTEL pipeline
+        /// keeps all of it - the guard will not silently redirect their telemetry, and will not
+        /// inject half a configuration over a wire format it cannot satisfy. The five content
+        /// flags are forced off unconditionally so prompts, responses, tool detail and raw API
         /// bodies are never emitted, whatever else is configured.
+        ///
+        /// Spans are deliberately not collected: they require
+        /// <c>CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1</c>, and opting a user into a beta collection
+        /// mode they did not ask for is worse than dropping the signal. The traces exporter is set
+        /// to <c>none</c> explicitly rather than left alone, so an <c>otlp</c> value inherited from
+        /// the user's shell cannot aim spans at a collector route that refuses them. Nothing here
+        /// may ever set a beta telemetry variable.
         /// </summary>
         private static void ApplyCollectorEnvironment(JsonValue registry, string profileId)
         {
-            if (registry == null || IsBlank(profileId))
+            if (registry == null || GuardValues.IsBlank(profileId))
             {
                 return;
             }
@@ -882,18 +862,14 @@ namespace ClaudeAccountGuard.WrapperLauncher
             {
                 return;
             }
-            JsonValue telemetryProfile = FindProfileById(registry, profileId);
-            if (telemetryProfile == null || !telemetryProfile["telemetryEnabled"].IsTrue)
-            {
-                return;
-            }
-            if (registry["integration"]["telemetryEnabled"].IsFalse)
+            JsonValue telemetryProfile = GuardRegistry.FindProfileById(registry, profileId);
+            if (!GuardRegistry.CollectionAllowed(registry, telemetryProfile))
             {
                 return;
             }
 
             DateTimeOffset updatedAt = DateTimeOffset.Parse(
-                Text(collector, "updatedAt"),
+                GuardValues.Text(collector, "updatedAt"),
                 CultureInfo.InvariantCulture,
                 DateTimeStyles.RoundtripKind
             );
@@ -910,16 +886,10 @@ namespace ClaudeAccountGuard.WrapperLauncher
 
             // Everything that can fail is computed before a single variable is set, so a
             // failure here can never leave a half-configured exporter behind.
-            string workspacePath = NormalizeGuardPath(Directory.GetCurrentDirectory());
-            string workspaceHash = WorkspaceHash(workspacePath);
-            string workspaceLabel = Regex.Replace(
-                Path.GetFileName(workspacePath.TrimEnd('\\')),
-                "[^A-Za-z0-9_.-]",
-                "_"
-            );
+            string workspacePath = GuardPaths.Normalize(Directory.GetCurrentDirectory());
             string guardAttributes = "claude.account_guard.profile_id=" + profileId
-                + ",claude.account_guard.workspace_hash=" + workspaceHash
-                + ",claude.account_guard.workspace_label=" + workspaceLabel;
+                + ",claude.account_guard.workspace_hash=" + GuardPaths.WorkspaceHash(workspacePath)
+                + ",claude.account_guard.workspace_label=" + GuardPaths.LabelFor(workspacePath);
             string existingAttributes = Environment.GetEnvironmentVariable(
                 "OTEL_RESOURCE_ATTRIBUTES"
             );
@@ -928,7 +898,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
             Environment.SetEnvironmentVariable("CLAUDE_CODE_ENABLE_TELEMETRY", "1");
             Environment.SetEnvironmentVariable("OTEL_METRICS_EXPORTER", "otlp");
             Environment.SetEnvironmentVariable("OTEL_LOGS_EXPORTER", "otlp");
-            Environment.SetEnvironmentVariable("OTEL_TRACES_EXPORTER", "otlp");
+            Environment.SetEnvironmentVariable("OTEL_TRACES_EXPORTER", "none");
             Environment.SetEnvironmentVariable("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json");
             Environment.SetEnvironmentVariable(
                 "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -936,11 +906,11 @@ namespace ClaudeAccountGuard.WrapperLauncher
             );
             Environment.SetEnvironmentVariable(
                 "OTEL_EXPORTER_OTLP_HEADERS",
-                "Authorization=Bearer " + (Text(collector, "token") ?? string.Empty)
+                "Authorization=Bearer " + (GuardValues.Text(collector, "token") ?? string.Empty)
             );
             Environment.SetEnvironmentVariable(
                 "OTEL_RESOURCE_ATTRIBUTES",
-                IsBlank(existingAttributes)
+                GuardValues.IsBlank(existingAttributes)
                     ? guardAttributes
                     : existingAttributes + "," + guardAttributes
             );
@@ -951,18 +921,15 @@ namespace ClaudeAccountGuard.WrapperLauncher
             Environment.SetEnvironmentVariable("OTEL_LOG_RAW_API_BODIES", "0");
         }
 
+        /// <summary>
+        /// True when the user has set any part of their own OTEL pipeline. Whitespace does not
+        /// count: an exported-but-blank variable is not a configured exporter.
+        /// </summary>
         private static bool HasUserExporterConfiguration()
         {
-            foreach (string name in ExistingEndpointVariables)
+            foreach (string name in ForeignOtelVariables)
             {
-                if (!IsBlank(Environment.GetEnvironmentVariable(name)))
-                {
-                    return true;
-                }
-            }
-            foreach (string name in ExistingExporterVariables)
-            {
-                if (!IsBlank(Environment.GetEnvironmentVariable(name)))
+                if (!GuardValues.IsBlank(Environment.GetEnvironmentVariable(name)))
                 {
                     return true;
                 }
@@ -987,7 +954,8 @@ namespace ClaudeAccountGuard.WrapperLauncher
         /// </summary>
         private static void WriteGuardHealth(string category, int exitCode)
         {
-            if (SupportRoot == null)
+            string target = GuardSupport.Combine("wrapper-health.json");
+            if (target == null)
             {
                 return;
             }
@@ -1004,103 +972,12 @@ namespace ClaudeAccountGuard.WrapperLauncher
                 builder.Append(",\"pid\":");
                 builder.Append(processId.ToString(CultureInfo.InvariantCulture));
                 builder.Append('}');
-                AtomicFile.Write(
-                    Path.Combine(SupportRoot, "wrapper-health.json"),
-                    builder.ToString()
-                );
+                AtomicFile.Write(target, builder.ToString());
             }
             catch (Exception)
             {
                 // Diagnostics are best effort and never alter Claude launch behaviour.
             }
-        }
-
-        private static string ResolveSupportRoot()
-        {
-            try
-            {
-                string localAppData = Environment.GetEnvironmentVariable("LOCALAPPDATA");
-                if (!string.IsNullOrEmpty(localAppData))
-                {
-                    return Path.Combine(localAppData, "ClaudeAccountGuard");
-                }
-                string userProfile = Environment.GetEnvironmentVariable("USERPROFILE");
-                if (!string.IsNullOrEmpty(userProfile))
-                {
-                    return Path.Combine(userProfile, ".claude-account-guard");
-                }
-            }
-            catch (Exception)
-            {
-                // An unusable support root means the guard has no state and forwards.
-            }
-            return null;
-        }
-
-        /// <summary>
-        /// The single path shape the registry is written and compared in: absolute, with
-        /// backslash separators, no trailing separator except on a bare drive root, and
-        /// lower case.
-        /// </summary>
-        private static string NormalizeGuardPath(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return string.Empty;
-            }
-            string normalized = Path.GetFullPath(value).Replace("/", "\\").TrimEnd('\\');
-            if (normalized.Length == 2
-                && normalized[1] == ':'
-                && ((normalized[0] >= 'A' && normalized[0] <= 'Z')
-                    || (normalized[0] >= 'a' && normalized[0] <= 'z')))
-            {
-                normalized += "\\";
-            }
-            return normalized.ToLowerInvariant();
-        }
-
-        private static string WorkspaceHash(string normalizedPath)
-        {
-            using (SHA256 algorithm = SHA256.Create())
-            {
-                byte[] digest = algorithm.ComputeHash(Encoding.UTF8.GetBytes(normalizedPath));
-                var builder = new StringBuilder(digest.Length * 2);
-                foreach (byte value in digest)
-                {
-                    builder.Append(value.ToString("x2", CultureInfo.InvariantCulture));
-                }
-                return builder.ToString().Substring(0, 16);
-            }
-        }
-
-        private static string FirstValue(params JsonValue[] candidates)
-        {
-            foreach (JsonValue candidate in candidates)
-            {
-                string value = candidate.AsText();
-                if (!IsBlank(value))
-                {
-                    return value;
-                }
-            }
-            return null;
-        }
-
-        private static string Text(JsonValue value, string name)
-        {
-            return value[name].AsText();
-        }
-
-        private static bool IsBlank(string value)
-        {
-            return string.IsNullOrWhiteSpace(value);
-        }
-
-        private static bool Matches(string left, string right)
-        {
-            return left != null
-                && right != null
-                && string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
         }
     }
 }

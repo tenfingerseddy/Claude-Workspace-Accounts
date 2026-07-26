@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn, spawnSync } from "node:child_process";
+import { FOREIGN_OTEL_VARIABLES } from "../src/telemetry/otelEnvironment.ts";
 
 const WRAPPER = path.resolve("bin/native/win-x64/claude-account-guard-wrapper.exe");
 const CLI_SCRIPT = path.resolve("test/fixtures/fake-claude-cli.js");
@@ -120,15 +121,10 @@ function baseEnvironment() {
     CLAUDE_ACCOUNT_GUARD_DISABLE: undefined,
     CLAUDE_ACCOUNT_GUARD_WORKSPACE_KEY: undefined,
     CLAUDE_CODE_ENABLE_TELEMETRY: undefined,
-    OTEL_EXPORTER_OTLP_ENDPOINT: undefined,
-    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: undefined,
-    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: undefined,
-    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: undefined,
-    OTEL_EXPORTER_OTLP_HEADERS: undefined,
-    OTEL_METRICS_EXPORTER: undefined,
-    OTEL_LOGS_EXPORTER: undefined,
-    OTEL_TRACES_EXPORTER: undefined,
     OTEL_RESOURCE_ATTRIBUTES: undefined,
+    // Every variable the guard treats as somebody else's exporter, so the injection checks
+    // measure the guard rather than the developer's shell.
+    ...Object.fromEntries(FOREIGN_OTEL_VARIABLES.map((name) => [name, undefined])),
     FAKE_EMAIL: "work@example.com",
     FAKE_ACCOUNT_ID: "acct-work",
     FAKE_ORG_ID: "org-work"
@@ -575,6 +571,22 @@ try {
     `status ${injected.result.status}, environment ${JSON.stringify(injected.environment)}`
   );
   check(
+    "the wire format the collector needs is set explicitly",
+    injected.environment.OTEL_EXPORTER_OTLP_PROTOCOL === "http/json"
+      && injected.environment.OTEL_METRICS_EXPORTER === "otlp"
+      && injected.environment.OTEL_LOGS_EXPORTER === "otlp",
+    JSON.stringify(injected.environment)
+  );
+  check(
+    "spans are refused rather than beta-enabled",
+    // The collector does not accept traces, and enabling them needs a beta flag Account Guard
+    // will not set for the user. `none` explicitly, so an inherited `otlp` cannot aim spans at a
+    // route that rejects them.
+    injected.environment.OTEL_TRACES_EXPORTER === "none"
+      && injected.environment.CLAUDE_CODE_ENHANCED_TELEMETRY_BETA === undefined,
+    JSON.stringify(injected.environment)
+  );
+  check(
     "every content-telemetry flag is forced off",
     ["OTEL_LOG_USER_PROMPTS", "OTEL_LOG_ASSISTANT_RESPONSES", "OTEL_LOG_TOOL_DETAILS",
       "OTEL_LOG_TOOL_CONTENT", "OTEL_LOG_RAW_API_BODIES"]
@@ -599,6 +611,23 @@ try {
     preserved.environment.OTEL_EXPORTER_OTLP_ENDPOINT === "https://collector.example.com",
     JSON.stringify(preserved.environment)
   );
+
+  // The guard used to check four endpoints and three exporter selections, so a user who had set
+  // any other part of their own pipeline was injected over and then had every export rejected.
+  // Every variable the extension considers foreign must refuse injection outright.
+  for (const name of FOREIGN_OTEL_VARIABLES) {
+    const foreign = await launchAndCaptureEnvironment({
+      cwd: parentWorkspace,
+      env: { [name]: name.endsWith("_PROTOCOL") ? "http/protobuf" : "user-value" }
+    });
+    check(
+      `a user's ${name} refuses collector injection outright`,
+      foreign.environment.CLAUDE_CODE_ENABLE_TELEMETRY === undefined
+        && foreign.environment.OTEL_EXPORTER_OTLP_ENDPOINT
+          !== "http://127.0.0.1:45999",
+      JSON.stringify(foreign.environment)
+    );
+  }
 
   await useRegistry(collectorRegistry(new Date(Date.now() - 600_000).toISOString()));
   const stale = await launchAndCaptureEnvironment({ cwd: parentWorkspace });

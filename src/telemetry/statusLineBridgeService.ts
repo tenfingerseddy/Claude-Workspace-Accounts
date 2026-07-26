@@ -11,19 +11,94 @@ interface ClaudeSettings {
   [key: string]: unknown;
 }
 
-export class StatusLineBridgeService {
-  public constructor(private readonly bridgePath: string) {}
+interface BridgeBackup {
+  schemaVersion: 1;
+  /** The whole previous statusLine object, so padding and custom keys survive a round trip. */
+  nextStatusLine?: ClaudeSettings["statusLine"];
+  /** The command alone, for the bridge, which only ever needs something to chain to. */
+  nextCommand?: string;
+  installedAt: string;
+}
 
+export type StatusLineBackupState =
+  /** No status line existed before installation, so there is nothing to preserve. */
+  | "none_recorded"
+  /** A backup exists and parses, and names a command to chain. */
+  | "valid"
+  /** A backup exists and parses but records no command. */
+  | "valid_empty"
+  /** A backup file exists and could not be read or parsed. The user's command is unrecoverable. */
+  | "corrupt"
+  /** No backup file at all, though the bridge is installed. */
+  | "missing";
+
+export interface StatusLineBackupReport {
+  state: StatusLineBackupState;
+  /** True only when a real previous command can actually be restored. Never claimed otherwise. */
+  restorable: boolean;
+  /** Which copy answered: the profile's own record, or the guard-owned mirror. */
+  source?: "profile" | "mirror";
+  command?: string;
+  detail?: string;
+}
+
+export interface StatusLineUninstallResult {
+  /** What the user's settings.json ended up with. */
+  restored: "previous_status_line" | "previous_command" | "claude_default" | "unchanged";
+  backup: StatusLineBackupReport;
+}
+
+function isStatusLineObject(value: unknown): value is NonNullable<ClaudeSettings["statusLine"]> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export class StatusLineBridgeService {
+  /**
+   * @param mirrorDirectory Where the guard-owned second copy of each backup lives. Defaults beside
+   * the bridge script, which is outside the versioned extension directory, so the backup survives
+   * both extension upgrades and a user clearing their Claude profile directory.
+   */
+  public constructor(
+    private readonly bridgePath: string,
+    private readonly mirrorDirectory = path.join(
+      path.dirname(bridgePath),
+      "statusline-backups"
+    )
+  ) {}
+
+  /**
+   * The command Claude runs on every status-line refresh.
+   *
+   * A native executable invoked directly: the bridge used to be a PowerShell script, which cost
+   * most of a second of interpreter start-up on every single refresh and mangled both the payload
+   * it was given and the command it chained. The path is quoted because Claude runs this through a
+   * shell and a user profile directory may contain spaces.
+   */
   public bridgeCommand(): string {
-    return `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${this.bridgePath}"`;
+    return `"${this.bridgePath}"`;
+  }
+
+  /**
+   * Whether a configured status-line command is one of ours, from any release.
+   *
+   * Recognising an older bridge matters on upgrade: replacing it without this check would record
+   * the previous *bridge* command as the user's own status line, and uninstalling would then
+   * "restore" a script that no longer exists.
+   */
+  private isBridgeCommand(command: string | undefined): boolean {
+    if (!command) {
+      return false;
+    }
+    const normalized = command.toLocaleLowerCase();
+    return normalized.includes("statusline-bridge.exe")
+      || normalized.includes("statusline-bridge.ps1");
   }
 
   public async install(profile: AccountProfile): Promise<"installed" | "already_installed"> {
     await mkdir(profile.configDir, { recursive: true });
     const settingsPath = path.join(profile.configDir, "settings.json");
-    const supportDirectory = path.join(profile.configDir, ".claude-account-guard");
-    const nextPath = path.join(supportDirectory, "statusline-next.json");
-    await mkdir(supportDirectory, { recursive: true });
+    const nextPath = this.backupPath(profile);
+    await mkdir(path.dirname(nextPath), { recursive: true });
 
     const settings = await this.readSettings(settingsPath);
     const command = this.bridgeCommand();
@@ -31,12 +106,40 @@ export class StatusLineBridgeService {
       return "already_installed";
     }
 
-    await this.atomicWrite(nextPath, {
+    // An earlier release installed a different bridge command. Swap it for the current one and
+    // leave the existing backup alone: the user's real status line is already recorded there, and
+    // overwriting it with a bridge command would make it unrestorable.
+    if (this.isBridgeCommand(settings.statusLine?.command)) {
+      settings.statusLine = { ...(settings.statusLine ?? {}), type: "command", command };
+      await this.atomicWrite(settingsPath, settings);
+      return "installed";
+    }
+
+    const backup: BridgeBackup = {
       schemaVersion: 1,
-      nextCommand: settings.statusLine?.command,
+      nextCommand: typeof settings.statusLine?.command === "string"
+        ? settings.statusLine.command
+        : undefined,
       nextStatusLine: settings.statusLine,
       installedAt: new Date().toISOString()
-    });
+    };
+    await this.atomicWrite(nextPath, backup);
+    // A second copy the user's own profile directory cannot take with it. Best effort: failing to
+    // mirror is not a reason to refuse installation, because the primary record is already durable.
+    await this.writeMirror(profile, backup).catch(() => undefined);
+
+    // Read the backup back before touching settings.json. Installing the bridge while the record of
+    // what it replaced is unreadable is exactly how a status line ends up unrecoverable.
+    if (settings.statusLine) {
+      const verified = await this.readBackup(nextPath);
+      if (!verified || !this.describeBackup(verified, "profile").restorable) {
+        throw new Error(
+          "Account Guard did not install the status-line bridge: it could not save a verifiable "
+          + "backup of your existing status line, and it will not replace a command it cannot restore."
+        );
+      }
+    }
+
     settings.statusLine = {
       ...(settings.statusLine ?? {}),
       type: "command",
@@ -46,35 +149,113 @@ export class StatusLineBridgeService {
     return "installed";
   }
 
-  public async uninstall(profile: AccountProfile): Promise<void> {
+  public async uninstall(profile: AccountProfile): Promise<StatusLineUninstallResult> {
     const settingsPath = path.join(profile.configDir, "settings.json");
-    const nextPath = path.join(profile.configDir, ".claude-account-guard", "statusline-next.json");
     const settings = await this.readSettings(settingsPath);
-    if (settings.statusLine?.command !== this.bridgeCommand()) {
-      return;
+    const backup = await this.backupState(profile);
+    // Any release's bridge command counts, so a user who upgraded can still detach cleanly.
+    if (!this.isBridgeCommand(settings.statusLine?.command)) {
+      return { restored: "unchanged", backup };
     }
-    let nextStatusLine: ClaudeSettings["statusLine"];
-    try {
-      const next = JSON.parse(await readFile(nextPath, "utf8")) as {
-        nextCommand?: unknown;
-        nextStatusLine?: unknown;
-      };
-      if (next.nextStatusLine
-        && typeof next.nextStatusLine === "object"
-        && !Array.isArray(next.nextStatusLine)) {
-        nextStatusLine = next.nextStatusLine as ClaudeSettings["statusLine"];
-      } else if (typeof next.nextCommand === "string") {
-        nextStatusLine = { type: "command", command: next.nextCommand };
-      }
-    } catch {
-      // A missing bridge record means there was no known status line to restore.
+
+    const record = (await this.readBackup(this.backupPath(profile)))
+      ?? (await this.readBackup(this.mirrorPath(profile)));
+
+    if (record && isStatusLineObject(record.nextStatusLine)) {
+      settings.statusLine = record.nextStatusLine;
+      await this.atomicWrite(settingsPath, settings);
+      return { restored: "previous_status_line", backup };
     }
-    if (nextStatusLine) {
-      settings.statusLine = nextStatusLine;
-    } else {
-      delete settings.statusLine;
+    if (record && typeof record.nextCommand === "string" && record.nextCommand) {
+      settings.statusLine = { type: "command", command: record.nextCommand };
+      await this.atomicWrite(settingsPath, settings);
+      return { restored: "previous_command", backup };
     }
+    if (backup.state === "corrupt" || backup.state === "missing") {
+      // Deleting the setting here is what blanked people's status lines: the bridge command goes
+      // away along with any record of what it replaced. Leave settings.json alone and report the
+      // loss so the caller can tell the user which command to put back by hand.
+      return { restored: "unchanged", backup };
+    }
+    // A verified "there was nothing here before": removing the key restores Claude's own default.
+    delete settings.statusLine;
     await this.atomicWrite(settingsPath, settings);
+    return { restored: "claude_default", backup };
+  }
+
+  /**
+   * What can actually be restored for this profile. The caller must consult this before telling a
+   * user their status line is preserved — the claim used to be unconditional and often untrue.
+   */
+  public async backupState(profile: AccountProfile): Promise<StatusLineBackupReport> {
+    for (const [source, location] of [
+      ["profile", this.backupPath(profile)],
+      ["mirror", this.mirrorPath(profile)]
+    ] as const) {
+      let raw: string;
+      try {
+        raw = await readFile(location, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          continue;
+        }
+        return {
+          state: "corrupt",
+          restorable: false,
+          source,
+          detail: (error as NodeJS.ErrnoException).code ?? "unreadable"
+        };
+      }
+      try {
+        return this.describeBackup(JSON.parse(raw) as BridgeBackup, source);
+      } catch {
+        return { state: "corrupt", restorable: false, source, detail: "invalid_json" };
+      }
+    }
+    return { state: "missing", restorable: false };
+  }
+
+  private describeBackup(
+    record: BridgeBackup,
+    source: "profile" | "mirror"
+  ): StatusLineBackupReport {
+    if (record.schemaVersion !== 1) {
+      return { state: "corrupt", restorable: false, source, detail: "unsupported_schema" };
+    }
+    const command = isStatusLineObject(record.nextStatusLine)
+      && typeof record.nextStatusLine.command === "string"
+      ? record.nextStatusLine.command
+      : typeof record.nextCommand === "string" ? record.nextCommand : undefined;
+    if (command) {
+      return { state: "valid", restorable: true, source, command };
+    }
+    if (isStatusLineObject(record.nextStatusLine)) {
+      return { state: "valid", restorable: true, source };
+    }
+    // Recorded, parseable, and genuinely empty: the profile had no status line before.
+    return { state: "none_recorded", restorable: false, source };
+  }
+
+  private backupPath(profile: AccountProfile): string {
+    return path.join(profile.configDir, ".claude-account-guard", "statusline-next.json");
+  }
+
+  private mirrorPath(profile: AccountProfile): string {
+    return path.join(this.mirrorDirectory, `${profile.id}.json`);
+  }
+
+  private async writeMirror(profile: AccountProfile, backup: BridgeBackup): Promise<void> {
+    await mkdir(this.mirrorDirectory, { recursive: true });
+    await this.atomicWrite(this.mirrorPath(profile), backup);
+  }
+
+  private async readBackup(location: string): Promise<BridgeBackup | undefined> {
+    try {
+      const parsed = JSON.parse(await readFile(location, "utf8")) as BridgeBackup;
+      return parsed.schemaVersion === 1 ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async readSettings(settingsPath: string): Promise<ClaudeSettings> {

@@ -1,4 +1,4 @@
-import type { StatusSnapshot } from "../core/models.js";
+import type { CollectionDegradationReason, StatusSnapshot } from "../core/models.js";
 
 export interface NormalizedMetric {
   name: string;
@@ -13,42 +13,127 @@ export interface NormalizedEvent {
   attributes: Record<string, string | number | boolean>;
 }
 
+export type OtlpSignal = "metrics" | "logs" | "traces";
+
 export interface NormalizedOtlp {
   metrics: NormalizedMetric[];
   events: NormalizedEvent[];
+  /**
+   * Which OTLP envelopes the payload actually contained. Empty means the body was valid JSON but was
+   * not an OTLP export request at all — the collector must say so rather than answer 200 and drop
+   * it, which is how "accepted and silently ignored" used to look identical to "stored".
+   */
+  signals: OtlpSignal[];
+  /** Fidelity losses, by reason. Surfaced through collection health so no fallback stays invisible. */
+  degradations: Partial<Record<CollectionDegradationReason, number>>;
 }
 
 type JsonRecord = Record<string, unknown>;
 type SafeScalar = string | number | boolean;
 
+/**
+ * Attribute allowlist, verified against https://code.claude.com/docs/en/monitoring-usage (2026-07).
+ *
+ * Deliberately absent, and must stay absent: `prompt`, `response`, `body`, `body_ref`, `tool_input`,
+ * `tool_parameters`, `message.uuid`, and `error`. `error` is documented as the *full error message*,
+ * which routinely contains file paths and command output, so only the categorical `error_type`,
+ * `error_code` and `error_category` are retained.
+ */
 const SAFE_ATTRIBUTES = new Set([
+  "action",
   "agent.name",
   "agent_id",
   "attempt",
+  "auth_method",
   "cache_creation_tokens",
   "cache_read_tokens",
+  "category",
   "claude.account_guard.profile_id",
   "claude.account_guard.workspace_hash",
   "claude.account_guard.workspace_label",
+  "cost_usd",
   "decision",
+  "decision_source",
+  "decision_type",
   "duration_ms",
+  "effort",
   "error_category",
+  "error_code",
+  "error_name",
+  "error_type",
   "event.name",
+  "from_mode",
   "input_tokens",
+  "language",
+  "marketplace.name",
+  "mcp_server.name",
+  "mcp_server_scope",
+  "mcp_tool.name",
   "model",
   "output_tokens",
   "plugin.name",
+  "plugin.scope",
+  "plugin.version",
   "query_source",
   "server_name",
+  "server_scope",
   "skill.name",
   "source",
+  "speed",
+  "start_type",
   "status",
   "status_code",
   "success",
+  "to_mode",
   "tool_name",
-  "type",
-  "ttft_ms"
+  "tool_source",
+  "transport_type",
+  "trigger",
+  "ttft_ms",
+  "type"
 ]);
+
+/**
+ * Anthropic encodes these as the strings "true"/"false", not as OTLP `boolValue`. Reading them as
+ * raw scalars made every failed tool result look successful and made failed auth events vanish,
+ * because a non-empty string is truthy and `"false" !== false`.
+ */
+const BOOLEAN_ATTRIBUTES = new Set([
+  "has_category",
+  "has_explanation",
+  "has_hooks",
+  "has_mcp",
+  "host_owned_mcp",
+  "is_plugin",
+  "marketplace.is_official",
+  "success"
+]);
+
+/**
+ * Interpret a boolean-like value from any of the encodings seen on the wire: a real boolean, the
+ * strings "true"/"false" that Claude Code actually sends, and the 1/0 forms OTLP `intValue` yields.
+ * Returns undefined when the value carries no boolean meaning, so callers can tell "absent" from
+ * "false" — a distinction the old `!== false` test destroyed.
+ */
+export function canonicalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value === 1 ? true : value === 0 ? false : undefined;
+  }
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim().toLocaleLowerCase();
+  if (["true", "1", "yes", "y", "ok", "success"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "no", "n", "failure", "failed", "error"].includes(normalized)) {
+    return false;
+  }
+  return undefined;
+}
 
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -56,6 +141,19 @@ function isRecord(value: unknown): value is JsonRecord {
 
 function array(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+/** Accumulates fidelity losses so the collector can persist them as counters. */
+class DegradationLog {
+  private readonly counts = new Map<CollectionDegradationReason, number>();
+
+  public note(reason: CollectionDegradationReason): void {
+    this.counts.set(reason, (this.counts.get(reason) ?? 0) + 1);
+  }
+
+  public snapshot(): Partial<Record<CollectionDegradationReason, number>> {
+    return Object.fromEntries(this.counts) as Partial<Record<CollectionDegradationReason, number>>;
+  }
 }
 
 function scalarFromOtlpValue(value: unknown): SafeScalar | undefined {
@@ -87,9 +185,22 @@ function attributes(value: unknown): Record<string, SafeScalar> {
       continue;
     }
     const scalar = scalarFromOtlpValue(item.value);
-    if (scalar !== undefined) {
-      result[item.key] = typeof scalar === "string" ? scalar.slice(0, 300) : scalar;
+    if (scalar === undefined) {
+      continue;
     }
+    if (BOOLEAN_ATTRIBUTES.has(item.key)) {
+      const canonical = canonicalBoolean(scalar);
+      if (canonical !== undefined) {
+        result[item.key] = canonical;
+        continue;
+      }
+    }
+    result[item.key] = typeof scalar === "string" ? scalar.slice(0, 300) : scalar;
+  }
+  // `error_type` is the documented categorical key on tool_result; `error_category` only exists on
+  // auth events. Storage reads one column, so alias rather than teaching every call site both.
+  if (result.error_category === undefined && typeof result.error_type === "string") {
+    result.error_category = result.error_type;
   }
   return result;
 }
@@ -105,37 +216,52 @@ function numberValue(record: JsonRecord): number | undefined {
   return undefined;
 }
 
-function timestamp(record: JsonRecord): string {
+/**
+ * Substituting collection time for a malformed export timestamp is the right fallback — dropping the
+ * point would lose real usage — but it silently misattributes the day, so every substitution is
+ * counted under `fallbackReason`.
+ */
+function timestamp(
+  record: JsonRecord,
+  degradations: DegradationLog,
+  fallbackReason: CollectionDegradationReason
+): string {
   const unixNanos = record.timeUnixNano
     ?? record.observedTimeUnixNano
     ?? record.startTimeUnixNano;
   if (typeof unixNanos === "string" && /^\d+$/.test(unixNanos)) {
-    try {
-      return new Date(Number(BigInt(unixNanos) / 1_000_000n)).toISOString();
-    } catch {
-      // Fall through to collection time.
+    const parsed = new Date(Number(BigInt(unixNanos) / 1_000_000n));
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
     }
   }
   if (typeof unixNanos === "number" && Number.isFinite(unixNanos)) {
-    return new Date(unixNanos / 1_000_000).toISOString();
+    const parsed = new Date(unixNanos / 1_000_000);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
   }
+  degradations.note(fallbackReason);
   return new Date().toISOString();
 }
 
-function spanDurationMs(record: JsonRecord): number | undefined {
+function spanDurationMs(record: JsonRecord, degradations: DegradationLog): number | undefined {
   const start = record.startTimeUnixNano;
   const end = record.endTimeUnixNano;
   if ((typeof start !== "string" && typeof start !== "number")
     || (typeof end !== "string" && typeof end !== "number")) {
+    degradations.note("span_duration_unusable");
     return undefined;
   }
   try {
     const nanoseconds = BigInt(end) - BigInt(start);
     if (nanoseconds < 0n) {
+      degradations.note("span_duration_unusable");
       return undefined;
     }
     return Number(nanoseconds / 1_000_000n);
   } catch {
+    degradations.note("span_duration_unusable");
     return undefined;
   }
 }
@@ -152,6 +278,17 @@ export function normalizeOtlp(payload: unknown): NormalizedOtlp {
   const root = isRecord(payload) ? payload : {};
   const metrics: NormalizedMetric[] = [];
   const events: NormalizedEvent[] = [];
+  const degradations = new DegradationLog();
+  const signals: OtlpSignal[] = [];
+  if (Array.isArray(root.resourceMetrics)) {
+    signals.push("metrics");
+  }
+  if (Array.isArray(root.resourceLogs)) {
+    signals.push("logs");
+  }
+  if (Array.isArray(root.resourceSpans)) {
+    signals.push("traces");
+  }
 
   for (const resourceMetric of array(root.resourceMetrics)) {
     if (!isRecord(resourceMetric)) {
@@ -174,16 +311,18 @@ export function normalizeOtlp(payload: unknown): NormalizedOtlp {
         ];
         for (const point of pointGroups) {
           if (!isRecord(point)) {
+            degradations.note("dropped_metric_point");
             continue;
           }
           const value = numberValue(point);
           if (value === undefined) {
+            degradations.note("dropped_metric_point");
             continue;
           }
           metrics.push({
             name: metric.name,
             value,
-            timestamp: timestamp(point),
+            timestamp: timestamp(point, degradations, "metric_timestamp_fallback"),
             attributes: {
               ...metricResourceAttributes,
               ...attributes(point.attributes)
@@ -207,6 +346,7 @@ export function normalizeOtlp(payload: unknown): NormalizedOtlp {
       }
       for (const logRecord of array(scopeLog.logRecords)) {
         if (!isRecord(logRecord)) {
+          degradations.note("dropped_log_record");
           continue;
         }
         const safeAttributes = {
@@ -217,11 +357,12 @@ export function normalizeOtlp(payload: unknown): NormalizedOtlp {
           ? safeAttributes["event.name"]
           : bodyName(logRecord.body);
         if (!name) {
+          degradations.note("dropped_log_record");
           continue;
         }
         events.push({
           name,
-          timestamp: timestamp(logRecord),
+          timestamp: timestamp(logRecord, degradations, "event_timestamp_fallback"),
           attributes: safeAttributes
         });
       }
@@ -241,25 +382,26 @@ export function normalizeOtlp(payload: unknown): NormalizedOtlp {
       }
       for (const span of array(scopeSpan.spans)) {
         if (!isRecord(span) || typeof span.name !== "string" || !span.name) {
+          degradations.note("dropped_span");
           continue;
         }
         const safeAttributes = {
           ...spanResourceAttributes,
           ...attributes(span.attributes)
         };
-        const durationMs = spanDurationMs(span);
+        const durationMs = spanDurationMs(span, degradations);
         if (durationMs !== undefined && safeAttributes.duration_ms === undefined) {
           safeAttributes.duration_ms = durationMs;
         }
         events.push({
           name: span.name.slice(0, 200),
-          timestamp: timestamp(span),
+          timestamp: timestamp(span, degradations, "event_timestamp_fallback"),
           attributes: safeAttributes
         });
       }
     }
   }
-  return { metrics, events };
+  return { metrics, events, signals, degradations: degradations.snapshot() };
 }
 
 export function localDay(timestampValue: string): string {

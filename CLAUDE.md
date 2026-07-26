@@ -53,8 +53,10 @@ with one environment variable. Documentation must state the guarantee at that st
 | Path | What lives there |
 | --- | --- |
 | `src/` | Extension host code (TypeScript, ESM, bundled to `dist/extension.cjs` by esbuild) |
+| `native/Shared/` | Path normalization, JSON reading, registry loading shared by both native binaries |
 | `native/WrapperLauncher/` | The process wrapper: C# compiled by in-box `csc.exe` to a small .NET Framework exe |
-| `bin/` | `statusline-bridge.ps1`, plus `bin/native/win-x64/` build output (gitignored) |
+| `native/StatusLineBridge/` | The status-line bridge, same toolchain — a second binary, not an argv mode of the first |
+| `bin/` | `bin/native/win-x64/` build output only, and gitignored. No PowerShell ships any more |
 | `scripts/` | Build, package, and smoke-test entry points (`.mjs`, plus `.ts` run through a loader) |
 | `test/` | `vitest` unit + integration tests; `test/fixtures/` holds stand-in executables |
 | `docs/` | Privacy, telemetry, troubleshooting, feasibility, release-readiness records |

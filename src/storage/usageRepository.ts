@@ -5,6 +5,14 @@ import type {
   AttributionDimension,
   AttributionRow,
   AuthVerification,
+  CollectionCounter,
+  CollectionDegradationReason,
+  CollectionHealth,
+  CollectionHealthContext,
+  CollectionPhase,
+  CollectionQuarantineReason,
+  CollectionRejectionReason,
+  CollectorLifecycleUpdate,
   DashboardDateBounds,
   DashboardRange,
   ReliabilitySummary,
@@ -14,7 +22,174 @@ import type {
 } from "../core/models.js";
 import { workspaceHash } from "../core/paths.js";
 import type { NormalizedEvent, NormalizedMetric } from "../telemetry/normalizers.js";
-import { localDay, normalizeEventName } from "../telemetry/normalizers.js";
+import { canonicalBoolean, localDay, normalizeEventName } from "../telemetry/normalizers.js";
+
+/**
+ * The wrapper refuses to inject OTEL when the collector registration is older than this, so a
+ * silently failing heartbeat stops telemetry permanently. Collection health reports the age against
+ * this window rather than making the dashboard rediscover the wrapper's rule.
+ */
+export const REGISTRATION_STALE_AFTER_MS = 60_000;
+
+export type StorageFailureCategory =
+  | "busy"
+  | "locked"
+  | "io"
+  | "disk_full"
+  | "readonly"
+  | "corrupt"
+  | "constraint"
+  | "schema"
+  | "unknown";
+
+/**
+ * A storage failure, distinguished from bad client data.
+ *
+ * Every ingest error used to surface as HTTP 400, which Claude's exporter treats as non-retryable —
+ * so a five-second SQLite busy timeout permanently destroyed a batch of real usage. `transient` is
+ * what decides whether the collector answers 503 (try again) or 500 (this will not get better).
+ */
+export class StorageWriteError extends Error {
+  public constructor(
+    public readonly category: StorageFailureCategory,
+    public readonly transient: boolean,
+    cause: unknown
+  ) {
+    super(`storage_${category}`);
+    this.name = "StorageWriteError";
+    this.cause = cause;
+  }
+}
+
+const TRANSIENT_CATEGORIES = new Set<StorageFailureCategory>([
+  "busy",
+  "locked",
+  "io",
+  "disk_full",
+  // An unrecognised failure is treated as transient on purpose: retrying costs a duplicate export
+  // attempt, whereas guessing "permanent" throws away usage we can never recover.
+  "unknown"
+]);
+
+/**
+ * Map a node:sqlite failure onto a category. node:sqlite surfaces the SQLite result code as
+ * `errcode` and the message as `errstr`, but neither is guaranteed, so the message is a fallback.
+ */
+export function classifyStorageFailure(error: unknown): StorageFailureCategory {
+  const candidate = error as { errcode?: unknown; errstr?: unknown; message?: unknown };
+  const code = typeof candidate?.errcode === "number" ? candidate.errcode & 0xff : undefined;
+  switch (code) {
+    case 5: return "busy";
+    case 6: return "locked";
+    case 8: return "readonly";
+    case 10: return "io";
+    case 11: return "corrupt";
+    case 13: return "disk_full";
+    case 14: return "io";
+    case 15: return "io";
+    case 17: return "schema";
+    case 19: return "constraint";
+    case 26: return "corrupt";
+    default: break;
+  }
+  const message = `${typeof candidate?.errstr === "string" ? candidate.errstr : ""} ${
+    typeof candidate?.message === "string" ? candidate.message : ""
+  }`.toLocaleLowerCase();
+  if (message.includes("database is locked")) {
+    return "locked";
+  }
+  if (message.includes("busy")) {
+    return "busy";
+  }
+  if (message.includes("readonly") || message.includes("read-only")) {
+    return "readonly";
+  }
+  if (message.includes("disk i/o") || message.includes("unable to open")) {
+    return "io";
+  }
+  if (message.includes("disk is full")) {
+    return "disk_full";
+  }
+  if (message.includes("malformed") || message.includes("not a database")) {
+    return "corrupt";
+  }
+  if (message.includes("constraint")) {
+    return "constraint";
+  }
+  if (message.includes("no such table") || message.includes("no such column")) {
+    return "schema";
+  }
+  return "unknown";
+}
+
+function asStorageWriteError(error: unknown): StorageWriteError {
+  if (error instanceof StorageWriteError) {
+    return error;
+  }
+  const category = classifyStorageFailure(error);
+  return new StorageWriteError(category, TRANSIENT_CATEGORIES.has(category), error);
+}
+
+/**
+ * A real synchronous pause. The repository is constructed synchronously before any telemetry service
+ * exists, so there is nowhere to await; without this, contention with another extension host's
+ * writer throws straight out of `activate`.
+ */
+function sleepSync(milliseconds: number): void {
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(signal, 0, 0, milliseconds);
+}
+
+const SCHEMA_VERSION = 3;
+const OPEN_RETRY_DELAYS_MS = [40, 90, 180, 360, 720];
+
+/** Interpret a boolean-like attribute, defaulting to `fallback` when the attribute is absent. */
+function flag(value: unknown, fallback: boolean): boolean {
+  return canonicalBoolean(value) ?? fallback;
+}
+
+/**
+ * Reduce the persisted facts to one phase, most-blocking first. The order is the diagnosis order: a
+ * collector that cannot bind is not "awaiting data", and a stale registration outranks a rejection
+ * because the wrapper has already stopped sending.
+ */
+type RequestOutcome = "stored" | "rejected" | "accepted_empty";
+
+function derivePhase(input: {
+  context: CollectionHealthContext;
+  collector: CollectionHealth["collector"];
+  lastOutcome?: RequestOutcome;
+  storage: CollectionHealth["storage"];
+}): CollectionPhase {
+  if (input.context.runtimeProfileRegistered === false) {
+    return "no_runtime_profile";
+  }
+  if (input.context.telemetryEnabled === false) {
+    return "telemetry_disabled";
+  }
+  if (input.collector.bindError && !input.collector.listening) {
+    return "port_bind_failed";
+  }
+  if (!input.collector.listening) {
+    return "collector_stopped";
+  }
+  if (input.collector.registrationStale || input.collector.heartbeatFailures > 0) {
+    return "registration_stale";
+  }
+  // Only the *most recent* request outcome is a diagnosis: a 401 during startup that was followed by
+  // successful stores is history. This reads a recorded outcome rather than comparing timestamps,
+  // because two outcomes in the same millisecond would otherwise order arbitrarily.
+  if (input.lastOutcome === "rejected") {
+    return "rejecting";
+  }
+  if (input.lastOutcome === "accepted_empty") {
+    return "accepted_empty";
+  }
+  if (input.storage.lastSuccessfulWriteAt) {
+    return "collecting";
+  }
+  return "awaiting_data";
+}
 
 interface DailyDimensions {
   day: string;
@@ -77,14 +252,128 @@ function percentile(values: number[], fraction: number): number | undefined {
 
 export class UsageRepository {
   private readonly database: DatabaseSync;
+  /** Deferred because the counters table does not exist until `migrate` has run. */
+  private readonly startupDegradations: Array<[CollectionDegradationReason, string]> = [];
+  /** Survives a database that is too locked to record its own unavailability. */
+  private lastStorageFailure?: { at: string; category: StorageFailureCategory };
+  private readonly busyTimeoutMs: number;
 
-  public constructor(public readonly databasePath: string) {
+  public constructor(
+    public readonly databasePath: string,
+    options: { busyTimeoutMs?: number } = {}
+  ) {
+    this.busyTimeoutMs = options.busyTimeoutMs ?? 5_000;
     mkdirSync(path.dirname(databasePath), { recursive: true });
-    this.database = new DatabaseSync(databasePath, { timeout: 5_000 });
-    this.database.exec("PRAGMA journal_mode = WAL");
+    this.database = this.open();
+    this.applyPragmas();
+    this.migrateWithRetry();
+    for (const [reason, detail] of this.startupDegradations.splice(0)) {
+      this.recordDegradation(undefined, reason, detail);
+    }
+  }
+
+  /**
+   * Opening can fail transiently while another extension host holds the file. Retry with backoff
+   * rather than letting the throw escape into `activate`.
+   */
+  private open(): DatabaseSync {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= OPEN_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        const database = new DatabaseSync(this.databasePath, { timeout: this.busyTimeoutMs });
+        if (attempt > 0) {
+          this.startupDegradations.push(["database_open_retried", `open_attempts=${attempt + 1}`]);
+        }
+        return database;
+      } catch (error) {
+        lastError = error;
+        const category = classifyStorageFailure(error);
+        if (!TRANSIENT_CATEGORIES.has(category) || attempt === OPEN_RETRY_DELAYS_MS.length) {
+          break;
+        }
+        sleepSync(OPEN_RETRY_DELAYS_MS[attempt] ?? 0);
+      }
+    }
+    throw asStorageWriteError(lastError);
+  }
+
+  private applyPragmas(): void {
+    // busy_timeout first: it is what makes the remaining pragmas and the migration wait rather than
+    // fail the moment another window is mid-write.
+    this.database.exec(`PRAGMA busy_timeout = ${this.busyTimeoutMs}`);
     this.database.exec("PRAGMA synchronous = NORMAL");
-    this.database.exec("PRAGMA busy_timeout = 5000");
-    this.migrate();
+    // Switching to WAL needs a brief exclusive moment. If another host is writing we may not get it,
+    // but WAL is a persistent property of the file — whoever set it first set it for everyone — so a
+    // failure here is a note, never a fatal error.
+    for (let attempt = 0; attempt <= OPEN_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        this.database.exec("PRAGMA journal_mode = WAL");
+        return;
+      } catch (error) {
+        if (attempt === OPEN_RETRY_DELAYS_MS.length) {
+          this.startupDegradations.push([
+            "journal_mode_unavailable",
+            classifyStorageFailure(error)
+          ]);
+          return;
+        }
+        sleepSync(OPEN_RETRY_DELAYS_MS[attempt] ?? 0);
+      }
+    }
+  }
+
+  /**
+   * Skip the migration entirely when the schema is already current — that removes the common
+   * contention case, because the second and later windows never need to write at all. When a
+   * migration really is required, retry it; only give up if the schema stays unusable.
+   */
+  private migrateWithRetry(): void {
+    if (this.schemaIsCurrent()) {
+      return;
+    }
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= OPEN_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        this.migrate();
+        if (attempt > 0) {
+          this.startupDegradations.push([
+            "database_open_retried",
+            `migrate_attempts=${attempt + 1}`
+          ]);
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+        // Another host may have completed the same idempotent migration while we waited.
+        if (this.schemaIsCurrent()) {
+          return;
+        }
+        if (attempt === OPEN_RETRY_DELAYS_MS.length) {
+          break;
+        }
+        sleepSync(OPEN_RETRY_DELAYS_MS[attempt] ?? 0);
+      }
+    }
+    throw asStorageWriteError(lastError);
+  }
+
+  private schemaIsCurrent(): boolean {
+    try {
+      const version = this.database.prepare("PRAGMA user_version").get() as
+        { user_version?: number } | undefined;
+      if (version?.user_version !== SCHEMA_VERSION) {
+        return false;
+      }
+      // user_version alone is not proof: a half-applied migration could have set it. Confirm the
+      // youngest tables exist before trusting it.
+      const present = this.database.prepare(`
+        SELECT COUNT(*) AS count FROM sqlite_master
+        WHERE type = 'table' AND name IN ('usage_daily', 'collection_state', 'collection_counters')
+      `).get() as { count: number } | undefined;
+      return present?.count === 3;
+    } catch {
+      return false;
+    }
   }
 
   public close(): void {
@@ -193,46 +482,45 @@ export class UsageRepository {
     };
   }
 
+  /**
+   * One transaction. These were three autocommit writes, so a failure between them left a snapshot
+   * row with no session and no health update — and the caller deleted the inbox file regardless.
+   */
   public recordStatusSnapshot(snapshot: StatusSnapshot): void {
-    this.database.prepare(`
-      INSERT INTO status_snapshots
-        (profile_id, session_id, captured_at, workspace_hash, workspace_label, model, payload_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      snapshot.profileId,
-      snapshot.sessionId,
-      snapshot.capturedAt,
-      snapshot.workspaceHash ?? "",
-      snapshot.workspaceLabel ?? "",
-      snapshot.modelId ?? snapshot.modelDisplayName ?? "",
-      JSON.stringify(snapshot)
-    );
-    this.database.prepare(`
-      INSERT INTO sessions
-        (id, profile_id, workspace_hash, workspace_label, model, session_name, started_at, last_event_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        model = excluded.model,
-        session_name = excluded.session_name,
-        last_event_at = excluded.last_event_at
-    `).run(
-      snapshot.sessionId,
-      snapshot.profileId,
-      snapshot.workspaceHash ?? "",
-      snapshot.workspaceLabel ?? "",
-      snapshot.modelId ?? snapshot.modelDisplayName ?? "",
-      snapshot.sessionName ?? null,
-      snapshot.capturedAt,
-      snapshot.capturedAt
-    );
-    this.database.prepare(`
-      INSERT INTO collector_health (profile_id, last_event_at, status, detail)
-      VALUES (?, ?, 'active', 'status_snapshot')
-      ON CONFLICT(profile_id) DO UPDATE SET
-        last_event_at = excluded.last_event_at,
-        status = excluded.status,
-        detail = excluded.detail
-    `).run(snapshot.profileId, snapshot.capturedAt);
+    this.write(() => {
+      this.database.prepare(`
+        INSERT INTO status_snapshots
+          (profile_id, session_id, captured_at, workspace_hash, workspace_label, model, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        snapshot.profileId,
+        snapshot.sessionId,
+        snapshot.capturedAt,
+        snapshot.workspaceHash ?? "",
+        snapshot.workspaceLabel ?? "",
+        snapshot.modelId ?? snapshot.modelDisplayName ?? "",
+        JSON.stringify(snapshot)
+      );
+      this.database.prepare(`
+        INSERT INTO sessions
+          (id, profile_id, workspace_hash, workspace_label, model, session_name, started_at, last_event_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          model = excluded.model,
+          session_name = excluded.session_name,
+          last_event_at = excluded.last_event_at
+      `).run(
+        snapshot.sessionId,
+        snapshot.profileId,
+        snapshot.workspaceHash ?? "",
+        snapshot.workspaceLabel ?? "",
+        snapshot.modelId ?? snapshot.modelDisplayName ?? "",
+        snapshot.sessionName ?? null,
+        snapshot.capturedAt,
+        snapshot.capturedAt
+      );
+      this.touchCollector(snapshot.profileId, snapshot.capturedAt, "status_snapshot");
+    }, snapshot.profileId);
   }
 
   public latestStatusSnapshot(profileId: string): StatusSnapshot | undefined {
@@ -247,7 +535,11 @@ export class UsageRepository {
     }
     try {
       return JSON.parse(row.payload_json) as StatusSnapshot;
-    } catch {
+    } catch (error) {
+      // A stored row we cannot parse is a defect, not an absence of data. Returning undefined is
+      // still the right behaviour for callers, but it must not be indistinguishable from "no
+      // snapshot yet" in the health state.
+      this.recordDegradation(profileId, "snapshot_payload_corrupt", classifyStorageFailure(error));
       return undefined;
     }
   }
@@ -325,7 +617,7 @@ export class UsageRepository {
     };
 
     if (name === "api_request" || name === "llm_request") {
-      const success = event.attributes.success !== false;
+      const success = flag(event.attributes.success, true);
       this.database.prepare(`
         INSERT INTO api_requests
           (profile_id, occurred_at, model, query_source, success, duration_ms, ttft_ms, status_code, error_category)
@@ -373,6 +665,10 @@ export class UsageRepository {
         { requests: 1 }
       );
     } else if (name === "tool_result" || name === "tool_execution" || name === "tool") {
+      // When `success` is absent entirely, a categorical error is the only evidence available, and
+      // it is better evidence than an optimistic default.
+      const succeeded = canonicalBoolean(event.attributes.success)
+        ?? !text(event.attributes.error_category);
       this.database.prepare(`
         INSERT INTO tool_results
           (profile_id, occurred_at, tool_name, success, duration_ms, error_category)
@@ -381,7 +677,7 @@ export class UsageRepository {
         profileId,
         event.timestamp,
         text(event.attributes.tool_name, "unknown"),
-        event.attributes.success === false ? 0 : 1,
+        succeeded ? 1 : 0,
         numeric(event.attributes.duration_ms),
         text(event.attributes.error_category) || null
       );
@@ -395,9 +691,9 @@ export class UsageRepository {
         event.timestamp,
         text(event.attributes.tool_name, "unknown"),
         text(event.attributes.decision, "unknown"),
-        text(event.attributes.source, "unknown")
+        text(event.attributes.source, text(event.attributes.tool_source, "unknown"))
       );
-    } else if (name === "auth" && event.attributes.success === false) {
+    } else if (name === "auth" && flag(event.attributes.success, true) === false) {
       this.database.prepare(`
         INSERT INTO security_events (profile_id, occurred_at, category, detail)
         VALUES (?, ?, 'auth_failure', ?)
@@ -407,7 +703,14 @@ export class UsageRepository {
       this.database.prepare(`
         INSERT INTO security_events (profile_id, occurred_at, category, detail)
         VALUES (?, ?, 'mcp_failure', ?)
-      `).run(profileId, event.timestamp, text(event.attributes.server_name, "unknown"));
+      `).run(
+        profileId,
+        event.timestamp,
+        text(
+          event.attributes["mcp_server.name"],
+          text(event.attributes.server_name, "unknown")
+        )
+      );
     }
     this.touchCollector(profileId, event.timestamp, "event");
   }
@@ -417,14 +720,14 @@ export class UsageRepository {
     metrics: readonly NormalizedMetric[],
     events: readonly NormalizedEvent[]
   ): void {
-    this.transaction(() => {
+    this.write(() => {
       for (const metric of metrics) {
         this.ingestMetric(profileId, metric);
       }
       for (const event of events) {
         this.ingestEvent(profileId, event);
       }
-    });
+    }, profileId);
   }
 
   public daily(
@@ -609,6 +912,389 @@ export class UsageRepository {
     return row ?? {};
   }
 
+  // ---------------------------------------------------------------------------
+  // Collection health
+  //
+  // `collector_health` is only written after a batch has already been stored, so it can only ever
+  // say "data arrived" or nothing at all. Everything below records the states in between, so that a
+  // bind failure, a stale registration, a rejected content type, a quarantined snapshot and a
+  // genuinely idle account stop rendering identically.
+  // ---------------------------------------------------------------------------
+
+  /** Record what the collector is doing. Never throws: diagnostics must not break the pipeline. */
+  public recordCollectorLifecycle(update: CollectorLifecycleUpdate): void {
+    this.safely(() => {
+      const now = new Date().toISOString();
+      this.ensureCollectionState(update.profileId);
+      const heartbeatFailed = update.heartbeatHealthy === false;
+      this.database.prepare(`
+        UPDATE collection_state SET
+          updated_at = @now,
+          listening = COALESCE(@listening, listening),
+          port = COALESCE(@port, port),
+          started_at = COALESCE(@startedAt, started_at),
+          stopped_at = COALESCE(@stoppedAt, stopped_at),
+          bind_error = CASE WHEN @clearBindError = 1 THEN NULL
+            ELSE COALESCE(@bindError, bind_error) END,
+          registration_updated_at =
+            COALESCE(@registrationUpdatedAt, registration_updated_at),
+          quarantine_directory = COALESCE(@quarantineDirectory, quarantine_directory),
+          heartbeat_failures = CASE
+            WHEN @heartbeatHealthy = 1 THEN 0
+            WHEN @heartbeatFailed = 1 THEN heartbeat_failures + 1
+            ELSE heartbeat_failures END,
+          heartbeat_failing_since = CASE
+            WHEN @heartbeatHealthy = 1 THEN NULL
+            WHEN @heartbeatFailed = 1 THEN COALESCE(heartbeat_failing_since, @now)
+            ELSE heartbeat_failing_since END,
+          heartbeat_error = CASE
+            WHEN @heartbeatHealthy = 1 THEN NULL
+            WHEN @heartbeatFailed = 1 THEN COALESCE(@heartbeatError, heartbeat_error)
+            ELSE heartbeat_error END
+        WHERE profile_id = @profileId
+      `).run({
+        profileId: update.profileId,
+        now,
+        listening: update.listening === undefined ? null : update.listening ? 1 : 0,
+        port: update.port ?? null,
+        startedAt: update.startedAt ?? null,
+        stoppedAt: update.stoppedAt ?? null,
+        bindError: update.bindError ?? null,
+        // A successful bind must erase the previous failure, otherwise the dashboard keeps blaming a
+        // port conflict that has already been resolved by a reload.
+        clearBindError: update.listening === true && update.bindError === undefined ? 1 : 0,
+        registrationUpdatedAt: update.registrationUpdatedAt ?? null,
+        quarantineDirectory: update.quarantineDirectory ?? null,
+        heartbeatHealthy: update.heartbeatHealthy === true ? 1 : 0,
+        heartbeatFailed: heartbeatFailed ? 1 : 0,
+        heartbeatError: update.heartbeatError ?? null
+      });
+    });
+  }
+
+  /** A request the collector turned away, with the reason but never the payload. */
+  public recordRequestRejected(
+    profileId: string | undefined,
+    reason: CollectionRejectionReason,
+    detail?: string
+  ): void {
+    this.safely(() => {
+      const now = new Date().toISOString();
+      this.ensureCollectionState(profileId);
+      this.database.prepare(`
+        UPDATE collection_state
+        SET updated_at = ?, requests_total = requests_total + 1,
+            requests_rejected = requests_rejected + 1, last_rejected_at = ?,
+            last_outcome = 'rejected'
+        WHERE profile_id = ?
+      `).run(now, now, this.stateKey(profileId));
+      this.bumpCounter(profileId, "rejection", reason, detail);
+    });
+  }
+
+  /**
+   * A batch that parsed and was acknowledged but yielded nothing storable. Answering 200 for this
+   * is correct at the protocol level and dishonest at the product level unless it is counted.
+   */
+  public recordBatchAcceptedEmpty(profileId: string, detail?: string): void {
+    this.safely(() => {
+      const now = new Date().toISOString();
+      this.ensureCollectionState(profileId);
+      this.database.prepare(`
+        UPDATE collection_state
+        SET updated_at = ?, requests_total = requests_total + 1,
+            requests_accepted_empty = requests_accepted_empty + 1, last_accepted_empty_at = ?,
+            last_outcome = 'accepted_empty'
+        WHERE profile_id = ?
+      `).run(now, now, profileId);
+      if (detail) {
+        this.bumpCounter(profileId, "empty", detail, undefined);
+      }
+    });
+  }
+
+  /** A batch that was understood and committed. */
+  public recordRequestStored(profileId: string): void {
+    this.safely(() => {
+      const now = new Date().toISOString();
+      this.ensureCollectionState(profileId);
+      this.database.prepare(`
+        UPDATE collection_state
+        SET updated_at = ?, requests_total = requests_total + 1,
+            requests_stored = requests_stored + 1, last_stored_at = ?,
+            last_outcome = 'stored'
+        WHERE profile_id = ?
+      `).run(now, now, profileId);
+    });
+  }
+
+  public recordStorageFailure(
+    profileId: string | undefined,
+    category: StorageFailureCategory
+  ): void {
+    const now = new Date().toISOString();
+    // In memory first, and unconditionally. The failure we most need to report is the database being
+    // unavailable — and in exactly that case the database cannot accept the record of it.
+    this.lastStorageFailure = { at: now, category };
+    if (category === "busy" || category === "locked") {
+      // Writing would block on the same lock that just failed, for the full busy timeout again.
+      return;
+    }
+    this.safely(() => {
+      this.ensureCollectionState(profileId);
+      this.database.prepare(`
+        UPDATE collection_state
+        SET updated_at = ?, last_failure_at = ?, last_failure_category = ?
+        WHERE profile_id = ?
+      `).run(now, now, category, this.stateKey(profileId));
+    });
+  }
+
+  public recordInboxProcessed(profileId: string): void {
+    this.safely(() => {
+      const now = new Date().toISOString();
+      this.ensureCollectionState(profileId);
+      this.database.prepare(`
+        UPDATE collection_state
+        SET updated_at = ?, inbox_processed = inbox_processed + 1, last_inbox_processed_at = ?
+        WHERE profile_id = ?
+      `).run(now, now, profileId);
+    });
+  }
+
+  public recordInboxQuarantined(
+    profileId: string | undefined,
+    reason: CollectionQuarantineReason,
+    detail?: string
+  ): void {
+    this.safely(() => {
+      const now = new Date().toISOString();
+      this.ensureCollectionState(profileId);
+      this.database.prepare(`
+        UPDATE collection_state
+        SET updated_at = ?, inbox_quarantined = inbox_quarantined + 1, last_quarantined_at = ?
+        WHERE profile_id = ?
+      `).run(now, now, this.stateKey(profileId));
+      this.bumpCounter(profileId, "quarantine", reason, detail);
+    });
+  }
+
+  public recordDegradation(
+    profileId: string | undefined,
+    reason: CollectionDegradationReason,
+    detail?: string
+  ): void {
+    this.safely(() => {
+      this.ensureCollectionState(profileId);
+      this.bumpCounter(profileId, "degradation", reason, detail);
+    });
+  }
+
+  /** Bulk-apply the fidelity losses a normalization pass reported. */
+  public recordDegradations(
+    profileId: string | undefined,
+    degradations: Partial<Record<CollectionDegradationReason, number>>
+  ): void {
+    this.safely(() => {
+      this.ensureCollectionState(profileId);
+      for (const [reason, count] of Object.entries(degradations)) {
+        if (typeof count === "number" && count > 0) {
+          this.bumpCounter(
+            profileId,
+            "degradation",
+            reason as CollectionDegradationReason,
+            undefined,
+            count
+          );
+        }
+      }
+    });
+  }
+
+  /**
+   * The single read the dashboard, diagnostics view and status bar should use.
+   *
+   * `context` carries the only two facts that are not persisted, because only the extension host
+   * knows them: the VS Code setting and whether the running config directory is a registered
+   * profile. Omit it and those phases simply are not reported.
+   */
+  public collectionHealth(
+    profileId: string | undefined,
+    context: CollectionHealthContext = {}
+  ): CollectionHealth {
+    const readAt = new Date().toISOString();
+    const key = this.stateKey(profileId);
+    const row = this.safely(() => this.database.prepare(`
+      SELECT * FROM collection_state WHERE profile_id = ?
+    `).get(key) as Record<string, unknown> | undefined) ?? undefined;
+    const counters = this.safely(() => this.database.prepare(`
+      SELECT kind, reason, count, first_at AS firstAt, last_at AS lastAt,
+             last_detail AS lastDetail
+      FROM collection_counters WHERE profile_id = ?
+      ORDER BY count DESC, reason ASC
+    `).all(key) as unknown as Array<CollectionCounter & { kind: string }>) ?? [];
+    const byKind = (kind: string): CollectionCounter[] => counters
+      .filter((counter) => counter.kind === kind)
+      .map(({ reason, count, firstAt, lastAt, lastDetail }) => ({
+        reason,
+        count,
+        firstAt,
+        lastAt,
+        lastDetail: lastDetail ?? undefined
+      }));
+
+    const optionalText = (field: string): string | undefined => {
+      const value = row?.[field];
+      return typeof value === "string" && value ? value : undefined;
+    };
+    const count = (field: string): number => {
+      const value = row?.[field];
+      return typeof value === "number" ? value : 0;
+    };
+
+    const registrationUpdatedAt = optionalText("registration_updated_at");
+    const registrationParsed = registrationUpdatedAt
+      ? Date.parse(registrationUpdatedAt)
+      : Number.NaN;
+    const registrationAgeMs = Number.isNaN(registrationParsed)
+      ? undefined
+      : Math.max(0, Date.parse(readAt) - registrationParsed);
+    const listening = row?.listening === 1;
+    const bindError = optionalText("bind_error");
+    const size = this.databaseSizeResult();
+
+    const collector: CollectionHealth["collector"] = {
+      listening,
+      port: typeof row?.port === "number" ? row.port : undefined,
+      startedAt: optionalText("started_at"),
+      stoppedAt: optionalText("stopped_at"),
+      bindError,
+      registrationUpdatedAt,
+      registrationAgeMs,
+      registrationStale: listening
+        && registrationAgeMs !== undefined
+        && registrationAgeMs > REGISTRATION_STALE_AFTER_MS,
+      registrationStaleAfterMs: REGISTRATION_STALE_AFTER_MS,
+      heartbeatFailures: count("heartbeat_failures"),
+      heartbeatFailingSince: optionalText("heartbeat_failing_since"),
+      heartbeatError: optionalText("heartbeat_error")
+    };
+    const requests: CollectionHealth["requests"] = {
+      total: count("requests_total"),
+      stored: count("requests_stored"),
+      acceptedEmpty: count("requests_accepted_empty"),
+      rejected: count("requests_rejected"),
+      lastStoredAt: optionalText("last_stored_at"),
+      lastAcceptedEmptyAt: optionalText("last_accepted_empty_at"),
+      lastRejectedAt: optionalText("last_rejected_at"),
+      rejections: byKind("rejection")
+    };
+    const inbox: CollectionHealth["inbox"] = {
+      processed: count("inbox_processed"),
+      quarantined: count("inbox_quarantined"),
+      lastProcessedAt: optionalText("last_inbox_processed_at"),
+      lastQuarantinedAt: optionalText("last_quarantined_at"),
+      quarantineDirectory: optionalText("quarantine_directory"),
+      quarantines: byKind("quarantine")
+    };
+    // Every read here goes through `safely`: this method is the one thing the dashboard, the
+    // diagnostics view and the status bar all call to find out what is wrong, so it must never be
+    // the thing that throws — including when what is wrong is the database itself.
+    const lastWrite = profileId
+      ? this.safely(() => this.database.prepare(
+        "SELECT last_event_at AS lastEventAt, detail FROM collector_health WHERE profile_id = ?"
+      ).get(profileId) as { lastEventAt?: string; detail?: string } | undefined)
+      : undefined;
+    const storage: CollectionHealth["storage"] = {
+      lastSuccessfulWriteAt: lastWrite?.lastEventAt,
+      lastSuccessfulWriteSource: lastWrite?.detail,
+      lastFailureAt: optionalText("last_failure_at"),
+      lastFailureCategory: optionalText("last_failure_category"),
+      databaseSizeBytes: size.bytes,
+      databaseSizeError: size.error
+    };
+    // Prefer whichever record is newer. The in-memory copy is the only one that exists when the
+    // failure was the database refusing writes in the first place.
+    if (this.lastStorageFailure
+      && (!storage.lastFailureAt || this.lastStorageFailure.at > storage.lastFailureAt)) {
+      storage.lastFailureAt = this.lastStorageFailure.at;
+      storage.lastFailureCategory = this.lastStorageFailure.category;
+    }
+
+    const recordedOutcome = optionalText("last_outcome");
+    return {
+      schemaVersion: 1,
+      readAt,
+      profileId,
+      phase: derivePhase({
+        context,
+        collector,
+        lastOutcome: recordedOutcome === "stored"
+          || recordedOutcome === "rejected"
+          || recordedOutcome === "accepted_empty"
+          ? recordedOutcome
+          : undefined,
+        storage
+      }),
+      collector,
+      requests,
+      inbox,
+      storage,
+      degradations: byKind("degradation")
+    };
+  }
+
+  private stateKey(profileId: string | undefined): string {
+    // Failures that happen before a profile is known still have to be recorded somewhere.
+    return profileId ?? "";
+  }
+
+  private ensureCollectionState(profileId: string | undefined): void {
+    this.database.prepare(`
+      INSERT INTO collection_state (profile_id, updated_at) VALUES (?, ?)
+      ON CONFLICT(profile_id) DO NOTHING
+    `).run(this.stateKey(profileId), new Date().toISOString());
+  }
+
+  private bumpCounter(
+    profileId: string | undefined,
+    kind: string,
+    reason: string,
+    detail: string | undefined,
+    increment = 1
+  ): void {
+    const now = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO collection_counters
+        (profile_id, kind, reason, count, first_at, last_at, last_detail)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(profile_id, kind, reason) DO UPDATE SET
+        count = count + excluded.count,
+        last_at = excluded.last_at,
+        last_detail = COALESCE(excluded.last_detail, last_detail)
+    `).run(
+      this.stateKey(profileId),
+      kind,
+      reason.slice(0, 100),
+      increment,
+      now,
+      now,
+      detail ? detail.slice(0, 200) : null
+    );
+  }
+
+  /**
+   * Health bookkeeping must never be the reason a write fails or a read throws. A lost counter is a
+   * far smaller problem than an ingest path that dies while recording that it died.
+   */
+  private safely<T>(work: () => T): T | undefined {
+    try {
+      return work();
+    } catch {
+      return undefined;
+    }
+  }
+
   public deleteUsageData(): void {
     this.transaction(() => {
       for (const table of [
@@ -621,7 +1307,11 @@ export class UsageRepository {
         "tool_results",
         "permission_decisions",
         "security_events",
-        "collector_health"
+        "collector_health",
+        // Health counters are the user's local data too. A live collector re-asserts its state on
+        // the next heartbeat, so clearing these costs at most one heartbeat interval of detail.
+        "collection_state",
+        "collection_counters"
       ]) {
         this.database.prepare(`DELETE FROM ${table}`).run();
       }
@@ -662,11 +1352,22 @@ export class UsageRepository {
     };
   }
 
+  /**
+   * Kept returning a plain number for existing callers, but a failed stat no longer masquerades as a
+   * genuinely empty database — the failure is counted and `collectionHealth().storage` reports the
+   * size as absent rather than zero. Prefer `collectionHealth()` for anything user-facing.
+   */
   public databaseSize(): number {
+    return this.databaseSizeResult().bytes ?? 0;
+  }
+
+  private databaseSizeResult(): { bytes?: number; error?: string } {
     try {
-      return statSync(this.databasePath).size;
-    } catch {
-      return 0;
+      return { bytes: statSync(this.databasePath).size };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+      this.recordDegradation(undefined, "database_size_unavailable", code);
+      return { error: code };
     }
   }
 
@@ -733,8 +1434,11 @@ export class UsageRepository {
     const skill = text(attributes["skill.name"]);
     const plugin = text(attributes["plugin.name"]);
     const agent = text(attributes["agent.name"], text(attributes.agent_id));
-    const server = text(attributes.server_name);
-    const tool = text(attributes.tool_name);
+    // Current Anthropic metrics carry the dotted `mcp_server.name` / `mcp_tool.name`. `server_name`
+    // only appears on mcp_server_connection events and only when tool details are enabled, which
+    // Account Guard forces off — so reading it alone left MCP attribution permanently empty.
+    const server = text(attributes["mcp_server.name"], text(attributes.server_name));
+    const tool = text(attributes["mcp_tool.name"], text(attributes.tool_name));
     const dimensions: Array<[AttributionDimension, string]> = [
       ["skill", skill],
       ["plugin", plugin],
@@ -801,8 +1505,28 @@ export class UsageRepository {
       work();
       this.database.exec("COMMIT");
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      try {
+        this.database.exec("ROLLBACK");
+      } catch {
+        // A failed rollback (the transaction was already aborted by SQLite) must not replace the
+        // original cause, which is what the caller needs to classify the failure.
+      }
       throw error;
+    }
+  }
+
+  /**
+   * A transaction whose failures arrive as a classified `StorageWriteError`. Callers on the HTTP path
+   * need to know whether to answer "try again" or "this is broken"; they must never be left guessing
+   * and defaulting to "your data was invalid".
+   */
+  private write(work: () => void, profileId?: string): void {
+    try {
+      this.transaction(work);
+    } catch (error) {
+      const failure = asStorageWriteError(error);
+      this.recordStorageFailure(profileId, failure.category);
+      throw failure;
     }
   }
 
@@ -936,9 +1660,47 @@ export class UsageRepository {
         status TEXT NOT NULL,
         detail TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS collection_state (
+        profile_id TEXT PRIMARY KEY,
+        updated_at TEXT NOT NULL,
+        listening INTEGER NOT NULL DEFAULT 0,
+        port INTEGER,
+        started_at TEXT,
+        stopped_at TEXT,
+        bind_error TEXT,
+        registration_updated_at TEXT,
+        quarantine_directory TEXT,
+        heartbeat_failures INTEGER NOT NULL DEFAULT 0,
+        heartbeat_failing_since TEXT,
+        heartbeat_error TEXT,
+        requests_total INTEGER NOT NULL DEFAULT 0,
+        requests_stored INTEGER NOT NULL DEFAULT 0,
+        requests_accepted_empty INTEGER NOT NULL DEFAULT 0,
+        requests_rejected INTEGER NOT NULL DEFAULT 0,
+        last_stored_at TEXT,
+        last_accepted_empty_at TEXT,
+        last_rejected_at TEXT,
+        inbox_processed INTEGER NOT NULL DEFAULT 0,
+        inbox_quarantined INTEGER NOT NULL DEFAULT 0,
+        last_inbox_processed_at TEXT,
+        last_quarantined_at TEXT,
+        last_failure_at TEXT,
+        last_failure_category TEXT,
+        last_outcome TEXT
+      );
+      CREATE TABLE IF NOT EXISTS collection_counters (
+        profile_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        first_at TEXT NOT NULL,
+        last_at TEXT NOT NULL,
+        last_detail TEXT,
+        PRIMARY KEY(profile_id, kind, reason)
+      );
     `);
     this.migrateAttributionTable();
-    this.database.exec("PRAGMA user_version = 2");
+    this.database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   }
 
   private migrateAttributionTable(): void {

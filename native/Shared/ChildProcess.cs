@@ -6,7 +6,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
-namespace ClaudeAccountGuard.WrapperLauncher
+namespace ClaudeAccountGuard
 {
     /// <summary>
     /// Windows command-line encoding.
@@ -251,16 +251,24 @@ namespace ClaudeAccountGuard.WrapperLauncher
         }
     }
 
-    /// <summary>Result of a captured child process run.</summary>
+    /// <summary>
+    /// Result of a captured child process run.
+    ///
+    /// stdout is kept as bytes. One caller parses it as UTF-8 JSON; the other passes it straight
+    /// through to a status line, where decoding and re-encoding it would be a chance to corrupt
+    /// somebody's output for no reason.
+    /// </summary>
     internal sealed class CaptureResult
     {
-        private readonly int exitCode;
-        private readonly string standardOutput;
+        private static readonly byte[] NoBytes = new byte[0];
 
-        public CaptureResult(int exitCode, string standardOutput)
+        private readonly int exitCode;
+        private readonly byte[] standardOutputBytes;
+
+        public CaptureResult(int exitCode, byte[] standardOutputBytes)
         {
             this.exitCode = exitCode;
-            this.standardOutput = standardOutput;
+            this.standardOutputBytes = standardOutputBytes ?? NoBytes;
         }
 
         public int ExitCode
@@ -268,9 +276,28 @@ namespace ClaudeAccountGuard.WrapperLauncher
             get { return exitCode; }
         }
 
+        public byte[] StandardOutputBytes
+        {
+            get { return standardOutputBytes; }
+        }
+
+        /// <summary>stdout decoded as UTF-8, with any byte-order mark removed.</summary>
         public string StandardOutput
         {
-            get { return standardOutput; }
+            get
+            {
+                int offset = standardOutputBytes.Length >= 3
+                    && standardOutputBytes[0] == 0xEF
+                    && standardOutputBytes[1] == 0xBB
+                    && standardOutputBytes[2] == 0xBF
+                    ? 3
+                    : 0;
+                return new UTF8Encoding(false).GetString(
+                    standardOutputBytes,
+                    offset,
+                    standardOutputBytes.Length - offset
+                );
+            }
         }
     }
 
@@ -366,7 +393,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
         }
 
         /// <summary>
-        /// Runs a short preflight command and captures its stdout.
+        /// Runs a short preflight command against the CLI and captures its stdout.
         ///
         /// Standard input is redirected and closed immediately so the query cannot consume a
         /// single byte of the stdin the CLI itself is about to read, and stderr is discarded
@@ -406,40 +433,77 @@ namespace ClaudeAccountGuard.WrapperLauncher
                 startInfo.FileName = executable;
                 startInfo.Arguments = builder.ToString();
             }
+            return Capture(startInfo, null, timeoutMilliseconds);
+        }
+
+        /// <summary>
+        /// Runs a shell command line the user wrote, feeding it a payload on stdin and capturing
+        /// its stdout.
+        ///
+        /// A user's status-line command is a command line, not an argument vector, so it must reach
+        /// the command processor with its own quoting intact. It is placed between the outer quotes
+        /// that <c>/s</c> strips, which is the one arrangement that hands <c>cmd.exe</c> the exact
+        /// text the user wrote: <c>/s</c> removes the first character and the last quote and runs
+        /// the remainder verbatim. Passing the command as an argument instead is what let PowerShell
+        /// 5.1 strip the quotes out of <c>node "C:\my scripts\line.js"</c>.
+        /// </summary>
+        public static CaptureResult CaptureShellCommand(
+            string command,
+            string standardInput,
+            int timeoutMilliseconds
+        )
+        {
+            var startInfo = new ProcessStartInfo();
+            startInfo.FileName = WindowsCommandLine.CommandProcessor();
+            startInfo.Arguments = "/d /s /v:off /c \"" + command + "\"";
+            return Capture(
+                startInfo,
+                new UTF8Encoding(false).GetBytes(standardInput ?? string.Empty),
+                timeoutMilliseconds
+            );
+        }
+
+        /// <summary>
+        /// The shared capture machinery. stdout is read as raw bytes so nothing re-encodes it, and
+        /// both pipes are drained on their own threads because a child that fills either one while
+        /// this thread waits on the other would deadlock.
+        /// </summary>
+        private static CaptureResult Capture(
+            ProcessStartInfo startInfo,
+            byte[] standardInput,
+            int timeoutMilliseconds
+        )
+        {
             startInfo.UseShellExecute = false;
             startInfo.CreateNoWindow = true;
             startInfo.RedirectStandardInput = true;
             startInfo.RedirectStandardOutput = true;
             startInfo.RedirectStandardError = true;
-            var utf8 = new UTF8Encoding(false);
-            startInfo.StandardOutputEncoding = utf8;
-            startInfo.StandardErrorEncoding = utf8;
 
             using (Process process = Process.Start(startInfo))
             {
                 if (process == null)
                 {
-                    throw new IOException("The preflight process did not start.");
+                    throw new IOException("The captured process did not start.");
                 }
                 ProcessJob.Adopt(process.Handle);
-                try
-                {
-                    process.StandardInput.Close();
-                }
-                catch (IOException)
-                {
-                    // A child that already closed its end of the pipe needs nothing.
-                }
-                string captured = null;
+
+                var captured = new MemoryStream();
                 Thread outputReader = new Thread(delegate()
                 {
                     try
                     {
-                        captured = process.StandardOutput.ReadToEnd();
+                        var chunk = new byte[8192];
+                        Stream source = process.StandardOutput.BaseStream;
+                        int read;
+                        while ((read = source.Read(chunk, 0, chunk.Length)) > 0)
+                        {
+                            captured.Write(chunk, 0, read);
+                        }
                     }
                     catch (Exception)
                     {
-                        captured = null;
+                        // Whatever arrived before the failure is still worth returning.
                     }
                 });
                 outputReader.IsBackground = true;
@@ -452,11 +516,26 @@ namespace ClaudeAccountGuard.WrapperLauncher
                     }
                     catch (Exception)
                     {
-                        // Preflight diagnostics are intentionally discarded.
+                        // Diagnostics from a captured child are intentionally discarded.
                     }
                 });
                 errorReader.IsBackground = true;
                 errorReader.Start();
+
+                try
+                {
+                    if (standardInput != null && standardInput.Length > 0)
+                    {
+                        Stream sink = process.StandardInput.BaseStream;
+                        sink.Write(standardInput, 0, standardInput.Length);
+                        sink.Flush();
+                    }
+                    process.StandardInput.Close();
+                }
+                catch (IOException)
+                {
+                    // A child that exits without reading its input is entitled to.
+                }
 
                 if (!process.WaitForExit(timeoutMilliseconds))
                 {
@@ -468,11 +547,11 @@ namespace ClaudeAccountGuard.WrapperLauncher
                     {
                         // The process may have exited between the wait and the kill.
                     }
-                    throw new TimeoutException("The preflight process did not complete in time.");
+                    throw new TimeoutException("The captured process did not complete in time.");
                 }
                 outputReader.Join(timeoutMilliseconds);
                 errorReader.Join(1000);
-                return new CaptureResult(process.ExitCode, captured ?? string.Empty);
+                return new CaptureResult(process.ExitCode, captured.ToArray());
             }
         }
 

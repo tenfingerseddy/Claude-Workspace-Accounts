@@ -1,25 +1,42 @@
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import {
+  FORBIDDEN_BETA_VARIABLES,
+  FORCED_PRIVACY_VARIABLES,
+  FOREIGN_OTEL_VARIABLES,
+  REQUIRED_COLLECTOR_VARIABLES
+} from "../../src/telemetry/otelEnvironment.js";
 
 /**
- * The process wrapper is the one component that runs outside the extension host, on the path
- * of every Claude launch including background ones. Its behaviour cannot be asserted from the
- * extension's own tests, so the properties it must never lose are asserted against its source:
- * it binds a workspace to an account rather than demanding the environment already match, it
- * refuses a launch for exactly one reason, it never reads a credential store, it never lets
- * content telemetry be emitted, and it never re-enters an interpreter that would re-parse the
- * argument vector.
+ * The two native components run outside the extension host: the process wrapper on every Claude
+ * launch, and the status-line bridge on every status-line refresh. Their behaviour cannot be
+ * asserted from the extension's own tests, so the properties they must never lose are asserted
+ * against their source: the wrapper binds a workspace to an account rather than demanding the
+ * environment already match, it refuses a launch for exactly one reason, neither component reads a
+ * credential store, neither lets content telemetry be emitted, and neither re-enters an interpreter
+ * that would re-parse what it was handed.
  */
-const SOURCE_DIRECTORY = path.join("native", "WrapperLauncher");
+const SHARED = path.join("native", "Shared");
+const WRAPPER = path.join("native", "WrapperLauncher");
+const BRIDGE = path.join("native", "StatusLineBridge");
 
-function read(name: string): string {
-  return readFileSync(path.join(SOURCE_DIRECTORY, name), "utf8");
+function read(directory: string, name: string): string {
+  return readFileSync(path.join(directory, name), "utf8");
 }
 
-const sources = readdirSync(SOURCE_DIRECTORY).filter((entry) => entry.endsWith(".cs"));
-const allSource = sources.map(read).join("\n");
-const program = read("Program.cs");
+function sourcesIn(directory: string): string[] {
+  return readdirSync(directory).filter((entry) => entry.endsWith(".cs"));
+}
+
+const allSource = [SHARED, WRAPPER, BRIDGE]
+  .flatMap((directory) => sourcesIn(directory).map((name) => read(directory, name)))
+  .join("\n");
+const program = read(WRAPPER, "Program.cs");
+const bridge = read(BRIDGE, "Program.cs");
+const childProcess = read(SHARED, "ChildProcess.cs");
+const guardRegistry = read(SHARED, "GuardRegistry.cs");
+const core = read(SHARED, "GuardCore.cs");
 
 /** The body of one method, so ordering inside it can be asserted meaningfully. */
 function methodBody(source: string, start: string, end: string): string {
@@ -30,18 +47,36 @@ function methodBody(source: string, start: string, end: string): string {
   return source.slice(from, to);
 }
 
-describe("process-wrapper security contract", () => {
-  it("is a single native process with no interpreter on the launch path", () => {
-    expect(sources).toContain("Program.cs");
-    // A shell or script host between Claude Code and the CLI re-parses the argument vector,
-    // which is how flags such as --verbose and -p get silently consumed.
+describe("native component security contract", () => {
+  it("keeps every interpreter off the launch and refresh paths", () => {
+    expect(sourcesIn(WRAPPER)).toContain("Program.cs");
+    expect(sourcesIn(BRIDGE)).toContain("Program.cs");
+    // A shell or script host between Claude Code and the CLI re-parses the argument vector, which
+    // is how flags such as --verbose and -p got silently consumed.
     for (const interpreter of ["powershell.exe", "pwsh", "ExecutionPolicy", "cscript", "wscript"]) {
       expect(allSource).not.toContain(interpreter);
     }
     expect(allSource).not.toContain(".ps1");
-    // The command processor is reachable only to run a batch-file CLI, which CreateProcess
-    // cannot execute directly.
-    expect(read("ChildProcess.cs")).toContain("IsBatchFile(executable)");
+    // The command processor is reachable only to run a batch-file CLI, which CreateProcess cannot
+    // execute directly, and to run a status-line command the user themselves wrote as a shell line.
+    expect(childProcess).toContain("IsBatchFile(executable)");
+    expect(childProcess).toContain("CaptureShellCommand(");
+  });
+
+  it("shares one implementation of the things that used to drift", () => {
+    // Two copies of path normalization meant a configuration directory at a drive root matched in
+    // one component and not the other, and one workspace was recorded under two identities.
+    expect(core).toContain("public static string Normalize(");
+    expect(core).toContain("public static string WorkspaceHash(");
+    expect(core).toContain("public static string LabelFor(");
+    expect(guardRegistry).toContain("public static bool CollectionAllowed(");
+    for (const source of [program, bridge]) {
+      expect(source).toContain("GuardPaths.Normalize(");
+      expect(source).toContain("GuardRegistry.");
+    }
+    // Neither component may reimplement them locally.
+    expect(program).not.toContain("private static string NormalizeGuardPath");
+    expect(bridge).not.toContain("private static string Normalize");
   });
 
   it("binds the workspace to an account instead of requiring a matching environment", () => {
@@ -49,8 +84,8 @@ describe("process-wrapper security contract", () => {
     expect(program).toContain(
       "Environment.SetEnvironmentVariable(ConfigDirectoryVariable, binding.ConfigDirectory)"
     );
-    // Secure storage is derived from its own variable when set, so an ambient value would
-    // send credentials to an account this launch is not bound to.
+    // Secure storage is derived from its own variable when set, so an ambient value would send
+    // credentials to an account this launch is not bound to.
     expect(program).toContain("SecureStorageDirectoryVariable");
     // The environment is never checked against the binding; the wrapper is what sets it.
     expect(allSource).not.toContain("runtime_profile_mismatch");
@@ -62,8 +97,8 @@ describe("process-wrapper security contract", () => {
       "private static GuardResolution Resolve(",
       "private static void ApplyBinding("
     );
-    // Applying the binding before probing is what makes the probe report the bound account
-    // rather than the ambient one.
+    // Applying the binding before probing is what makes the probe report the bound account rather
+    // than the ambient one.
     expect(resolve.indexOf("ApplyBinding(binding)")).toBeGreaterThan(0);
     expect(resolve.indexOf("ApplyBinding(binding)")).toBeLessThan(
       resolve.indexOf("Verify(target, binding)")
@@ -71,8 +106,8 @@ describe("process-wrapper security contract", () => {
     expect(resolve.indexOf("ApplyBinding(remembered)")).toBeLessThan(
       resolve.indexOf("Verify(target, remembered)")
     );
-    // Claude Code passes `[node.exe, cli.js]` when it falls back to the JavaScript CLI, so a
-    // probe against the first token alone would ask the host, not Claude.
+    // Claude Code passes `[node.exe, cli.js]` when it falls back to the JavaScript CLI, so a probe
+    // against the first token alone would ask the host, not Claude.
     expect(program).toContain("target.Compose(new[] { \"auth\", \"status\" })");
   });
 
@@ -90,7 +125,7 @@ describe("process-wrapper security contract", () => {
     const verify = methodBody(
       program,
       "private static string Verify(",
-      "private static void ValidateRegistry("
+      "private static JsonValue ResolveWorkspaceLock("
     );
     // Being signed out is a reason to let Claude prompt for sign-in, not to refuse.
     expect(verify).toContain("return \"signed_out\";");
@@ -100,7 +135,7 @@ describe("process-wrapper security contract", () => {
     expect(program).toContain("BindingCache.Match(cachePath, currentDirectory)");
     expect(program).toContain("\"registry_unavailable\"");
     // A cached binding is good enough to keep the right account, not to refuse a launch.
-    expect(read("GuardStorage.cs")).toContain("public bool FromRegistry");
+    expect(read(SHARED, "GuardStorage.cs")).toContain("public bool FromRegistry");
   });
 
   it("fails open for anything that is not a deliberate guard decision", () => {
@@ -128,42 +163,11 @@ describe("process-wrapper security contract", () => {
     expect(program).toContain("CaptureResult status = ChildProcess.Capture(");
   });
 
-  it("forces every content-telemetry flag off", () => {
-    for (const flag of [
-      "OTEL_LOG_USER_PROMPTS",
-      "OTEL_LOG_ASSISTANT_RESPONSES",
-      "OTEL_LOG_TOOL_DETAILS",
-      "OTEL_LOG_TOOL_CONTENT",
-      "OTEL_LOG_RAW_API_BODIES"
-    ]) {
-      expect(program).toContain(`Environment.SetEnvironmentVariable("${flag}", "0");`);
-    }
-  });
-
-  it("keeps telemetry opt-in and never redirects an exporter the user configured", () => {
-    expect(program).toContain("registry[\"integration\"][\"telemetryEnabled\"].IsFalse");
-    expect(program).toContain("telemetryProfile[\"telemetryEnabled\"].IsTrue");
-    expect(program).toContain("HasUserExporterConfiguration()");
-    for (const name of [
-      "OTEL_EXPORTER_OTLP_ENDPOINT",
-      "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-      "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-      "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-      "OTEL_METRICS_EXPORTER",
-      "OTEL_LOGS_EXPORTER",
-      "OTEL_TRACES_EXPORTER",
-      "OTEL_EXPORTER_OTLP_HEADERS"
-    ]) {
-      expect(program).toContain(name);
-    }
-    expect(program).toContain("CollectorFreshnessSeconds = 60");
-  });
-
   it("records a launch outcome without recording what was launched", () => {
     const health = methodBody(
       program,
       "private static void WriteGuardHealth(",
-      "private static string ResolveSupportRoot("
+      "AtomicFile.Write("
     );
     expect(health).toContain("\\\"category\\\"");
     expect(health).toContain("\\\"exitCode\\\"");
@@ -173,18 +177,145 @@ describe("process-wrapper security contract", () => {
     expect(health).not.toContain("Environment.GetEnvironmentVariable");
   });
 
+  it("contains the CLI it starts in a job object that dies with the wrapper", () => {
+    expect(childProcess).toContain("JobObjectLimitKillOnJobClose = 0x00002000");
+    expect(childProcess).toContain("AssignProcessToJobObject");
+    // Containment is best effort: it must never be a launch precondition.
+    expect(childProcess).toContain("catch (Exception)");
+  });
+});
+
+/**
+ * The OpenTelemetry environment contract exists in two languages, so it has to be checked in both.
+ * The wrapper's list previously covered four endpoints and three exporter selections; a user with
+ * `OTEL_EXPORTER_OTLP_COMPRESSION` or a per-signal protocol override did not trip the guard, was
+ * injected over anyway, and then had every export rejected. These assertions fail the build rather
+ * than let the two copies drift again.
+ */
+describe("wrapper OpenTelemetry contract", () => {
+  const declared = program.match(
+    /private static readonly string\[\] ForeignOtelVariables =\s*\{([\s\S]*?)\};/
+  );
+
+  it("checks exactly the foreign variables the extension knows about", () => {
+    expect(declared).not.toBeNull();
+    const mirrored = [...(declared?.[1] ?? "").matchAll(/"([A-Z0-9_]+)"/g)].map(
+      (match) => match[1]
+    );
+    expect(mirrored).toHaveLength(FOREIGN_OTEL_VARIABLES.length);
+    expect([...mirrored].sort()).toEqual([...FOREIGN_OTEL_VARIABLES].sort());
+    // Whitespace-only is not a configured exporter, in either language.
+    expect(program).toContain(
+      "if (!GuardValues.IsBlank(Environment.GetEnvironmentVariable(name)))"
+    );
+    expect(core).toContain("string.IsNullOrWhiteSpace(value)");
+  });
+
+  it("sets every variable the loopback collector needs, with the value it needs", () => {
+    for (const [name, value] of Object.entries(REQUIRED_COLLECTOR_VARIABLES)) {
+      expect(program).toContain(`Environment.SetEnvironmentVariable("${name}", "${value}");`);
+    }
+    // The OTEL default is grpc, which the collector cannot read at all.
+    expect(REQUIRED_COLLECTOR_VARIABLES.OTEL_EXPORTER_OTLP_PROTOCOL).toBe("http/json");
+    // Spans are refused rather than beta-enabled, and `none` is explicit so an inherited `otlp`
+    // cannot aim them at a route that returns 404.
+    expect(REQUIRED_COLLECTOR_VARIABLES.OTEL_TRACES_EXPORTER).toBe("none");
+    expect(program).not.toContain(
+      "Environment.SetEnvironmentVariable(\"OTEL_TRACES_EXPORTER\", \"otlp\")"
+    );
+  });
+
+  it("forces every content-telemetry flag off", () => {
+    for (const [name, value] of Object.entries(FORCED_PRIVACY_VARIABLES)) {
+      expect(program).toContain(`Environment.SetEnvironmentVariable("${name}", "${value}");`);
+    }
+    expect(Object.keys(FORCED_PRIVACY_VARIABLES)).toHaveLength(5);
+  });
+
+  it("never enables a beta telemetry mode on the user's behalf", () => {
+    for (const name of FORBIDDEN_BETA_VARIABLES) {
+      expect(allSource).not.toContain(`SetEnvironmentVariable("${name}"`);
+    }
+  });
+
+  it("keeps collection opt-in and refuses to inject over a user's pipeline", () => {
+    expect(guardRegistry).toContain("profile[\"telemetryEnabled\"].IsTrue");
+    expect(guardRegistry).toContain("registry[\"integration\"][\"telemetryEnabled\"].IsFalse");
+    expect(program).toContain("GuardRegistry.CollectionAllowed(registry, telemetryProfile)");
+    expect(program).toContain("HasUserExporterConfiguration()");
+    expect(program).toContain("CollectorFreshnessSeconds = 60");
+  });
+
   it("identifies a workspace by hash and label rather than by path", () => {
     expect(program).toContain("claude.account_guard.workspace_hash=");
     expect(program).toContain("claude.account_guard.workspace_label=");
-    expect(program).toContain("\"[^A-Za-z0-9_.-]\"");
+    expect(core).toContain("\"[^A-Za-z0-9_.-]\"");
     expect(program).not.toContain("claude.account_guard.workspace_path");
   });
+});
 
-  it("contains the CLI it starts in a job object that dies with the wrapper", () => {
-    const child = read("ChildProcess.cs");
-    expect(child).toContain("JobObjectLimitKillOnJobClose = 0x00002000");
-    expect(child).toContain("AssignProcessToJobObject");
-    // Containment is best effort: it must never be a launch precondition.
-    expect(child).toContain("catch (Exception)");
+/**
+ * The status-line bridge runs many times per session and its stdout *is* the status line, so its
+ * whole contract is about never being the reason something is missing.
+ */
+describe("status-line bridge contract", () => {
+  it("reads its payload as bytes and decodes it as UTF-8", () => {
+    // `$input | Out-String` applied console-width formatting, wrapping a long single-line payload
+    // and turning it into a parse failure nobody ever saw.
+    expect(bridge).toContain("Console.OpenStandardInput()");
+    expect(bridge).toContain("new UTF8Encoding(false).GetString(");
+    expect(bridge).not.toContain("Console.In");
+    expect(bridge).not.toContain("ReadLine");
+  });
+
+  it("always leaves a visible status line and always exits zero", () => {
+    expect(bridge).toContain("[account-guard: status line unavailable]");
+    // Every path out of Main goes through Emit or EmitMarker, and Emit reports success.
+    const main = methodBody(
+      bridge,
+      "public static int Main(",
+      "private static string ReadStandardInput("
+    );
+    for (const match of main.matchAll(/^\s*return (.+);$/gm)) {
+      expect(match[1]).toMatch(/^(0|Emit\(summary\)|EmitMarker\(\))$/);
+    }
+    expect(bridge).not.toContain("Environment.Exit");
+    expect(methodBody(bridge, "private static int Emit(", "return 0;")).toContain("output.Flush()");
+  });
+
+  it("hands a chained command its own quoting, and its payload, untouched", () => {
+    expect(bridge).toContain("ChildProcess.CaptureShellCommand(");
+    // The command is a shell line the user wrote; it must not be re-quoted or split.
+    expect(childProcess).toContain("\"/d /s /v:off /c \\\"\" + command + \"\\\"\"");
+    // A payload this bridge cannot parse is still what the user's own status line is given.
+    expect(bridge).toContain("payload ?? string.Empty");
+  });
+
+  it("falls back to the guard-owned mirror when the profile's backup is unusable", () => {
+    expect(bridge).toContain("statusline-backups");
+    expect(bridge).toContain("statusline-next.json");
+    const resolve = methodBody(
+      bridge,
+      "private static string ResolveChainedCommand(",
+      "private static IEnumerable<string> BackupLocations("
+    );
+    // A malformed or unreadable primary must continue to the next location, not give up.
+    expect(resolve).toContain("continue;");
+  });
+
+  it("keeps the snapshot contract and the privacy rules", () => {
+    for (const field of [
+      "schemaVersion", "capturedAt", "profileId", "sessionId", "sessionName",
+      "workspaceHash", "workspaceLabel", "workspacePath", "modelId", "modelDisplayName",
+      "contextWindow", "currentUsage", "rateLimits", "fiveHour", "sevenDay"
+    ]) {
+      expect(bridge).toContain(field);
+    }
+    // A full workspace path is written only on an explicit opt-in; otherwise a label and a hash.
+    expect(bridge).toContain("registry[\"integration\"][\"collectWorkspacePath\"].IsTrue");
+    expect(bridge).toContain("GuardPaths.WorkspaceHash(normalizedWorkspace)");
+    expect(bridge).toContain("GuardPaths.LabelFor(normalizedWorkspace)");
+    // Collection is gated by the same check the wrapper uses, not a second copy of it.
+    expect(bridge).toContain("GuardRegistry.CollectionAllowed(registry, profile)");
   });
 });

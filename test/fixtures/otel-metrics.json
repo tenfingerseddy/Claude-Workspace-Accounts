@@ -1,4 +1,5 @@
 {
+  "_comment": "Real Claude Code wire format: MCP attribution arrives as the dotted mcp_server.name / mcp_tool.name keys documented at https://code.claude.com/docs/en/monitoring-usage. otel-metrics-legacy-attributes.json covers the undotted server_name / tool_name shape.",
   "resourceMetrics": [
     {
       "resource": {
@@ -26,8 +27,11 @@
                       { "key": "skill.name", "value": { "stringValue": "release-check" } },
                       { "key": "plugin.name", "value": { "stringValue": "github" } },
                       { "key": "agent.name", "value": { "stringValue": "reviewer" } },
-                      { "key": "server_name", "value": { "stringValue": "github" } },
-                      { "key": "tool_name", "value": { "stringValue": "get_pull_request" } },
+                      { "key": "mcp_server.name", "value": { "stringValue": "github" } },
+                      { "key": "mcp_tool.name", "value": { "stringValue": "get_pull_request" } },
+                      { "key": "marketplace.name", "value": { "stringValue": "official" } },
+                      { "key": "speed", "value": { "stringValue": "standard" } },
+                      { "key": "effort", "value": { "stringValue": "high" } },
                       { "key": "user.email", "value": { "stringValue": "must-not-be-retained@example.com" } }
                     ]
                   }

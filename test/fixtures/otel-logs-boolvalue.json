@@ -1,5 +1,5 @@
 {
-  "_comment": "Real Claude Code wire format: `success` is the STRING \"true\"/\"false\", not an OTLP boolValue, and MCP attribution uses the dotted mcp_server.name key. See otel-logs-boolvalue.json for the OTLP-boolean encoding of the same events; both must normalize identically.",
+  "_comment": "The same events as otel-logs.json encoded with OTLP boolValue booleans and the older undotted server_name key. Kept so both representations stay covered: the committed fixtures used to carry only this shape, which is exactly why the string-encoded wire format shipped broken.",
   "resourceLogs": [
     {
       "scopeLogs": [
@@ -11,7 +11,7 @@
               "attributes": [
                 { "key": "model", "value": { "stringValue": "claude-opus-4-8" } },
                 { "key": "query_source", "value": { "stringValue": "repl_main_thread" } },
-                { "key": "success", "value": { "stringValue": "true" } },
+                { "key": "success", "value": { "boolValue": true } },
                 { "key": "duration_ms", "value": { "intValue": "900" } },
                 { "key": "ttft_ms", "value": { "intValue": "240" } },
                 { "key": "speed", "value": { "stringValue": "standard" } },
@@ -24,7 +24,7 @@
               "body": { "stringValue": "claude_code.tool_result" },
               "attributes": [
                 { "key": "tool_name", "value": { "stringValue": "Read" } },
-                { "key": "success", "value": { "stringValue": "true" } },
+                { "key": "success", "value": { "boolValue": true } },
                 { "key": "duration_ms", "value": { "intValue": "120" } }
               ]
             },
@@ -33,7 +33,7 @@
               "body": { "stringValue": "claude_code.tool_result" },
               "attributes": [
                 { "key": "tool_name", "value": { "stringValue": "Bash" } },
-                { "key": "success", "value": { "stringValue": "false" } },
+                { "key": "success", "value": { "boolValue": false } },
                 { "key": "duration_ms", "value": { "intValue": "45" } },
                 { "key": "error_type", "value": { "stringValue": "ShellError" } },
                 { "key": "error", "value": { "stringValue": "must not be retained" } }
@@ -44,7 +44,7 @@
               "body": { "stringValue": "claude_code.auth" },
               "attributes": [
                 { "key": "action", "value": { "stringValue": "refresh" } },
-                { "key": "success", "value": { "stringValue": "false" } },
+                { "key": "success", "value": { "boolValue": false } },
                 { "key": "auth_method", "value": { "stringValue": "oauth" } },
                 { "key": "error_category", "value": { "stringValue": "token_expired" } }
               ]
@@ -54,7 +54,7 @@
               "body": { "stringValue": "claude_code.mcp_server_connection" },
               "attributes": [
                 { "key": "status", "value": { "stringValue": "failed" } },
-                { "key": "mcp_server.name", "value": { "stringValue": "github" } },
+                { "key": "server_name", "value": { "stringValue": "github" } },
                 { "key": "transport_type", "value": { "stringValue": "stdio" } },
                 { "key": "error_code", "value": { "stringValue": "ECONNREFUSED" } },
                 { "key": "error", "value": { "stringValue": "must not be retained" } }

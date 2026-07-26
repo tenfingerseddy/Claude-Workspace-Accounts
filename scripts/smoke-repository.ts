@@ -43,6 +43,15 @@ try {
     || reliability.medianRequestMs !== 900) {
     throw new Error("Reliability reconciliation failed.");
   }
+  // Anthropic encodes success as the strings "true"/"false". A strict `!== false` test recorded every
+  // failed tool result as a success and dropped failed auth events entirely.
+  if (reliability.tools.find((tool) => tool.name === "Bash")?.successes !== 0
+    || reliability.tools.find((tool) => tool.name === "Read")?.successes !== 1) {
+    throw new Error("String-encoded tool failure was recorded as a success.");
+  }
+  if (reliability.authFailures !== 1 || reliability.mcpFailures !== 1) {
+    throw new Error("String-encoded auth or MCP failure was not recorded.");
+  }
   if (repository.latestStatusSnapshot("work")?.rateLimits?.sevenDay?.usedPercentage !== 86) {
     throw new Error("Status snapshot persistence failed.");
   }
@@ -99,6 +108,52 @@ try {
     || lockMirror.hash !== workspaceHash(workspacePath)
     || lockMirror.uri !== workspaceHash("file:///C:/repos/sensitive-client")) {
     throw new Error("Registry mirror persisted a path instead of a hash.");
+  }
+
+  // MCP attribution must resolve from the documented dotted keys as well as the legacy ones.
+  const legacy = new UsageRepository(path.join(directory, "legacy.sqlite3"));
+  try {
+    legacy.ingestBatch(
+      "work",
+      normalizeOtlp(JSON.parse(
+        await readFile("test/fixtures/otel-metrics-legacy-attributes.json", "utf8")
+      ) as unknown).metrics,
+      []
+    );
+    if (!legacy.attribution("work", "7d").some((row) => row.dimension === "mcp_tool"
+      && row.label === "github / get_pull_request")) {
+      throw new Error("Legacy MCP attribute keys stopped resolving.");
+    }
+  } finally {
+    legacy.close();
+  }
+
+  // A second repository over the same file must not have to remigrate, and must not throw: the
+  // unconditional pragma and migration used to fail activation when another window held the file.
+  const second = new UsageRepository(databasePath);
+  try {
+    if (second.latestStatusSnapshot("work")?.sessionId !== snapshot.sessionId) {
+      throw new Error("A second extension host could not read the existing database.");
+    }
+    const health = second.collectionHealth("work", {
+      telemetryEnabled: true,
+      runtimeProfileRegistered: true
+    });
+    // Data is stored but no collector has registered in this process, so the honest phase is
+    // "collector_stopped" — not the single "unavailable" the dashboard used to infer for everything.
+    if (health.phase !== "collector_stopped"
+      || health.storage.lastSuccessfulWriteAt === undefined
+      || health.storage.databaseSizeBytes === undefined) {
+      throw new Error(`Collection health misreported a stopped collector: ${health.phase}`);
+    }
+    if (second.collectionHealth("work", { runtimeProfileRegistered: false }).phase
+      !== "no_runtime_profile"
+      || second.collectionHealth("work", { telemetryEnabled: false }).phase
+      !== "telemetry_disabled") {
+      throw new Error("Collection health could not distinguish setup states.");
+    }
+  } finally {
+    second.close();
   }
   console.log("Usage repository smoke test: OK");
 } finally {

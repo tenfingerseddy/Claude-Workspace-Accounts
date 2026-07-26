@@ -6,18 +6,44 @@ import { fileURLToPath } from "node:url";
 
 const run = promisify(execFile);
 
-const SOURCE_DIRECTORY = path.join("native", "WrapperLauncher");
+const SHARED_DIRECTORY = path.join("native", "Shared");
+const OUTPUT_DIRECTORY = path.join("bin", "native", "win-x64");
 
 /**
- * Compile the Claude process wrapper.
+ * The two native components, each compiled with the shared guard sources.
  *
- * The wrapper must be a single self-contained native executable: it sits between Claude Code
- * and the Claude CLI on every launch, including background ones, so it carries no interpreter
- * hop and no sidecar files that could be missing or stale. It is built with the in-box .NET
- * Framework compiler, which means C# 5 and only assemblies that ship with Windows.
+ * They are separate executables on purpose. The wrapper's argument vector is a contract with
+ * Claude Code and its first argument is the CLI, so it must never have to inspect argv to work out
+ * which mode it is running in. Sharing the source instead of the binary is what keeps them from
+ * drifting: the status-line bridge used to reimplement the registry lookup and path normalization
+ * in PowerShell, and the two copies disagreed.
+ */
+const COMPONENTS = [
+  { directory: path.join("native", "WrapperLauncher"), output: "claude-account-guard-wrapper.exe" },
+  { directory: path.join("native", "StatusLineBridge"), output: "statusline-bridge.exe" }
+];
+
+async function sourcesIn(directory) {
+  const entries = (await readdir(directory))
+    .filter((entry) => entry.endsWith(".cs"))
+    .sort()
+    .map((entry) => path.join(directory, entry));
+  if (entries.length === 0) {
+    throw new Error(`No C# sources found in ${directory}.`);
+  }
+  return entries;
+}
+
+/**
+ * Compile the native components.
+ *
+ * Both must be self-contained: they sit between Claude Code and the Claude CLI on every launch and
+ * every status-line refresh, so they carry no interpreter hop and no sidecar files that could be
+ * missing or stale. They are built with the in-box .NET Framework compiler, which means C# 5 and
+ * only assemblies that ship with Windows.
  */
 export async function buildWrapper() {
-  await mkdir("bin/native/win-x64", { recursive: true });
+  await mkdir(OUTPUT_DIRECTORY, { recursive: true });
   const compiler = path.join(
     process.env.WINDIR ?? "C:\\Windows",
     "Microsoft.NET",
@@ -25,28 +51,26 @@ export async function buildWrapper() {
     "v4.0.30319",
     "csc.exe"
   );
-  const sources = (await readdir(SOURCE_DIRECTORY))
-    .filter((entry) => entry.endsWith(".cs"))
-    .sort()
-    .map((entry) => path.join(SOURCE_DIRECTORY, entry));
-  if (sources.length === 0) {
-    throw new Error(`No wrapper sources found in ${SOURCE_DIRECTORY}.`);
-  }
-  const { stdout, stderr } = await run(compiler, [
-    "/nologo",
-    "/target:exe",
-    "/platform:x64",
-    "/optimize+",
-    "/debug-",
-    "/warnaserror+",
-    "/out:bin/native/win-x64/claude-account-guard-wrapper.exe",
-    ...sources
-  ], { windowsHide: true });
-  if (stdout) {
-    process.stdout.write(stdout);
-  }
-  if (stderr) {
-    process.stderr.write(stderr);
+  const shared = await sourcesIn(SHARED_DIRECTORY);
+
+  for (const component of COMPONENTS) {
+    const { stdout, stderr } = await run(compiler, [
+      "/nologo",
+      "/target:exe",
+      "/platform:x64",
+      "/optimize+",
+      "/debug-",
+      "/warnaserror+",
+      `/out:${path.join(OUTPUT_DIRECTORY, component.output)}`,
+      ...shared,
+      ...(await sourcesIn(component.directory))
+    ], { windowsHide: true });
+    if (stdout) {
+      process.stdout.write(stdout);
+    }
+    if (stderr) {
+      process.stderr.write(stderr);
+    }
   }
 }
 

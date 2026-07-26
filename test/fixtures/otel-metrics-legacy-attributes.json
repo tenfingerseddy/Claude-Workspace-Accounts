@@ -1,0 +1,38 @@
+{
+  "_comment": "The undotted server_name / tool_name attribute shape. MCP attribution must resolve to the same label from either representation, so neither encoding can regress unnoticed.",
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "claude.account_guard.profile_id", "value": { "stringValue": "work" } },
+          { "key": "claude.account_guard.workspace_hash", "value": { "stringValue": "0123456789abcdef" } },
+          { "key": "claude.account_guard.workspace_label", "value": { "stringValue": "client-repo" } }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "claude_code.token.usage",
+              "sum": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1784782800000000000",
+                    "asInt": "1200",
+                    "attributes": [
+                      { "key": "type", "value": { "stringValue": "input" } },
+                      { "key": "model", "value": { "stringValue": "claude-opus-4-8" } },
+                      { "key": "query_source", "value": { "stringValue": "repl_main_thread" } },
+                      { "key": "server_name", "value": { "stringValue": "github" } },
+                      { "key": "tool_name", "value": { "stringValue": "get_pull_request" } }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
