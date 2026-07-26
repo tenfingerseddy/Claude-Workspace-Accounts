@@ -1,0 +1,33 @@
+{
+  "resourceLogs": [
+    {
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "timeUnixNano": "1784782801000000000",
+              "body": { "stringValue": "claude_code.api_request" },
+              "attributes": [
+                { "key": "model", "value": { "stringValue": "claude-opus-4-8" } },
+                { "key": "query_source", "value": { "stringValue": "repl_main_thread" } },
+                { "key": "success", "value": { "boolValue": true } },
+                { "key": "duration_ms", "value": { "intValue": "900" } },
+                { "key": "ttft_ms", "value": { "intValue": "240" } },
+                { "key": "tool_input", "value": { "stringValue": "must not be retained" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1784782802000000000",
+              "body": { "stringValue": "claude_code.tool_result" },
+              "attributes": [
+                { "key": "tool_name", "value": { "stringValue": "Read" } },
+                { "key": "success", "value": { "boolValue": true } },
+                { "key": "duration_ms", "value": { "intValue": "120" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

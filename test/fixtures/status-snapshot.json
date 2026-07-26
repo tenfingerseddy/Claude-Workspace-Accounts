@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-07-23T05:00:00.000Z",
+  "profileId": "work",
+  "sessionId": "session-123",
+  "sessionName": "Guard implementation",
+  "workspaceHash": "abc123def456",
+  "workspaceLabel": "account-switch-extension",
+  "modelId": "claude-opus-4-8",
+  "modelDisplayName": "Opus",
+  "effort": "high",
+  "thinkingEnabled": true,
+  "costUsd": 1.23,
+  "durationMs": 60000,
+  "apiDurationMs": 12000,
+  "linesAdded": 90,
+  "linesRemoved": 12,
+  "contextWindow": {
+    "usedPercentage": 64,
+    "remainingPercentage": 36,
+    "size": 200000,
+    "totalInputTokens": 128000,
+    "currentUsage": {
+      "input": 50000,
+      "output": 8000,
+      "cacheRead": 60000,
+      "cacheCreation": 10000
+    }
+  },
+  "rateLimits": {
+    "fiveHour": {
+      "usedPercentage": 42,
+      "resetsAt": 1784786400
+    },
+    "sevenDay": {
+      "usedPercentage": 86,
+      "resetsAt": 1785225600
+    }
+  }
+}

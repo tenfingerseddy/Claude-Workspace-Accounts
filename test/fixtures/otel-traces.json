@@ -1,0 +1,43 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "claude.account_guard.workspace_hash",
+            "value": { "stringValue": "0123456789abcdef" }
+          },
+          {
+            "key": "claude.account_guard.workspace_label",
+            "value": { "stringValue": "client-repo" }
+          },
+          {
+            "key": "user.email",
+            "value": { "stringValue": "must-not-be-retained@example.com" }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "name": "claude_code.api_request",
+              "startTimeUnixNano": "1784782800000000000",
+              "endTimeUnixNano": "1784782801250000000",
+              "attributes": [
+                { "key": "model", "value": { "stringValue": "claude-opus-4-8" } },
+                { "key": "query_source", "value": { "stringValue": "repl_main_thread" } },
+                { "key": "success", "value": { "boolValue": true } },
+                { "key": "ttft_ms", "value": { "intValue": "275" } },
+                {
+                  "key": "request.body",
+                  "value": { "stringValue": "must-not-be-retained" }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

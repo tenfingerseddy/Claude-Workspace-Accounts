@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Claude Account Guard">
+  <rect width="128" height="128" rx="24" fill="#252526"/>
+  <path d="M64 18 103 32v29c0 24-15 42-39 50C40 103 25 85 25 61V32z" fill="#d7ba7d"/>
+  <path d="M64 32 89 41v20c0 15-9 27-25 34-16-7-25-19-25-34V41z" fill="#252526"/>
+  <circle cx="64" cy="58" r="11" fill="#d7ba7d"/>
+  <path d="M47 85c3-11 9-17 17-17s14 6 17 17" fill="#d7ba7d"/>
+</svg>

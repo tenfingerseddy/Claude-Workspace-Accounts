@@ -1,0 +1,13 @@
+node_modules/
+dist/
+bin/native/
+coverage/
+*.vsix
+*.log
+.vscode-test/
+.DS_Store
+Thumbs.db
+
+# Local scratch
+artifacts/
+.agents/

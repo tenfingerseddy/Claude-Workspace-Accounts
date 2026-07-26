@@ -1,0 +1,218 @@
+{
+  "name": "claude-account-guard",
+  "displayName": "Claude Account Guard",
+  "description": "Make the Claude Code account in play explicit, switch safely between isolated profiles, enforce workspace locks, and inspect local usage.",
+  "version": "0.1.0",
+  "type": "module",
+  "publisher": "ResonanceLattice-Semanticus",
+  "license": "MIT",
+  "private": true,
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "vscode": "^1.130.0"
+  },
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "keywords": [
+    "claude",
+    "accounts",
+    "security",
+    "usage",
+    "telemetry"
+  ],
+  "main": "./dist/extension.cjs",
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:claudeAccountGuard.openMenu"
+  ],
+  "files": [
+    "dist/**",
+    "bin/**",
+    "resources/**",
+    "docs/**",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeAccountGuard.openMenu",
+        "title": "Claude Account Guard: Open Account Menu",
+        "icon": "$(account)"
+      },
+      {
+        "command": "claudeAccountGuard.openDashboard",
+        "title": "Claude Account Guard: Open Usage Dashboard",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "claudeAccountGuard.addProfile",
+        "title": "Claude Account Guard: Add Account Profile"
+      },
+      {
+        "command": "claudeAccountGuard.registerCurrentProfile",
+        "title": "Claude Account Guard: Register Current Account"
+      },
+      {
+        "command": "claudeAccountGuard.switchProfile",
+        "title": "Claude Account Guard: Switch Account Profile"
+      },
+      {
+        "command": "claudeAccountGuard.lockWorkspace",
+        "title": "Claude Account Guard: Lock Workspace"
+      },
+      {
+        "command": "claudeAccountGuard.unlockWorkspace",
+        "title": "Claude Account Guard: Remove Workspace Lock"
+      },
+      {
+        "command": "claudeAccountGuard.verifyAccount",
+        "title": "Claude Account Guard: Verify Account"
+      },
+      {
+        "command": "claudeAccountGuard.login",
+        "title": "Claude Account Guard: Sign In"
+      },
+      {
+        "command": "claudeAccountGuard.manageProfiles",
+        "title": "Claude Account Guard: Manage Profiles"
+      },
+      {
+        "command": "claudeAccountGuard.diagnostics",
+        "title": "Claude Account Guard: Show Diagnostics"
+      },
+      {
+        "command": "claudeAccountGuard.deleteUsageData",
+        "title": "Claude Account Guard: Delete Local Usage Data"
+      },
+      {
+        "command": "claudeAccountGuard.exportUsage",
+        "title": "Claude Account Guard: Export Local Usage"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "claudeAccountGuard.openMenu",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "claudeAccountGuard.openDashboard",
+          "when": "workspaceFolderCount > 0"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Claude Account Guard",
+      "properties": {
+        "claudeAccountGuard.defaultLockMode": {
+          "type": "string",
+          "enum": [
+            "enforce",
+            "warn",
+            "off"
+          ],
+          "default": "enforce",
+          "description": "Default mode for new workspace locks."
+        },
+        "claudeAccountGuard.telemetry.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Collect privacy-minimized Claude Code OpenTelemetry and status snapshots locally."
+        },
+        "claudeAccountGuard.telemetry.retentionDays": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 365,
+          "default": 30,
+          "description": "Days to retain normalized event-level local usage."
+        },
+        "claudeAccountGuard.usage.warningThreshold": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 99,
+          "default": 70,
+          "description": "Local usage warning threshold. This is not an Anthropic policy threshold."
+        },
+        "claudeAccountGuard.usage.criticalThreshold": {
+          "type": "number",
+          "minimum": 2,
+          "maximum": 100,
+          "default": 90,
+          "description": "Local usage critical threshold. This is not an Anthropic policy threshold."
+        },
+        "claudeAccountGuard.context.warningThreshold": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 80,
+          "description": "Local context-window warning threshold."
+        },
+        "claudeAccountGuard.statusBar.showUsage": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a fresh five-hour or more-severe seven-day percentage in the status bar."
+        },
+        "claudeAccountGuard.dashboard.defaultRange": {
+          "type": "string",
+          "enum": [
+            "24h",
+            "7d",
+            "30d"
+          ],
+          "default": "7d",
+          "description": "Default dashboard time range."
+        },
+        "claudeAccountGuard.privacy.collectWorkspacePath": {
+          "type": "boolean",
+          "default": false,
+          "description": "Store full workspace paths in local telemetry. Disabled by default; labels and hashes are used otherwise."
+        },
+        "claudeAccountGuard.wrapper.autoConfigure": {
+          "type": "boolean",
+          "default": true,
+          "description": "Configure the official Claude Code extension to use the stable Account Guard process wrapper."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "node scripts/build.mjs",
+    "watch": "node scripts/build.mjs --watch",
+    "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\"",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --configLoader runner",
+    "test:watch": "vitest --configLoader runner",
+    "smoke:runtime": "node scripts/smoke-runtime.mjs",
+    "smoke:collector": "node --experimental-transform-types --experimental-loader ./scripts/typescript-loader.mjs scripts/smoke-collector.ts",
+    "smoke:core": "node --experimental-transform-types --experimental-loader ./scripts/typescript-loader.mjs scripts/smoke-core.ts",
+    "smoke:registry": "node --experimental-transform-types --experimental-loader ./scripts/typescript-loader.mjs scripts/smoke-registry.ts",
+    "smoke:repository": "node --experimental-transform-types --experimental-loader ./scripts/typescript-loader.mjs scripts/smoke-repository.ts",
+    "smoke:statusline": "node scripts/smoke-statusline.mjs",
+    "smoke:wrapper": "node scripts/smoke-wrapper.mjs",
+    "test:e2e": "npm run build && npm run smoke:runtime && npm run smoke:core && npm run smoke:registry && npm run smoke:repository && npm run smoke:collector && npm run smoke:statusline && npm run smoke:wrapper",
+    "check": "npm run lint && npm run typecheck && npm test && npm run test:e2e",
+    "package": "node scripts/package-vsix.mjs",
+    "vscode:prepublish": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.125.0",
+    "@vscode/vsce": "^3.6.0",
+    "@eslint/js": "~9.39.5",
+    "eslint": "~9.39.5",
+    "esbuild": "^0.25.5",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "~8.65.0",
+    "vitest": "^3.2.4"
+  }
+}

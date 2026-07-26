@@ -1,0 +1,16 @@
+{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "apiProvider": "firstParty",
+  "email": "developer@example.com",
+  "account": {
+    "id": "acct_work_123"
+  },
+  "organization": {
+    "id": "org_456",
+    "name": "Example Engineering"
+  },
+  "futureField": {
+    "ignored": true
+  }
+}

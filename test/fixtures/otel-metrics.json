@@ -1,0 +1,56 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "claude.account_guard.profile_id", "value": { "stringValue": "work" } },
+          { "key": "claude.account_guard.workspace_hash", "value": { "stringValue": "0123456789abcdef" } },
+          { "key": "claude.account_guard.workspace_label", "value": { "stringValue": "client-repo" } },
+          { "key": "process.command_line", "value": { "stringValue": "must-not-be-retained" } }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "claude_code.token.usage",
+              "sum": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1784782800000000000",
+                    "asInt": "1200",
+                    "attributes": [
+                      { "key": "type", "value": { "stringValue": "input" } },
+                      { "key": "model", "value": { "stringValue": "claude-opus-4-8" } },
+                      { "key": "query_source", "value": { "stringValue": "repl_main_thread" } },
+                      { "key": "skill.name", "value": { "stringValue": "release-check" } },
+                      { "key": "plugin.name", "value": { "stringValue": "github" } },
+                      { "key": "agent.name", "value": { "stringValue": "reviewer" } },
+                      { "key": "server_name", "value": { "stringValue": "github" } },
+                      { "key": "tool_name", "value": { "stringValue": "get_pull_request" } },
+                      { "key": "user.email", "value": { "stringValue": "must-not-be-retained@example.com" } }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "claude_code.cost.usage",
+              "sum": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1784782800000000000",
+                    "asDouble": 0.42,
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-opus-4-8" } }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
