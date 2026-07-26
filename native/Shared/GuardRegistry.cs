@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Text;
 
-namespace ClaudeAccountGuard
+namespace ClaudeWorkspaceAccounts
 {
     /// <summary>Where the guard keeps the state both native components read.</summary>
     internal static class GuardSupport
@@ -43,12 +43,12 @@ namespace ClaudeAccountGuard
                 string localAppData = Environment.GetEnvironmentVariable("LOCALAPPDATA");
                 if (!string.IsNullOrEmpty(localAppData))
                 {
-                    return Path.Combine(localAppData, "ClaudeAccountGuard");
+                    return Path.Combine(localAppData, "ClaudeWorkspaceAccounts");
                 }
                 string userProfile = Environment.GetEnvironmentVariable("USERPROFILE");
                 if (!string.IsNullOrEmpty(userProfile))
                 {
-                    return Path.Combine(userProfile, ".claude-account-guard");
+                    return Path.Combine(userProfile, ".claude-workspace-accounts");
                 }
             }
             catch (Exception)

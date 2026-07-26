@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,7 @@ const OUTPUT_DIRECTORY = path.join("bin", "native", "win-x64");
  * in PowerShell, and the two copies disagreed.
  */
 const COMPONENTS = [
-  { directory: path.join("native", "WrapperLauncher"), output: "claude-account-guard-wrapper.exe" },
+  { directory: path.join("native", "WrapperLauncher"), output: "claude-workspace-accounts-wrapper.exe" },
   { directory: path.join("native", "StatusLineBridge"), output: "statusline-bridge.exe" }
 ];
 
@@ -43,6 +43,10 @@ async function sourcesIn(directory) {
  * only assemblies that ship with Windows.
  */
 export async function buildWrapper() {
+  // Emptied rather than overwritten. `package.json` ships `bin/**` verbatim, so an executable
+  // left behind by an earlier build — a wrapper under its previous name, for instance — would
+  // be packaged into the VSIX and installed alongside the real one.
+  await rm(OUTPUT_DIRECTORY, { recursive: true, force: true });
   await mkdir(OUTPUT_DIRECTORY, { recursive: true });
   const compiler = path.join(
     process.env.WINDIR ?? "C:\\Windows",

@@ -45,7 +45,7 @@ describe("OTEL environment contract", () => {
 
   it("requires the wire format the loopback collector can actually read", () => {
     expect(REQUIRED_COLLECTOR_VARIABLES.OTEL_EXPORTER_OTLP_PROTOCOL).toBe("http/json");
-    // Spans need a beta telemetry mode Account Guard will not enable, so traces are turned off
+    // Spans need a beta telemetry mode Workspace Accounts will not enable, so traces are turned off
     // explicitly rather than left to inherit `otlp` from the user's shell.
     expect(REQUIRED_COLLECTOR_VARIABLES.OTEL_TRACES_EXPORTER).toBe("none");
     expect(REQUIRED_COLLECTOR_VARIABLES.OTEL_METRICS_EXPORTER).toBe("otlp");

@@ -1,4 +1,4 @@
-# Claude Account Guard
+# Claude Workspace Accounts
 
 Windows-only VS Code extension for developers with more than one Claude Code account.
 
@@ -6,7 +6,42 @@ Windows-only VS Code extension for developers with more than one Claude Code acc
 signing in somewhere else does not change the account every other workspace uses. Local usage
 collection is a secondary feature.
 
-Published to the Marketplace as `ResonanceLattice-Semanticus.claude-account-guard`.
+Published to the Marketplace as `ResonanceLattice-Semanticus.claude-workspace-accounts`.
+
+## The rename, and why nothing may un-migrate
+
+Up to and including v0.1.0 this shipped as **Claude Account Guard**
+(`ResonanceLattice-Semanticus.claude-account-guard`). The name described a product that blocked
+launches; the product now *selects* an account, so 0.2.0 renamed everything: display name, extension
+`name`, the `claudeAccountGuard.` command and configuration namespace (now `claudeAccounts.`), the
+`CLAUDE_ACCOUNT_GUARD_` environment prefix (now `CLAUDE_WORKSPACE_ACCOUNTS_`),
+`%LOCALAPPDATA%\ClaudeAccountGuard` (now `ClaudeWorkspaceAccounts`), the per-profile
+`.claude-account-guard` directory, the C# namespace, and `claude-account-guard-wrapper.exe`. The
+status-line bridge executable name is deliberately **unchanged**, which is what still lets
+`isStatusLineBridgeCommand` recognise a bridge command installed by the old release.
+
+Because the extension `name` changed, this is a new Marketplace listing rather than an upgrade path,
+so `src/migration/legacyMigration.ts` exists to stop the rename orphaning an existing installation.
+Its rules are load-bearing:
+
+- **It copies; it never moves.** `registry.json` is often the only copy of a user's bindings. The old
+  directory is left intact and a marker file is written into it — the single write this codebase ever
+  makes to the old support root.
+- **It never overwrites the destination**, which is what makes it resumable after a partial failure
+  and a no-op on the second activation.
+- **It runs before anything reads support state.** `ProfileRegistry.initialize()` creates an empty
+  registry when there is none, so migrating after it would present an upgrading user with no accounts.
+- **It fails open** and records every step to `migration-report.json`, which the diagnostics report
+  reads back. A migration defect must never stop activation or block a Claude launch.
+- It rewrites only what it can prove is ours: a `claudeCode.claudeProcessWrapper` naming the *old*
+  wrapper executable, and a `statusLine` command matched by the one shared bridge matcher. Anything
+  else belongs to somebody else and is left completely alone.
+- `SETTING_KEYS` is checked against `package.json` by a test, so a configuration property added later
+  cannot be silently stranded in the old namespace.
+
+Registry schema stays at version 1 with no migration. In particular `workspaceLocks` and its `mode`
+field keep their names because both native binaries read them; only what the *user* sees says
+"bind" rather than "lock".
 
 ## Bind, don't block
 
@@ -40,7 +75,7 @@ directory is correct behaviour, and blocking there would prevent the user from e
 
 `mode` on a binding stays `"enforce" | "warn" | "off"` (schema v1, no migration): `enforce` binds and
 blocks on genuine identity mismatch, `warn` binds and never blocks, `off` disables the binding. The UI
-does not ask — it uses `claudeAccountGuard.defaultLockMode`.
+does not ask — it uses `claudeAccounts.defaultBindMode`.
 
 ### Identity verification barely works, and nothing may depend on it
 
@@ -70,7 +105,7 @@ Rules that follow:
   one case where real identity is obtainable.
 - Keep `compareIdentity` and the mismatch paths — they are correct and will start working if the CLI
   reports those fields again. Just never depend on them.
-- Say so in the UI and docs. Do not imply Account Guard can detect a bound directory being
+- Say so in the UI and docs. Do not imply Workspace Accounts can detect a bound directory being
   re-authenticated as somebody else, because on this CLI it cannot.
 
 Whether this is intended CLI behaviour or an upstream bug is unknown — `subscriptionType` surviving
@@ -87,6 +122,7 @@ with one environment variable. Documentation must state the guarantee at that st
 | Path | What lives there |
 | --- | --- |
 | `src/` | Extension host code (TypeScript, ESM, bundled to `dist/extension.cjs` by esbuild) |
+| `src/migration/` | The 0.1.0 → 0.2.0 rename migration. Imports no `vscode`; the host is injected |
 | `native/Shared/` | Path normalization, JSON reading, registry loading shared by both native binaries |
 | `native/WrapperLauncher/` | The process wrapper: C# compiled by in-box `csc.exe` to a small .NET Framework exe |
 | `native/StatusLineBridge/` | The status-line bridge, same toolchain — a second binary, not an argv mode of the first |
@@ -101,7 +137,7 @@ with one environment variable. Documentation must state the guarantee at that st
 npm run check      # lint + typecheck + vitest + full e2e chain. The gate.
 npm run build      # esbuild bundle + csc compile of the wrapper into bin/native/
 npm test           # vitest only
-npm run package    # -> artifacts/claude-account-guard.vsix
+npm run package    # -> artifacts/claude-workspace-accounts.vsix
 ```
 
 `npm run check` is the contract; run it before declaring anything done. `bin/native/` is gitignored, so
@@ -135,17 +171,17 @@ the wrapper had eaten. **Never reintroduce a shell into the launch path.**
 
 **2. Fail open.** Any unexpected error — I/O, JSON parse, P/Invoke, missing support state, an
 unreadable registry — must forward the launch unchanged and record why. A block exits `78` with
-`CLAUDE_ACCOUNT_GUARD_BLOCKED category=<category>` on stderr, and identity mismatch is the only
+`CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED category=<category>` on stderr, and identity mismatch is the only
 category that still blocks. A bug in the guard must never be able to stop someone from running Claude;
 that is the failure the owner actually experienced, and it is why the guarantee is deliberately stated
-as convenience rather than security. `CLAUDE_ACCOUNT_GUARD_DISABLE=1` bypasses everything, including
+as convenience rather than security. `CLAUDE_WORKSPACE_ACCOUNTS_DISABLE=1` bypasses everything, including
 binding, and must stay that way.
 
 Note that exit code `78` is also a legal exit code for the CLI itself; a forwarded `78` must be
 recorded as `forwarded`, not as a block.
 
 **3. The integration outlives the extension.** The wrapper is installed to
-`%LOCALAPPDATA%\ClaudeAccountGuard\wrapper\` — outside the versioned extension directory — so Claude
+`%LOCALAPPDATA%\ClaudeWorkspaceAccounts\wrapper\` — outside the versioned extension directory — so Claude
 Code keeps working across extension upgrades. The cost is that uninstalling the extension leaves a
 global setting pointing at a wrapper the user can no longer manage from the UI. Detaching must stay a
 first-class, discoverable command, and activation must repair or clear a setting that points at a
@@ -181,7 +217,7 @@ without changing the documentation in the same commit.
 - `wrapper-health.json` carries only `{schemaVersion, updatedAt, category, exitCode, pid}`. Never add
   arguments, environment, paths, or auth output to it.
 - Workspace paths are stored as a label plus a SHA-256 prefix unless the user opts in via
-  `claudeAccountGuard.privacy.collectWorkspacePath`.
+  `claudeAccounts.privacy.collectWorkspacePath`.
 
 ## Conventions
 

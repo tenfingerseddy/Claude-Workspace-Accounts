@@ -1,6 +1,6 @@
 # Privacy
 
-Claude Account Guard is local-first. It does not provide a network service beyond a loopback-only OpenTelemetry receiver for Claude Code processes on the same machine.
+Claude Workspace Accounts is local-first. It does not provide a network service beyond a loopback-only OpenTelemetry receiver for Claude Code processes on the same machine.
 
 ## Data the extension stores
 

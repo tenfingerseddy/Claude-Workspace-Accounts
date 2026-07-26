@@ -6,7 +6,7 @@ import { workspaceHash } from "../src/core/paths.js";
 import { UsageRepository } from "../src/storage/usageRepository.js";
 import { normalizeOtlp, normalizeStatusSnapshot } from "../src/telemetry/normalizers.js";
 
-const directory = await mkdtemp(path.join(os.tmpdir(), "claude-account-guard-repository-"));
+const directory = await mkdtemp(path.join(os.tmpdir(), "claude-workspace-accounts-repository-"));
 const databasePath = path.join(directory, "usage.sqlite3");
 const repository = new UsageRepository(databasePath);
 

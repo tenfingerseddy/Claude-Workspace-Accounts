@@ -14,7 +14,7 @@ function supportPaths(root: string): SupportPaths {
   };
 }
 
-const root = await mkdtemp(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+const root = await mkdtemp(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
 const paths = supportPaths(root);
 
 try {
@@ -66,7 +66,7 @@ try {
   // Two ProfileRegistry instances stand in for two extension hosts: they share no in-process queue,
   // so without cross-process coordination one of these writes is lost and the wrapper finds either no
   // collector or a stale one.
-  const concurrentRoot = await mkdtemp(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+  const concurrentRoot = await mkdtemp(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
   const concurrentPaths = supportPaths(concurrentRoot);
   const hostA = new ProfileRegistry(concurrentPaths);
   await hostA.initialize();

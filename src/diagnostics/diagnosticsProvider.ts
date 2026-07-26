@@ -4,6 +4,8 @@ import { readFile } from "node:fs/promises";
 import * as vscode from "vscode";
 import { workspaceHash } from "../core/paths.js";
 import { bindingIdentityState } from "../core/statusState.js";
+import type { LegacyMigrationReport } from "../migration/legacyMigration.js";
+import { MIGRATION_REPORT } from "../migration/legacyMigration.js";
 import type { WorkspaceLockService } from "../locks/workspaceLockService.js";
 import type { ProfileRegistry } from "../profiles/registryStore.js";
 import type { RuntimeProfileDetector } from "../profiles/runtimeProfileDetector.js";
@@ -45,8 +47,8 @@ export class DiagnosticsProvider {
       || status?.text.includes("unverified") === true;
     const choice = await vscode.window.showInformationMessage(
       needsIdentity
-        ? "Claude Account Guard diagnostics are redacted by default. This workspace's account cannot be matched against the identity recorded for it."
-        : "Claude Account Guard diagnostics are redacted by default.",
+        ? "Claude Workspace Accounts diagnostics are redacted by default. This workspace's account cannot be matched against the identity recorded for it."
+        : "Claude Workspace Accounts diagnostics are redacted by default.",
       ...(needsIdentity ? ["Update Expected Identity"] : []),
       "Copy Redacted Diagnostics"
     );
@@ -54,7 +56,7 @@ export class DiagnosticsProvider {
       await vscode.env.clipboard.writeText(content);
       void vscode.window.showInformationMessage("Redacted diagnostics copied.");
     } else if (choice === "Update Expected Identity") {
-      await vscode.commands.executeCommand("claudeAccountGuard.updateExpectedIdentity");
+      await vscode.commands.executeCommand("claudeAccounts.updateExpectedIdentity");
     }
   }
 
@@ -81,6 +83,7 @@ export class DiagnosticsProvider {
       ? this.repository.latestStatusSnapshot(activeProfile.id)
       : undefined;
     const wrapperHealth = await this.wrapperHealth();
+    const migration = await this.migrationState();
     const redact = (value: string | undefined): string => {
       if (!value) {
         return "Not configured";
@@ -118,7 +121,7 @@ export class DiagnosticsProvider {
       .inspect<Record<string, string>>("env.windows")
       ?.workspaceValue?.CLAUDE_CONFIG_DIR;
 
-    return `# Claude Account Guard — Redacted Diagnostics
+    return `# Claude Workspace Accounts — Redacted Diagnostics
 
 - Generated: ${new Date().toISOString()}
 - Extension version: ${String(this.context.extension.packageJSON.version)}
@@ -126,8 +129,8 @@ export class DiagnosticsProvider {
 - Claude Code version: ${this.binaryResolver.installedVersion() ?? "Not installed"}
 - Platform: ${process.platform}-${process.arch}
 - Workspace account: ${boundProfile ? `${boundProfile.displayName} (${lock?.mode} mode)` : "None — uses the default account"}
-- Workspace account applied: ${boundProfile ? (this.actions?.wrapperState() === "guard" ? "Yes, by the Account Guard wrapper" : "No — Claude Code does not launch through Account Guard") : "N/A"}
-- Account in play here: ${activeProfile?.displayName ?? "Not tracked by Account Guard"}
+- Workspace account applied: ${boundProfile ? (this.actions?.wrapperState() === "guard" ? "Yes, by the Workspace Accounts wrapper" : "No — Claude Code does not launch through Workspace Accounts") : "N/A"}
+- Account in play here: ${activeProfile?.displayName ?? "Not tracked by Workspace Accounts"}
 - Account config dir: ${redact(activeProfile?.configDir ?? runtime.configDir)}
 - Default (inherited) config dir: ${redact(runtime.configDir)}
 - Default config dir tracked: ${runtime.profile ? "Yes" : "No — its usage is not collected"}
@@ -154,11 +157,14 @@ export class DiagnosticsProvider {
 - Wrapper last update: ${wrapperHealth.updatedAt ?? "Never"}
 - Configured wrapper: ${redact(configuredWrapper)}
 - Wrapper conflict: ${conflict ? "Yes" : "No"}
-- Claude Code integration: ${this.actions ? (this.actions.wrapperState() === "guard" ? "On — Claude Code launches through Account Guard" : this.actions.wrapperState() === "foreign" ? "Another tool's wrapper is configured" : "Off — per-workspace accounts are not applied") : "Unavailable"}
-- Undo integration: run "Claude Account Guard: Disconnect From Claude Code", or clear claudeCode.claudeProcessWrapper in settings.json and reload the window
-- Bypass without uninstalling: set CLAUDE_ACCOUNT_GUARD_DISABLE=1 in the environment
+- Claude Code integration: ${this.actions ? (this.actions.wrapperState() === "guard" ? "On — Claude Code launches through Workspace Accounts" : this.actions.wrapperState() === "foreign" ? "Another tool's wrapper is configured" : "Off — per-workspace accounts are not applied") : "Unavailable"}
+- Upgrade from Claude Account Guard: ${migration.summary}
+- Upgrade items still needing attention: ${migration.failures.length > 0 ? migration.failures.join("; ") : "None"}
+- Previous support directory: ${migration.legacyRoot ? `${redact(migration.legacyRoot)} (copied, not deleted)` : "Not present"}
+- Undo integration: run "Claude Workspace Accounts: Disconnect From Claude Code", or clear claudeCode.claudeProcessWrapper in settings.json and reload the window
+- Bypass without uninstalling: set CLAUDE_WORKSPACE_ACCOUNTS_DISABLE=1 in the environment
 - SQLite size: ${this.formatBytes(this.repository.databaseSize())}
-- Raw event retention: ${vscode.workspace.getConfiguration("claudeAccountGuard").get<number>("telemetry.retentionDays", 30)} days
+- Raw event retention: ${vscode.workspace.getConfiguration("claudeAccounts").get<number>("telemetry.retentionDays", 30)} days
 - Prompt/response/tool content collection: Disabled
 - Credential file access: Never
 
@@ -172,6 +178,42 @@ This report excludes email addresses, account and organization identifiers, raw 
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * The rename migration's own record, read back from disk.
+   *
+   * A migration that silently half-succeeded would leave the user with some accounts and no
+   * explanation, so its outcome is retrievable here rather than only in a notification that has
+   * already been dismissed.
+   */
+  private async migrationState(): Promise<{
+    summary: string;
+    failures: string[];
+    legacyRoot?: string;
+  }> {
+    try {
+      const content = await readFile(
+        path.join(this.registry.paths.root, MIGRATION_REPORT),
+        "utf8"
+      );
+      const value = JSON.parse(content.replace(/^\uFEFF/, "")) as Partial<LegacyMigrationReport>;
+      if (!value.legacyInstallationFound) {
+        return { summary: "Not applicable — no previous installation was found", failures: [] };
+      }
+      const failures = Array.isArray(value.failures)
+        ? value.failures.filter((entry): entry is string => typeof entry === "string")
+        : [];
+      return {
+        summary: failures.length > 0
+          ? `Incomplete as of ${value.completedAt ?? "an unknown time"}`
+          : `Complete as of ${value.completedAt ?? "an unknown time"}`,
+        failures,
+        legacyRoot: typeof value.legacyRoot === "string" ? value.legacyRoot : undefined
+      };
+    } catch {
+      return { summary: "No record — this install has not migrated anything", failures: [] };
     }
   }
 

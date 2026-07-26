@@ -17,7 +17,7 @@ function supportPaths(root: string): SupportPaths {
 
 describe("shared registry integrity", () => {
   it("creates an empty registry only when the file is absent", async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+    const root = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
     const registry = new ProfileRegistry(supportPaths(root));
     await registry.initialize();
     expect(await registry.read()).toMatchObject({
@@ -29,7 +29,7 @@ describe("shared registry integrity", () => {
   });
 
   it("preserves a corrupt registry and rejects startup", async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+    const root = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
     const paths = supportPaths(root);
     writeFileSync(paths.registry, "{corrupt", "utf8");
     const registry = new ProfileRegistry(paths);
@@ -42,7 +42,7 @@ describe("shared registry integrity", () => {
     // Each window read-modify-writes the whole document. Atomic rename protects a reader from
     // half-written JSON but does nothing about a lost update, so a collector registration could be
     // clobbered by an older read and the wrapper would then find no collector at all.
-    const root = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+    const root = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
     const paths = supportPaths(root);
     const now = new Date().toISOString();
     const first = new ProfileRegistry(paths);
@@ -106,7 +106,7 @@ describe("shared registry integrity", () => {
   });
 
   it("survives many interleaved cross-process writes without losing any", async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+    const root = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
     const paths = supportPaths(root);
     const now = new Date().toISOString();
     const hosts = [0, 1, 2, 3].map(() => new ProfileRegistry(paths));
@@ -130,7 +130,7 @@ describe("shared registry integrity", () => {
 
   it("recovers a lock abandoned by a dead process instead of deadlocking", async () => {
     // Fail open is the rule: contention must never be able to stop activation.
-    const root = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+    const root = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
     const paths = supportPaths(root);
     const registry = new ProfileRegistry(paths);
     await registry.initialize();
@@ -152,7 +152,7 @@ describe("shared registry integrity", () => {
   });
 
   it("still writes when the lock cannot be taken at all", async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+    const root = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
     const paths = supportPaths(root);
     const registry = new ProfileRegistry(paths);
     await registry.initialize();
@@ -175,7 +175,7 @@ describe("shared registry integrity", () => {
   });
 
   it("keeps a corrupt registry fail-closed even under the write lock", async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+    const root = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
     const paths = supportPaths(root);
     const registry = new ProfileRegistry(paths);
     await registry.initialize();
@@ -194,7 +194,7 @@ describe("shared registry integrity", () => {
   });
 
   it("rejects duplicate profile isolation paths", async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-registry-"));
+    const root = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-registry-"));
     const paths = supportPaths(root);
     const now = new Date().toISOString();
     const profile = {

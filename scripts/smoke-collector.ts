@@ -10,7 +10,7 @@ import {
 import { UsageRepository } from "../src/storage/usageRepository.js";
 import { TelemetryCollector } from "../src/telemetry/telemetryCollector.js";
 
-const directory = await mkdtemp(path.join(os.tmpdir(), "claude-account-guard-collector-"));
+const directory = await mkdtemp(path.join(os.tmpdir(), "claude-workspace-accounts-collector-"));
 const paths: SupportPaths = {
   root: directory,
   registry: path.join(directory, "registry.json"),

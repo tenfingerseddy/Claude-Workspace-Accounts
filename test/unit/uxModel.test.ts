@@ -9,7 +9,7 @@ import {
   planWrapperConsent
 } from "../../src/commands/uxModel.js";
 
-const WRAPPER_PATH = "C:\\Users\\dev\\AppData\\Local\\ClaudeAccountGuard\\wrapper\\claude-account-guard-wrapper.exe";
+const WRAPPER_PATH = "C:\\Users\\dev\\AppData\\Local\\ClaudeWorkspaceAccounts\\wrapper\\claude-workspace-accounts-wrapper.exe";
 const DEFAULT_CONFIG_DIR = "C:\\Users\\dev\\.claude";
 
 function collection(overrides: Partial<CollectionInput> = {}): CollectionInput {
@@ -58,7 +58,7 @@ const actions = (state: MenuState): (string | undefined)[] =>
   buildAccountMenu(state).filter((entry) => entry.kind === "item").map((entry) => entry.action);
 
 describe("planWrapperConsent", () => {
-  it("never re-asks when Account Guard is already the configured wrapper", () => {
+  it("never re-asks when Workspace Accounts is already the configured wrapper", () => {
     expect(planWrapperConsent({
       autoConfigure: true,
       configuredWrapper: WRAPPER_PATH,

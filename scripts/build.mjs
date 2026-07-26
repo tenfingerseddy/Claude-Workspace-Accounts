@@ -25,7 +25,7 @@ await buildWrapper();
 if (process.argv.includes("--watch")) {
   const buildContext = await context(options);
   await buildContext.watch();
-  console.log("Watching Claude Account Guard sources…");
+  console.log("Watching Claude Workspace Accounts sources…");
 } else {
   await build(options);
 }

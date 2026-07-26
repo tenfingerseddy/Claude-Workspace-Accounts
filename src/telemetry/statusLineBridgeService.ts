@@ -52,6 +52,26 @@ function isStatusLineObject(value: unknown): value is NonNullable<ClaudeSettings
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/**
+ * Whether a configured status-line command is one of ours, from any release.
+ *
+ * Recognising an older bridge matters on upgrade: replacing it without this check would record
+ * the previous *bridge* command as the user's own status line, and uninstalling would then
+ * "restore" a script that no longer exists. The rename migration matches on the same rule, so a
+ * status line that is not ours is never rewritten — hence one exported matcher rather than two.
+ *
+ * The executable name is deliberately unchanged across the rename, which is why matching on it
+ * still recognises a bridge installed by the old extension identity.
+ */
+export function isStatusLineBridgeCommand(command: string | undefined): boolean {
+  if (!command) {
+    return false;
+  }
+  const normalized = command.toLocaleLowerCase();
+  return normalized.includes("statusline-bridge.exe")
+    || normalized.includes("statusline-bridge.ps1");
+}
+
 export class StatusLineBridgeService {
   /**
    * @param mirrorDirectory Where the guard-owned second copy of each backup lives. Defaults beside
@@ -78,20 +98,8 @@ export class StatusLineBridgeService {
     return `"${this.bridgePath}"`;
   }
 
-  /**
-   * Whether a configured status-line command is one of ours, from any release.
-   *
-   * Recognising an older bridge matters on upgrade: replacing it without this check would record
-   * the previous *bridge* command as the user's own status line, and uninstalling would then
-   * "restore" a script that no longer exists.
-   */
   private isBridgeCommand(command: string | undefined): boolean {
-    if (!command) {
-      return false;
-    }
-    const normalized = command.toLocaleLowerCase();
-    return normalized.includes("statusline-bridge.exe")
-      || normalized.includes("statusline-bridge.ps1");
+    return isStatusLineBridgeCommand(command);
   }
 
   public async install(profile: AccountProfile): Promise<"installed" | "already_installed"> {
@@ -134,7 +142,7 @@ export class StatusLineBridgeService {
       const verified = await this.readBackup(nextPath);
       if (!verified || !this.describeBackup(verified, "profile").restorable) {
         throw new Error(
-          "Account Guard did not install the status-line bridge: it could not save a verifiable "
+          "Workspace Accounts did not install the status-line bridge: it could not save a verifiable "
           + "backup of your existing status line, and it will not replace a command it cannot restore."
         );
       }
@@ -237,7 +245,7 @@ export class StatusLineBridgeService {
   }
 
   private backupPath(profile: AccountProfile): string {
-    return path.join(profile.configDir, ".claude-account-guard", "statusline-next.json");
+    return path.join(profile.configDir, ".claude-workspace-accounts", "statusline-next.json");
   }
 
   private mirrorPath(profile: AccountProfile): string {

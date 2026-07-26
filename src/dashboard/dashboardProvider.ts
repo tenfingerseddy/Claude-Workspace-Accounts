@@ -35,7 +35,7 @@ interface DashboardPayload extends DashboardData {
     /** The account this workspace is bound to, if any. */
     boundProfileName?: string;
     workspaceLabel?: string;
-    /** True when the account in play here is one Account Guard knows about. */
+    /** True when the account in play here is one Workspace Accounts knows about. */
     runtimeRegistered: boolean;
     runtimeConfigDir: string;
     wrapperState: WrapperState;
@@ -81,7 +81,7 @@ export class DashboardProvider implements vscode.Disposable {
     this.selectedProfileId = context.globalState.get<string>(PROFILE_STATE_KEY);
     this.range = context.globalState.get<DashboardRange>(
       RANGE_STATE_KEY,
-      vscode.workspace.getConfiguration("claudeAccountGuard").get<DashboardRange>(
+      vscode.workspace.getConfiguration("claudeAccounts").get<DashboardRange>(
         "dashboard.defaultRange",
         "7d"
       )
@@ -107,7 +107,7 @@ export class DashboardProvider implements vscode.Disposable {
     }
     if (!this.panel) {
       this.panel = vscode.window.createWebviewPanel(
-        "claudeAccountGuard.usage",
+        "claudeAccounts.usage",
         "Claude Account Usage",
         vscode.ViewColumn.Active,
         {
@@ -199,18 +199,18 @@ export class DashboardProvider implements vscode.Disposable {
         await this.refresh();
         break;
       case "switchProfile":
-        await vscode.commands.executeCommand("claudeAccountGuard.switchProfile", message.profileId);
+        await vscode.commands.executeCommand("claudeAccounts.switchProfile", message.profileId);
         break;
       case "changeLock":
-        await vscode.commands.executeCommand("claudeAccountGuard.lockWorkspace");
+        await vscode.commands.executeCommand("claudeAccounts.bindWorkspace");
         await this.refresh();
         break;
       case "refresh":
-        await vscode.commands.executeCommand("claudeAccountGuard.verifyAccount");
+        await vscode.commands.executeCommand("claudeAccounts.verifyAccount");
         await this.refresh();
         break;
       case "export":
-        await vscode.commands.executeCommand("claudeAccountGuard.exportUsage", message.profileId);
+        await vscode.commands.executeCommand("claudeAccounts.exportUsage", message.profileId);
         break;
       case "retry":
         await this.refresh();
@@ -269,11 +269,11 @@ export class DashboardProvider implements vscode.Disposable {
       customRange: this.customRange,
       threadScope: this.threadScope,
       thresholds: {
-        usageWarning: vscode.workspace.getConfiguration("claudeAccountGuard")
+        usageWarning: vscode.workspace.getConfiguration("claudeAccounts")
           .get<number>("usage.warningThreshold", 70),
-        usageCritical: vscode.workspace.getConfiguration("claudeAccountGuard")
+        usageCritical: vscode.workspace.getConfiguration("claudeAccounts")
           .get<number>("usage.criticalThreshold", 90),
-        contextWarning: vscode.workspace.getConfiguration("claudeAccountGuard")
+        contextWarning: vscode.workspace.getConfiguration("claudeAccounts")
           .get<number>("context.warningThreshold", 80)
       },
       profiles: document.profiles.map((profile) => ({
@@ -759,7 +759,7 @@ export class DashboardProvider implements vscode.Disposable {
         <p class="meta">\${esc(message || 'Unknown error')}</p>
         <p class="meta">Local usage storage or the account registry could not be read. Account switching and workspace locks are unaffected.</p>
         <p><button id="retry">Try again</button></p>
-        <p class="meta">Run “Claude Account Guard: Show Diagnostics” for a redacted report.</p>
+        <p class="meta">Run “Claude Workspace Accounts: Show Diagnostics” for a redacted report.</p>
       </div></div>\`;
       document.getElementById('retry')?.addEventListener('click', () => vscode.postMessage({ type: 'retry' }));
     };

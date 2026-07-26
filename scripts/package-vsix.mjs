@@ -11,7 +11,7 @@ const { stdout, stderr } = await run(process.execPath, [
   "--target",
   "win32-x64",
   "--out",
-  "artifacts/claude-account-guard.vsix",
+  "artifacts/claude-workspace-accounts.vsix",
   "--allow-missing-repository"
 ], { windowsHide: true });
 

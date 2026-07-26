@@ -14,7 +14,7 @@ interface Scenario {
 
 /** A profile directory whose settings.json starts with `statusLine`, plus a guard-owned mirror dir. */
 async function scenario(statusLine: Record<string, unknown> | undefined): Promise<Scenario> {
-  const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-statusline-"));
+  const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-statusline-"));
   const settingsPath = path.join(directory, "settings.json");
   writeFileSync(settingsPath, JSON.stringify(statusLine ? { statusLine } : {}), "utf8");
   return {
@@ -35,7 +35,7 @@ async function scenario(statusLine: Record<string, unknown> | undefined): Promis
 
 describe("status-line bridge settings preservation", () => {
   it("restores the complete previous status-line object", async () => {
-    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-statusline-"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-statusline-"));
     const settingsPath = path.join(directory, "settings.json");
     const previous = {
       type: "command",
@@ -92,7 +92,7 @@ describe("status-line bridge settings preservation", () => {
     const bridge = new StatusLineBridgeService("C:\\Guard\\statusline-bridge.ps1", mirrorDirectory);
     await bridge.install(profile);
 
-    rmSync(path.join(directory, ".claude-account-guard"), { recursive: true, force: true });
+    rmSync(path.join(directory, ".claude-workspace-accounts"), { recursive: true, force: true });
     expect(await bridge.backupState(profile)).toMatchObject({
       state: "valid",
       restorable: true,
@@ -116,7 +116,7 @@ describe("status-line bridge settings preservation", () => {
     });
     const bridge = new StatusLineBridgeService("C:\\Guard\\statusline-bridge.ps1", mirrorDirectory);
     await bridge.install(profile);
-    rmSync(path.join(directory, ".claude-account-guard"), { recursive: true, force: true });
+    rmSync(path.join(directory, ".claude-workspace-accounts"), { recursive: true, force: true });
     rmSync(mirrorDirectory, { recursive: true, force: true });
 
     expect(await bridge.backupState(profile)).toMatchObject({
@@ -140,7 +140,7 @@ describe("status-line bridge settings preservation", () => {
     const bridge = new StatusLineBridgeService("C:\\Guard\\statusline-bridge.ps1", mirrorDirectory);
     await bridge.install(profile);
     writeFileSync(
-      path.join(directory, ".claude-account-guard", "statusline-next.json"),
+      path.join(directory, ".claude-workspace-accounts", "statusline-next.json"),
       "{not json",
       "utf8"
     );
@@ -174,7 +174,7 @@ describe("status-line bridge settings preservation", () => {
       command: "node existing-status.js"
     });
     // A file where the support directory belongs: mkdir fails, so no backup can be recorded.
-    writeFileSync(path.join(directory, ".claude-account-guard"), "not a directory", "utf8");
+    writeFileSync(path.join(directory, ".claude-workspace-accounts"), "not a directory", "utf8");
     const bridge = new StatusLineBridgeService("C:\\Guard\\statusline-bridge.ps1", mirrorDirectory);
 
     await expect(bridge.install(profile)).rejects.toBeDefined();

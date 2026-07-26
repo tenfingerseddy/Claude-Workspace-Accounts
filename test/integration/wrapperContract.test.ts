@@ -118,7 +118,7 @@ describe("native component security contract", () => {
     expect(site).toContain("\"identity_mismatch\"");
     expect(program).toContain("outcome == \"identity_mismatch\" && binding.Enforced");
     expect(program).toContain("GuardExitCode = 78");
-    expect(program).toContain("\"CLAUDE_ACCOUNT_GUARD_BLOCKED category=\" + category");
+    expect(program).toContain("\"CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED category=\" + category");
   });
 
   it("never blocks a user out of signing in, or out of a broken registry", () => {
@@ -150,7 +150,7 @@ describe("native component security contract", () => {
     expect(generalCatch).toBeGreaterThan(blockedCatch);
     // The kill switch is checked before any guard work happens at all.
     expect(main.indexOf("IsGuardDisabled()")).toBeLessThan(main.indexOf("Resolve(target)"));
-    expect(program).toContain("DisableVariable = \"CLAUDE_ACCOUNT_GUARD_DISABLE\"");
+    expect(program).toContain("DisableVariable = \"CLAUDE_WORKSPACE_ACCOUNTS_DISABLE\"");
     // A forwarded exit code is returned verbatim, so a CLI exit of 78 stays a CLI exit.
     expect(program).toContain("WriteGuardHealth(category, exitCode);");
     expect(program).toContain("return exitCode;");
@@ -269,7 +269,7 @@ describe("status-line bridge contract", () => {
   });
 
   it("always leaves a visible status line and always exits zero", () => {
-    expect(bridge).toContain("[account-guard: status line unavailable]");
+    expect(bridge).toContain("[workspace-accounts: status line unavailable]");
     // Every path out of Main goes through Emit or EmitMarker, and Emit reports success.
     const main = methodBody(
       bridge,

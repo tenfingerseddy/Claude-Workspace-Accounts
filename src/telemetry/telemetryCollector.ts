@@ -27,7 +27,7 @@ const inflateAsync = promisify(inflate);
  * The signal each route carries, and the OTLP partial-success field that names what was dropped.
  *
  * `/v1/traces` is deliberately absent. Claude Code only emits spans when
- * CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1, and Account Guard will not opt a user into a beta telemetry
+ * CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1, and Workspace Accounts will not opt a user into a beta telemetry
  * mode on their behalf, so traces are not collected and the endpoint says so instead of accepting
  * data it was never going to receive. `normalizeOtlp` still understands `resourceSpans`: re-enabling
  * collection, if spans ever leave beta, is this one line plus the wrapper's exporter variable.

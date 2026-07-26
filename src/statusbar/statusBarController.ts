@@ -45,8 +45,8 @@ export class StatusBarController implements vscode.Disposable {
     private readonly describeIntegration: () => string = () => "Unknown",
     private readonly log: (message: string) => void = () => undefined
   ) {
-    this.item.name = "Claude Account Guard";
-    this.item.command = "claudeAccountGuard.openMenu";
+    this.item.name = "Claude Workspace Accounts";
+    this.item.command = "claudeAccounts.openMenu";
   }
 
   public start(): void {
@@ -125,12 +125,12 @@ export class StatusBarController implements vscode.Disposable {
     // Keeps the palette's contextual commands honest even when state changes elsewhere.
     void vscode.commands.executeCommand(
       "setContext",
-      "claudeAccountGuard.locked",
+      "claudeAccounts.locked",
       Boolean(lock)
     );
     void vscode.commands.executeCommand(
       "setContext",
-      "claudeAccountGuard.hasProfiles",
+      "claudeAccounts.hasProfiles",
       document.profiles.length > 0
     );
 
@@ -179,7 +179,7 @@ export class StatusBarController implements vscode.Disposable {
     // Surfaces the recovery command in the palette exactly when it is the thing to run.
     void vscode.commands.executeCommand(
       "setContext",
-      "claudeAccountGuard.identityNeedsAttention",
+      "claudeAccounts.identityNeedsAttention",
       status.kind === "wrong_account"
         || status.kind === "wrong_account_warning"
         || status.text.includes("unverified")
@@ -193,7 +193,7 @@ export class StatusBarController implements vscode.Disposable {
    *
    * Using the default Claude account in a workspace with no account of its own is normal,
    * not a fault, so it must not be rendered as a warning. It is still named, because a
-   * default account Account Guard does not know about collects no usage.
+   * default account Workspace Accounts does not know about collects no usage.
    */
   private present(
     status: GuardStatus,
@@ -209,7 +209,7 @@ export class StatusBarController implements vscode.Disposable {
         ...status,
         text: "$(account) Claude · Default account",
         severity: "normal",
-        detail: `This workspace uses the default Claude account (${runtime.configDir}), which Account Guard does not track. Choose an account for this workspace, or track this one to collect its usage.`
+        detail: `This workspace uses the default Claude account (${runtime.configDir}), which Workspace Accounts does not track. Choose an account for this workspace, or track this one to collect its usage.`
       };
     }
     if (!bound.expectedIdentity) {
@@ -276,22 +276,22 @@ export class StatusBarController implements vscode.Disposable {
         : undefined;
     const tooltip = new vscode.MarkdownString(undefined, true);
     tooltip.isTrusted = true;
-    tooltip.appendMarkdown(`**Claude Account Guard**\n\n`);
+    tooltip.appendMarkdown(`**Claude Workspace Accounts**\n\n`);
     if (activeLock && requiredProfile) {
       tooltip.appendMarkdown(
         `This workspace uses **${this.escape(requiredProfile.displayName)}**  \n`
       );
       tooltip.appendMarkdown(`Account directory: \`${requiredProfile.configDir}\`  \n`);
       tooltip.appendMarkdown(
-        `[Use a different account here](command:claudeAccountGuard.lockWorkspace) · [Stop using it here](command:claudeAccountGuard.unlockWorkspace)  \n`
+        `[Use a different account here](command:claudeAccounts.bindWorkspace) · [Stop using it here](command:claudeAccounts.unbindWorkspace)  \n`
       );
     } else {
-      // Normal, but worth naming: a default account Account Guard does not know about
+      // Normal, but worth naming: a default account Workspace Accounts does not know about
       // collects no usage, which is why the dashboard would look empty.
       tooltip.appendMarkdown(`This workspace uses your **default Claude account**  \n`);
       tooltip.appendMarkdown(`Account directory: \`${runtime.configDir}\`  \n`);
       tooltip.appendMarkdown(
-        `[Use a specific account here](command:claudeAccountGuard.lockWorkspace)${runtime.profile ? "" : " · [Track this account's usage](command:claudeAccountGuard.registerCurrentProfile)"}  \n`
+        `[Use a specific account here](command:claudeAccounts.bindWorkspace)${runtime.profile ? "" : " · [Track this account's usage](command:claudeAccounts.registerCurrentProfile)"}  \n`
       );
     }
     if (verification?.email) {
@@ -351,17 +351,17 @@ export class StatusBarController implements vscode.Disposable {
   }
 
   private warningThreshold(): number {
-    return vscode.workspace.getConfiguration("claudeAccountGuard")
+    return vscode.workspace.getConfiguration("claudeAccounts")
       .get<number>("usage.warningThreshold", 70);
   }
 
   private criticalThreshold(): number {
-    return vscode.workspace.getConfiguration("claudeAccountGuard")
+    return vscode.workspace.getConfiguration("claudeAccounts")
       .get<number>("usage.criticalThreshold", 90);
   }
 
   private showUsage(): boolean {
-    return vscode.workspace.getConfiguration("claudeAccountGuard")
+    return vscode.workspace.getConfiguration("claudeAccounts")
       .get<boolean>("statusBar.showUsage", true);
   }
 
@@ -372,36 +372,36 @@ export class StatusBarController implements vscode.Disposable {
       // changed. An enforcing binding stops every launch until this is resolved, so the
       // click has to be the recovery, not a diagnosis.
       return {
-        command: "claudeAccountGuard.updateExpectedIdentity",
+        command: "claudeAccounts.updateExpectedIdentity",
         title: `Resolve the identity mismatch in ${requiredProfile.displayName}`
       };
     }
     if (status.kind === "usage_unavailable" && status.text.includes("unverified")) {
       return {
-        command: "claudeAccountGuard.updateExpectedIdentity",
+        command: "claudeAccounts.updateExpectedIdentity",
         title: "Restore identity checking for this workspace's account"
       };
     }
     if (status.kind === "signed_out") {
       return {
-        command: "claudeAccountGuard.login",
+        command: "claudeAccounts.login",
         title: "Sign in to this workspace's Claude account"
       };
     }
     if (status.kind === "limit_warning") {
       return {
-        command: "claudeAccountGuard.openDashboard",
+        command: "claudeAccounts.openDashboard",
         title: "Open usage dashboard"
       };
     }
     if (status.kind === "verifying") {
       return {
-        command: "claudeAccountGuard.diagnostics",
+        command: "claudeAccounts.diagnostics",
         title: "Open diagnostic details"
       };
     }
     return {
-      command: "claudeAccountGuard.openMenu",
+      command: "claudeAccounts.openMenu",
       title: "Open account menu"
     };
   }

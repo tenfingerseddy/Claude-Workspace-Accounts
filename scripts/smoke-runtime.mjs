@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const directory = await mkdtemp(path.join(os.tmpdir(), "claude-account-guard-runtime-"));
+const directory = await mkdtemp(path.join(os.tmpdir(), "claude-workspace-accounts-runtime-"));
 const databasePath = path.join(directory, "smoke.sqlite3");
 
 try {

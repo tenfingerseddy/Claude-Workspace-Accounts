@@ -171,7 +171,7 @@ describe("telemetry normalization", () => {
 
   it("normalizes trace latency while dropping span content and identity", () => {
     // Traces are not collected — the endpoint refuses them because spans need a beta telemetry mode
-    // Account Guard will not enable — but the parser stays covered so re-enabling is a one-liner.
+    // Workspace Accounts will not enable — but the parser stays covered so re-enabling is a one-liner.
     const payload = JSON.parse(readFileSync("test/fixtures/otel-traces.json", "utf8"));
     const normalized = normalizeOtlp(payload);
     expect(normalized.events).toHaveLength(1);

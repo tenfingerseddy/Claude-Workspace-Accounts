@@ -4,7 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 
-namespace ClaudeAccountGuard.WrapperLauncher
+namespace ClaudeWorkspaceAccounts.WrapperLauncher
 {
     /// <summary>
     /// A deliberate refusal to launch Claude.
@@ -282,7 +282,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
     }
 
     /// <summary>
-    /// The Claude Account Guard process wrapper.
+    /// The Claude Workspace Accounts process wrapper.
     ///
     /// Claude Code launches <c>wrapper.exe &lt;claude-cli...&gt; &lt;args...&gt;</c>. The
     /// wrapper works out which account this workspace should run as, points the launch at that
@@ -305,8 +305,8 @@ namespace ClaudeAccountGuard.WrapperLauncher
     internal static class Program
     {
         private const int GuardExitCode = 78;
-        private const string DisableVariable = "CLAUDE_ACCOUNT_GUARD_DISABLE";
-        private const string WorkspaceKeyVariable = "CLAUDE_ACCOUNT_GUARD_WORKSPACE_KEY";
+        private const string DisableVariable = "CLAUDE_WORKSPACE_ACCOUNTS_DISABLE";
+        private const string WorkspaceKeyVariable = "CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY";
         private const string ConfigDirectoryVariable = "CLAUDE_CONFIG_DIR";
         private const string SecureStorageDirectoryVariable = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
         private const int AuthStatusTimeoutMilliseconds = 60000;
@@ -544,8 +544,8 @@ namespace ClaudeAccountGuard.WrapperLauncher
                     "identity_mismatch",
                     "This workspace is bound to '" + displayName + "', but that account's "
                         + "directory is now signed in as a different account, so no Claude "
-                        + "request was started. Re-verify the account from Claude Account "
-                        + "Guard, or set this workspace's lock mode to 'warn' to launch anyway."
+                        + "request was started. Re-verify the account from Claude Workspace "
+                        + "Accounts, or set this workspace's binding to 'warn' to launch anyway."
                 );
             }
             return new GuardResolution(registry, binding, binding.ProfileId, outcome);
@@ -575,7 +575,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
             if (!GuardValues.IsBlank(binding.ProfileId))
             {
                 Environment.SetEnvironmentVariable(
-                    "CLAUDE_ACCOUNT_GUARD_PROFILE_ID",
+                    "CLAUDE_WORKSPACE_ACCOUNTS_PROFILE_ID",
                     binding.ProfileId
                 );
             }
@@ -829,7 +829,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
 
             // Not a guard decision, so deliberately not reported as one.
             WriteGuardHealth(launchFailureCategory, 1);
-            Console.Error.WriteLine("Claude Account Guard could not start the Claude executable.");
+            Console.Error.WriteLine("Claude Workspace Accounts could not start the Claude executable.");
             return 1;
         }
 
@@ -894,7 +894,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
                 "OTEL_RESOURCE_ATTRIBUTES"
             );
 
-            Environment.SetEnvironmentVariable("CLAUDE_ACCOUNT_GUARD_PROFILE_ID", profileId);
+            Environment.SetEnvironmentVariable("CLAUDE_WORKSPACE_ACCOUNTS_PROFILE_ID", profileId);
             Environment.SetEnvironmentVariable("CLAUDE_CODE_ENABLE_TELEMETRY", "1");
             Environment.SetEnvironmentVariable("OTEL_METRICS_EXPORTER", "otlp");
             Environment.SetEnvironmentVariable("OTEL_LOGS_EXPORTER", "otlp");
@@ -940,7 +940,7 @@ namespace ClaudeAccountGuard.WrapperLauncher
         private static int Block(string category, string message)
         {
             WriteGuardHealth(category, GuardExitCode);
-            Console.Error.WriteLine("CLAUDE_ACCOUNT_GUARD_BLOCKED category=" + category);
+            Console.Error.WriteLine("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED category=" + category);
             Console.Error.WriteLine(message);
             return GuardExitCode;
         }

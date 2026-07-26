@@ -25,12 +25,12 @@ function check(label, condition, detail = "") {
 // Windows can expose the same temporary directory in 8.3 form to Node and long form to a child
 // process, so canonicalize before sharing paths across the process boundary.
 const directory = await realpath(
-  await mkdtemp(path.join(await realpath(os.tmpdir()), "claude-account-guard-statusline-"))
+  await mkdtemp(path.join(await realpath(os.tmpdir()), "claude-workspace-accounts-statusline-"))
 );
-const supportRoot = path.join(directory, "ClaudeAccountGuard");
+const supportRoot = path.join(directory, "ClaudeWorkspaceAccounts");
 const inbox = path.join(supportRoot, "snapshots");
 const configDir = path.join(directory, ".claude-work");
-const profileBackupDirectory = path.join(configDir, ".claude-account-guard");
+const profileBackupDirectory = path.join(configDir, ".claude-workspace-accounts");
 
 // The bridge resolves its guard-owned backup mirror beside its own executable, so run it from a
 // copy laid out the way installation lays it out.
@@ -364,7 +364,7 @@ try {
   check(
     "an unreadable payload produces a visible marker, not a blank line",
     unparseable.status === 0
-      && unparseable.stdout.includes("[account-guard: status line unavailable]"),
+      && unparseable.stdout.includes("[workspace-accounts: status line unavailable]"),
     `status ${unparseable.status}, stdout ${JSON.stringify(unparseable.stdout)}`
   );
 
@@ -372,7 +372,7 @@ try {
   check(
     "an empty payload produces a visible marker, not a blank line",
     empty.status === 0
-      && empty.stdout.includes("[account-guard: status line unavailable]"),
+      && empty.stdout.includes("[workspace-accounts: status line unavailable]"),
     `status ${empty.status}, stdout ${JSON.stringify(empty.stdout)}`
   );
 
@@ -386,7 +386,7 @@ try {
   check(
     "an unregistered account gets a real status line, not an error marker",
     unknown.status === 0
-      && !unknown.stdout.includes("[account-guard: status line unavailable]")
+      && !unknown.stdout.includes("[workspace-accounts: status line unavailable]")
       && unknown.stdout.includes("Opus"),
     `status ${unknown.status}, stdout ${JSON.stringify(unknown.stdout)}`
   );

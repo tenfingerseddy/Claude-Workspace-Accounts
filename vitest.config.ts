@@ -15,7 +15,7 @@ import { defineConfig } from "vitest/config";
  * `resolveSupportPaths` now requires the override to be named, which fixes that specific mistake.
  * This exists so the next variation of it cannot reach anything that matters either.
  */
-const isolatedLocalAppData = mkdtempSync(path.join(os.tmpdir(), "claude-guard-vitest-"));
+const isolatedLocalAppData = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-vitest-"));
 
 export default defineConfig({
   test: {

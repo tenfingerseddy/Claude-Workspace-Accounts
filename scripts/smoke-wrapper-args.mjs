@@ -17,12 +17,12 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 
-const WRAPPER = path.resolve("bin/native/win-x64/claude-account-guard-wrapper.exe");
+const WRAPPER = path.resolve("bin/native/win-x64/claude-workspace-accounts-wrapper.exe");
 const failures = [];
 let checks = 0;
 
-const directory = await mkdtemp(path.join(os.tmpdir(), "claude-guard-args-"));
-const supportRoot = path.join(directory, "ClaudeAccountGuard");
+const directory = await mkdtemp(path.join(os.tmpdir(), "claude-workspace-accounts-args-"));
+const supportRoot = path.join(directory, "ClaudeWorkspaceAccounts");
 await mkdir(supportRoot, { recursive: true });
 
 const compiler = path.join(
@@ -105,7 +105,7 @@ function invoke(claudeBinary, claudeArguments, options = {}) {
         ...process.env,
         LOCALAPPDATA: directory,
         CLAUDE_CONFIG_DIR: "C:\\profiles\\work",
-        CLAUDE_ACCOUNT_GUARD_WORKSPACE_KEY: "0123456789abcdef",
+        CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY: "0123456789abcdef",
         ARGDUMP_OUT: dumpPath,
         FAKE_EMAIL: "work@example.com",
         FAKE_ACCOUNT_ID: "acct-work",
@@ -215,7 +215,7 @@ try {
     if (code === 78) {
       check(
         "a forwarded exit 78 is not recorded as a guard block",
-        !(result.stderr ?? "").includes("CLAUDE_ACCOUNT_GUARD_BLOCKED"),
+        !(result.stderr ?? "").includes("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED"),
         JSON.stringify((result.stderr ?? "").slice(0, 200))
       );
     }
@@ -261,26 +261,26 @@ try {
       ...process.env,
       LOCALAPPDATA: directory,
       CLAUDE_CONFIG_DIR: "C:\\profiles\\mismatched",
-      CLAUDE_ACCOUNT_GUARD_WORKSPACE_KEY: "0123456789abcdef",
-      CLAUDE_ACCOUNT_GUARD_DISABLE: "1",
+      CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY: "0123456789abcdef",
+      CLAUDE_WORKSPACE_ACCOUNTS_DISABLE: "1",
       ARGDUMP_OUT: disabledDump
     },
     windowsHide: true,
     encoding: "utf8"
   });
   check(
-    "CLAUDE_ACCOUNT_GUARD_DISABLE=1 bypasses the guard",
+    "CLAUDE_WORKSPACE_ACCOUNTS_DISABLE=1 bypasses the guard",
     disabled.status === 0,
     `status ${disabled.status}, stderr ${JSON.stringify((disabled.stderr ?? "").slice(0, 300))}`
   );
   try {
     check(
-      "CLAUDE_ACCOUNT_GUARD_DISABLE=1 still forwards arguments intact",
+      "CLAUDE_WORKSPACE_ACCOUNTS_DISABLE=1 still forwards arguments intact",
       JSON.stringify(JSON.parse(await readFile(disabledDump, "utf8")))
         === JSON.stringify(["--print", "-p", "hello world", "--verbose"])
     );
   } catch {
-    failures.push("CLAUDE_ACCOUNT_GUARD_DISABLE=1 still forwards arguments intact: no vector written");
+    failures.push("CLAUDE_WORKSPACE_ACCOUNTS_DISABLE=1 still forwards arguments intact: no vector written");
   }
 } finally {
   await rm(directory, { recursive: true, force: true });

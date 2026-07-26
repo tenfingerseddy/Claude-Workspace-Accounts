@@ -2,14 +2,14 @@ import type { CollectionPhase, LockMode } from "../core/models.js";
 import type { BindingIdentityState } from "../core/statusState.js";
 
 /**
- * Pure presentation and decision logic for the Account Guard command surface.
+ * Pure presentation and decision logic for the Workspace Accounts command surface.
  *
  * Nothing here imports `vscode`, so every state the user can land in — including the
  * "nothing works and nothing explains why" states — is unit-testable.
  */
 
 export const WRAPPER_SETTING_ID = "claudeCode.claudeProcessWrapper";
-export const DISABLE_ENVIRONMENT_VARIABLE = "CLAUDE_ACCOUNT_GUARD_DISABLE";
+export const DISABLE_ENVIRONMENT_VARIABLE = "CLAUDE_WORKSPACE_ACCOUNTS_DISABLE";
 
 /** What `claudeCode.claudeProcessWrapper` currently points at. */
 export type WrapperState = "guard" | "foreign" | "none";
@@ -20,7 +20,7 @@ export interface WrapperView {
   state: WrapperState;
   /** The value currently stored in the global setting, if any. */
   configuredPath?: string;
-  /** Where Account Guard's own wrapper lives. */
+  /** Where the Workspace Accounts wrapper lives. */
   wrapperPath: string;
 }
 
@@ -33,7 +33,7 @@ export type ConsentPlan =
   | { kind: "ask_chain"; foreignWrapper: string };
 
 export interface ConsentInput {
-  /** `claudeAccountGuard.wrapper.autoConfigure`. */
+  /** `claudeAccounts.wrapper.autoConfigure`. */
   autoConfigure: boolean;
   /** The answer this user already gave, persisted across windows. */
   storedConsent?: WrapperConsent;
@@ -80,7 +80,7 @@ export function planWrapperConsent(input: ConsentInput): ConsentPlan {
  * `diagnoseCollection` distinguish "not listening" from "listening but rejecting".
  */
 export interface CollectionInput {
-  /** `claudeAccountGuard.telemetry.enabled`. */
+  /** `claudeAccounts.telemetry.enabled`. */
   telemetryEnabledSetting: boolean;
   /** True when the active `CLAUDE_CONFIG_DIR` maps to a registered profile. */
   runtimeRegistered: boolean;
@@ -132,7 +132,7 @@ export function diagnoseCollection(input: CollectionInput): CollectionDiagnosis 
     return {
       state: "blocked",
       headline: "Local usage collection is turned off",
-      detail: `Nothing is collected while claudeAccountGuard.telemetry.enabled is false.`,
+      detail: `Nothing is collected while claudeAccounts.telemetry.enabled is false.`,
       action: "open_settings",
       actionLabel: "Open Settings"
     };
@@ -141,7 +141,7 @@ export function diagnoseCollection(input: CollectionInput): CollectionDiagnosis 
     return {
       state: "blocked",
       headline: "This window's Claude account is not registered",
-      detail: `Claude Code here uses ${input.runtimeConfigDir}, which is not one of your Account Guard profiles. No usage is collected and no workspace lock applies until you register it.`,
+      detail: `Claude Code here uses ${input.runtimeConfigDir}, which is not one of your Workspace Accounts profiles. No usage is collected and no workspace lock applies until you register it.`,
       action: "register_runtime",
       actionLabel: "Register This Account"
     };
@@ -168,7 +168,7 @@ export function diagnoseCollection(input: CollectionInput): CollectionDiagnosis 
     return {
       state: "partial",
       headline: "Quota snapshots only — token-level telemetry is off",
-      detail: `Token, cost, and tool detail arrive over OpenTelemetry, which Account Guard injects when Claude Code launches through its wrapper. ${WRAPPER_SETTING_ID} is not pointing at Account Guard, so only status-line quota snapshots are collected.`,
+      detail: `Token, cost, and tool detail arrive over OpenTelemetry, which Workspace Accounts injects when Claude Code launches through its wrapper. ${WRAPPER_SETTING_ID} is not pointing at Workspace Accounts, so only status-line quota snapshots are collected.`,
       action: "configure_wrapper",
       actionLabel: "Enable Integration"
     };
@@ -177,7 +177,7 @@ export function diagnoseCollection(input: CollectionInput): CollectionDiagnosis 
     return {
       state: "partial",
       headline: "Your own OpenTelemetry exporter is in use",
-      detail: "OTEL_EXPORTER_OTLP_* is already set in this environment, so Account Guard deliberately does not redirect Claude's telemetry to its local collector. Quota snapshots still arrive.",
+      detail: "OTEL_EXPORTER_OTLP_* is already set in this environment, so Workspace Accounts deliberately does not redirect Claude's telemetry to its local collector. Quota snapshots still arrive.",
       action: "none"
     };
   }
@@ -292,7 +292,7 @@ export interface MenuState {
   accountName?: string;
   /** The default Claude configuration directory this window inherited. */
   runtimeConfigDir: string;
-  /** True when that default directory is a registered Account Guard account. */
+  /** True when that default directory is a registered Workspace Accounts account. */
   runtimeRegistered: boolean;
   identityLabel?: string;
   authState?: "signed_in" | "signed_out" | "unavailable";
@@ -328,7 +328,7 @@ export function describeBinding(state: MenuState): string {
     return "Uses your default Claude account";
   }
   if (state.wrapper.state !== "guard") {
-    return `Set to use ${state.boundProfileName}, but not applied yet — Claude Code is not routed through Account Guard`;
+    return `Set to use ${state.boundProfileName}, but not applied yet — Claude Code is not routed through Workspace Accounts`;
   }
   return state.boundMode === "warn"
     ? `Uses ${state.boundProfileName} (mismatches are reported, never blocked)`
@@ -338,7 +338,7 @@ export function describeBinding(state: MenuState): string {
 export function describeWrapper(state: MenuState): string {
   switch (state.wrapper.state) {
     case "guard":
-      return "Claude Code launches through Account Guard";
+      return "Claude Code launches through Workspace Accounts";
     case "foreign":
       return `Another tool's wrapper is configured: ${state.wrapper.configuredPath ?? "unknown"}`;
     default:
@@ -390,7 +390,7 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
       description: state.profileCount === 0 ? "Adds your first account" : undefined,
       detail: state.profileCount === 0
         ? "No accounts have been added yet, so you will add one first: a name, then a sign-in in a terminal. Other workspaces keep using your default account."
-        : `Claude Code started in this folder will run as the account you pick. Every other workspace is unaffected.${state.wrapper.state === "guard" ? "" : " Account Guard will ask once to route Claude Code launches through it, which is what applies the choice."}`,
+        : `Claude Code started in this folder will run as the account you pick. Every other workspace is unaffected.${state.wrapper.state === "guard" ? "" : " Workspace Accounts will ask once to route Claude Code launches through it, which is what applies the choice."}`,
       action: "bind"
     });
     if (bound && state.identity === "mismatch") {
@@ -417,7 +417,7 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
         kind: "item",
         label: `$(check) ${state.boundProfileName} is signed in`,
         description: "Account details not reported by this Claude version",
-        detail: "The account is applied and working. Claude Code does not report which account it is when a per-workspace account is in use, so Account Guard cannot warn you if that directory is signed into a different account.",
+        detail: "The account is applied and working. Claude Code does not report which account it is when a per-workspace account is in use, so Workspace Accounts cannot warn you if that directory is signed into a different account.",
         action: "verify"
       });
     } else if (bound && state.identity === "unconfirmed") {
@@ -458,7 +458,7 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
   entries.push({
     kind: "item",
     label: "$(add) Add a Claude account…",
-    detail: "Give it a name; Account Guard creates a separate Claude configuration directory and opens a terminal where you sign in to that account. No new VS Code window.",
+    detail: "Give it a name; Workspace Accounts creates a separate Claude configuration directory and opens a terminal where you sign in to that account. No new VS Code window.",
     action: "addProfile"
   });
   if (state.accountName) {
@@ -474,7 +474,7 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
     entries.push({
       kind: "item",
       label: `$(check) Verify ${state.accountName} now`,
-      detail: `Runs claude auth status for that account and records the identity, which is what lets Account Guard spot a wrong-account mismatch later. Last verified: ${state.lastVerifiedLabel ?? "never"}.`,
+      detail: `Runs claude auth status for that account and records the identity, which is what lets Workspace Accounts spot a wrong-account mismatch later. Last verified: ${state.lastVerifiedLabel ?? "never"}.`,
       action: "verify"
     });
   }
@@ -482,7 +482,7 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
     entries.push({
       kind: "item",
       label: "$(settings-gear) Manage accounts…",
-      detail: "Rename nothing, delete or export Account Guard's account metadata. Claude's own settings and credentials are never touched.",
+      detail: "Rename nothing, delete or export the Workspace Accounts account metadata. Claude's own settings and credentials are never touched.",
       action: "manageProfiles"
     });
   }
@@ -541,7 +541,7 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
       kind: "item",
       label: "$(plug) Connect to Claude Code",
       description: bound ? "Required for this workspace's account" : undefined,
-      detail: `Sets one global setting, ${WRAPPER_SETTING_ID}, to Account Guard's wrapper. That wrapper is what puts the chosen account in front of each Claude Code launch. ${state.wrapper.state === "foreign" ? "Your existing wrapper is chained, not discarded." : "Reversible from this menu."}`,
+      detail: `Sets one global setting, ${WRAPPER_SETTING_ID}, to the Workspace Accounts wrapper. That wrapper is what puts the chosen account in front of each Claude Code launch. ${state.wrapper.state === "foreign" ? "Your existing wrapper is chained, not discarded." : "Reversible from this menu."}`,
       action: "configureWrapper"
     });
   }
@@ -553,7 +553,7 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
   });
   entries.push({
     kind: "item",
-    label: "$(trash) Remove Account Guard data…",
+    label: "$(trash) Remove Workspace Accounts data…",
     detail: "Disconnects from Claude Code, restores chained status lines, and deletes all accounts, bindings, and local usage. Claude Code's own configuration is left alone.",
     action: "removeAllData"
   });
@@ -573,7 +573,7 @@ export interface SupportFileRemovalInput {
   disableOutcome?: "cleared" | "restored_upstream" | "not_configured";
   /** Sanitised failure detail when `disable()` threw. */
   disableError?: string;
-  /** Re-read after disabling: does the global setting still name an Account Guard wrapper? */
+  /** Re-read after disabling: does the global setting still name an Workspace Accounts wrapper? */
   settingStillReferencesGuard: boolean;
   /** The path the setting would be pointing at. */
   wrapperPath: string;
@@ -598,7 +598,7 @@ export function planSupportFileRemoval(
     return {
       remove: false,
       state: "kept",
-      detail: `${WRAPPER_SETTING_ID} still points at Account Guard, so its wrapper was left in place. Deleting it now would stop Claude Code from starting at all.`,
+      detail: `${WRAPPER_SETTING_ID} still points at Workspace Accounts, so its wrapper was left in place. Deleting it now would stop Claude Code from starting at all.`,
       manual: `Clear "${WRAPPER_SETTING_ID}" in your user settings.json, reload the window, then delete ${input.wrapperPath}.`
     };
   }
@@ -606,16 +606,16 @@ export function planSupportFileRemoval(
     return {
       remove: false,
       state: "kept",
-      detail: `Account Guard could not confirm it had detached from Claude Code${input.disableError ? ` (${input.disableError})` : ""}, so its wrapper was left in place.`,
-      manual: `Check "${WRAPPER_SETTING_ID}" in your user settings.json, clear it if it names Account Guard, reload the window, then delete ${input.wrapperPath}.`
+      detail: `Workspace Accounts could not confirm it had detached from Claude Code${input.disableError ? ` (${input.disableError})` : ""}, so its wrapper was left in place.`,
+      manual: `Check "${WRAPPER_SETTING_ID}" in your user settings.json, clear it if it names Workspace Accounts, reload the window, then delete ${input.wrapperPath}.`
     };
   }
   return {
     remove: true,
     state: "removed",
     detail: input.disableOutcome === "restored_upstream"
-      ? "The wrapper you had configured before Account Guard was restored, and Account Guard's own wrapper was removed."
-      : "Claude Code no longer launches through Account Guard, and its wrapper was removed."
+      ? "The wrapper you had configured before Workspace Accounts was restored, and the Workspace Accounts wrapper was removed."
+      : "Claude Code no longer launches through Workspace Accounts, and its wrapper was removed."
   };
 }
 
@@ -625,7 +625,7 @@ export interface StatusLineTeardownInput {
   /** What `uninstall()` reported, or undefined when it threw. */
   restored?: "previous_status_line" | "previous_command" | "claude_default" | "unchanged";
   backupState?: "none_recorded" | "valid" | "valid_empty" | "corrupt" | "missing";
-  /** Re-read of the profile's settings.json: does an Account Guard status line remain? */
+  /** Re-read of the profile's settings.json: does an Workspace Accounts status line remain? */
   guardCommandRemains: boolean;
   error?: string;
 }
@@ -661,9 +661,9 @@ export function planStatusLineTeardown(
       state: "kept",
       safeToForgetProfile: false,
       detail: input.backupState === "corrupt" || input.backupState === "missing"
-        ? `${input.profileName} still runs Account Guard's status line: the record of what it replaced is ${input.backupState}, so nothing was overwritten in ${settings}.`
-        : `${input.profileName} still runs Account Guard's status line in ${settings}.`,
-      manual: `Open ${settings} and replace the "statusLine" command with your own, or remove it. Account Guard's files were kept so that status line keeps working until you do.`
+        ? `${input.profileName} still runs the Workspace Accounts status line: the record of what it replaced is ${input.backupState}, so nothing was overwritten in ${settings}.`
+        : `${input.profileName} still runs the Workspace Accounts status line in ${settings}.`,
+      manual: `Open ${settings} and replace the "statusLine" command with your own, or remove it. The Workspace Accounts files were kept so that status line keeps working until you do.`
     };
   }
   return {
@@ -673,7 +673,7 @@ export function planStatusLineTeardown(
       ? `${input.profileName} had its previous status line restored.`
       : input.restored === "claude_default"
         ? `${input.profileName} went back to Claude's default status line.`
-        : `${input.profileName} had no Account Guard status line to remove.`
+        : `${input.profileName} had no Workspace Accounts status line to remove.`
   };
 }
 
@@ -720,8 +720,8 @@ export function summarizeTeardown(steps: readonly TeardownStep[]): TeardownSumma
   return {
     complete: unfinished.length === 0,
     headline: unfinished.length === 0
-      ? "Account Guard removed everything it had installed and detached from Claude Code."
-      : `Account Guard removed most of its data, but ${unfinished.length} item${unfinished.length === 1 ? "" : "s"} need${unfinished.length === 1 ? "s" : ""} your attention.`,
+      ? "Workspace Accounts removed everything it had installed and detached from Claude Code."
+      : `Workspace Accounts removed most of its data, but ${unfinished.length} item${unfinished.length === 1 ? "" : "s"} need${unfinished.length === 1 ? "s" : ""} your attention.`,
     manual: unfinished.flatMap((step) => step.manual ? [`${step.artifact}: ${step.manual}`] : []),
     detail: steps.flatMap((step) => step.detail ? [`${step.artifact}: ${step.detail}`] : [])
   };

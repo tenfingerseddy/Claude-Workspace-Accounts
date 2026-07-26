@@ -57,7 +57,7 @@ describe("loopback telemetry collector", () => {
 
   beforeEach(async () => {
     dataEvents = 0;
-    paths = supportPaths(mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-collector-")));
+    paths = supportPaths(mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-collector-")));
     registry = new ProfileRegistry(paths);
     await registry.initialize();
     await registry.upsertProfile(profile);
@@ -178,7 +178,7 @@ describe("loopback telemetry collector", () => {
   });
 
   it("does not collect traces, and says so", async () => {
-    // Claude Code only emits spans under CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1, which Account Guard
+    // Claude Code only emits spans under CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1, which Workspace Accounts
     // will not set on a user's behalf, so the route reports a named refusal rather than a bare 404.
     const response = await post("/v1/traces", readFileSync("test/fixtures/otel-traces.json"));
     expect(response.status).toBe(404);
@@ -275,7 +275,7 @@ describe("status snapshot inbox", () => {
     readdir(path.join(paths.snapshotInbox, "quarantine")).catch(() => []);
 
   beforeEach(async () => {
-    paths = supportPaths(mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-inbox-")));
+    paths = supportPaths(mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-inbox-")));
     registry = new ProfileRegistry(paths);
     await registry.initialize();
     await registry.upsertProfile(profile);

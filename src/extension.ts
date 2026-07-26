@@ -1,3 +1,4 @@
+import path from "node:path";
 import * as vscode from "vscode";
 import { ClaudeBinaryResolver, AuthVerifier } from "./auth/authVerifier.js";
 import { CommandController } from "./commands/commandController.js";
@@ -5,13 +6,28 @@ import { workspaceHash } from "./core/paths.js";
 import { DashboardProvider } from "./dashboard/dashboardProvider.js";
 import { DiagnosticsProvider } from "./diagnostics/diagnosticsProvider.js";
 import { WorkspaceLockService } from "./locks/workspaceLockService.js";
+import type {
+  LegacyMigrationReport,
+  MigrationHost,
+  SettingScope
+} from "./migration/legacyMigration.js";
+import {
+  migrateLegacyInstallation,
+  migrationManualSteps,
+  resolveLegacySupportRoot,
+  summarizeMigration
+} from "./migration/legacyMigration.js";
 import { ProfileRegistry, resolveSupportPaths } from "./profiles/registryStore.js";
 import { RuntimeProfileDetector } from "./profiles/runtimeProfileDetector.js";
 import { UsageRepository } from "./storage/usageRepository.js";
 import { StatusBarController } from "./statusbar/statusBarController.js";
 import { StatusLineBridgeService } from "./telemetry/statusLineBridgeService.js";
 import { TelemetryCollector } from "./telemetry/telemetryCollector.js";
-import { WrapperIntegrationService } from "./wrapper/wrapperIntegrationService.js";
+import {
+  STATUSLINE_EXE,
+  WRAPPER_EXE,
+  WrapperIntegrationService
+} from "./wrapper/wrapperIntegrationService.js";
 
 interface RuntimeServices {
   collector?: TelemetryCollector;
@@ -20,22 +36,152 @@ interface RuntimeServices {
 
 let runtimeServices: RuntimeServices | undefined;
 
+/** The settings and extension lookups the rename migration needs, and nothing else. */
+function migrationHost(): MigrationHost {
+  const target = (scope: SettingScope): vscode.ConfigurationTarget => scope === "global"
+    ? vscode.ConfigurationTarget.Global
+    : scope === "workspace"
+      ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.WorkspaceFolder;
+  return {
+    inspectSetting: (section, key) => {
+      const inspected = vscode.workspace.getConfiguration(section).inspect<unknown>(key);
+      return inspected
+        ? {
+            globalValue: inspected.globalValue,
+            workspaceValue: inspected.workspaceValue,
+            workspaceFolderValue: inspected.workspaceFolderValue
+          }
+        : undefined;
+    },
+    updateSetting: async (section, key, value, scope) => {
+      await vscode.workspace.getConfiguration(section).update(key, value, target(scope));
+    },
+    isExtensionInstalled: (extensionId) =>
+      Boolean(vscode.extensions.getExtension(extensionId))
+  };
+}
+
+/**
+ * Tell the user what the rename did to their installation, once activation can offer actions.
+ *
+ * Two installations both writing the global `claudeCode.claudeProcessWrapper` is the worst
+ * outcome here — whichever wrote last wins and the other silently stops applying accounts — so
+ * that warning is separate and unconditional rather than folded into a summary.
+ */
+async function reportMigration(
+  report: LegacyMigrationReport,
+  output: vscode.LogOutputChannel
+): Promise<void> {
+  if (!report.legacyInstallationFound) {
+    return;
+  }
+  const manual = migrationManualSteps(report);
+  if (report.legacyExtensionInstalled) {
+    void vscode.window.showWarningMessage(
+      "Claude Account Guard is still installed alongside Claude Workspace Accounts. Both set the "
+      + "same global claudeCode.claudeProcessWrapper setting, so they will overwrite each other "
+      + "and one of them will stop applying per-workspace accounts. Uninstall Claude Account "
+      + "Guard, then reload the window.",
+      "Show Extensions"
+    ).then((choice) => choice === "Show Extensions"
+      ? vscode.commands.executeCommand(
+          "workbench.extensions.search",
+          "ResonanceLattice-Semanticus"
+        )
+      : undefined);
+  }
+  if (report.failures.length > 0) {
+    output.error(`Migration left ${report.failures.length} item(s) unfinished.`);
+    void vscode.window.showWarningMessage(
+      `Claude Workspace Accounts could not finish migrating your previous installation: `
+      + `${report.failures.length} item${report.failures.length === 1 ? "" : "s"} need your `
+      + "attention. Nothing was deleted, and Claude Code keeps working.",
+      "Show Details",
+      "Show Diagnostics"
+    ).then(async (choice) => {
+      if (choice === "Show Details") {
+        const details = await vscode.workspace.openTextDocument({
+          language: "markdown",
+          content: `# Claude Workspace Accounts — upgrade report\n\n`
+            + `Your previous installation is still in place at `
+            + `${report.legacyRoot ?? "its original location"}; nothing was deleted.\n\n`
+            + `## Still to do by hand\n\n${manual.map((step) => `- ${step}`).join("\n") || "- Nothing."}\n\n`
+            + `## Every step\n\n${report.steps.map((step) =>
+              `- **${step.artifact}** — ${step.state}${step.detail ? `: ${step.detail}` : ""}`
+            ).join("\n")}\n`
+        });
+        await vscode.window.showTextDocument(details, { preview: true });
+      } else if (choice === "Show Diagnostics") {
+        await vscode.commands.executeCommand("claudeAccounts.diagnostics");
+      }
+    });
+    return;
+  }
+  if (report.changed) {
+    void vscode.window.showInformationMessage(
+      "Claude Workspace Accounts carried your accounts, workspace bindings, and local usage "
+      + "over from Claude Account Guard. Reload the window so Claude Code launches through the "
+      + "renamed wrapper. Your previous data was copied, not moved, so nothing was deleted.",
+      "Reload Window",
+      "Show Details"
+    ).then(async (choice) => {
+      if (choice === "Reload Window") {
+        await vscode.commands.executeCommand("workbench.action.reloadWindow");
+      } else if (choice === "Show Details") {
+        const details = await vscode.workspace.openTextDocument({
+          language: "markdown",
+          content: `# Claude Workspace Accounts — upgrade report\n\n${report.steps.map((step) =>
+            `- **${step.artifact}** — ${step.state}${step.detail ? `: ${step.detail}` : ""}`
+          ).join("\n")}\n${manual.length > 0
+            ? `\n## Optional cleanup\n\n${manual.map((step) => `- ${step}`).join("\n")}\n`
+            : ""}`
+        });
+        await vscode.window.showTextDocument(details, { preview: true });
+      }
+    });
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  const output = vscode.window.createOutputChannel("Claude Account Guard", { log: true });
+  const output = vscode.window.createOutputChannel("Claude Workspace Accounts", { log: true });
   context.subscriptions.push(output);
-  output.info("Activating Claude Account Guard.");
+  output.info("Activating Claude Workspace Accounts.");
   if (process.platform !== "win32" || vscode.env.remoteName) {
     const environment = vscode.env.remoteName
       ? `VS Code Remote (${vscode.env.remoteName})`
       : process.platform;
-    output.warn(`Account Guard is inactive in unsupported environment: ${environment}.`);
+    output.warn(`Workspace Accounts is inactive in unsupported environment: ${environment}.`);
     void vscode.window.showWarningMessage(
-      `Claude Account Guard v1 supports local Windows VS Code only. No wrapper, profile, lock, or telemetry changes were made in ${environment}.`
+      `Claude Workspace Accounts v1 supports local Windows VS Code only. No wrapper, profile, lock, or telemetry changes were made in ${environment}.`
     );
     return;
   }
 
   const paths = resolveSupportPaths({ fallbackRoot: context.globalStorageUri.fsPath });
+
+  // First, before anything reads support state. This extension was published under a different
+  // `name` until 0.2.0, so an upgrading user has a fresh install pointed at a support directory,
+  // a settings namespace and a wrapper executable that did not exist a moment ago. Reading the
+  // registry before migrating would create an empty one and present the user with no accounts.
+  // It never throws: a failed migration must not stop activation or block a Claude launch.
+  const migration = await migrateLegacyInstallation({
+    root: paths.root,
+    legacyRoot: resolveLegacySupportRoot(process.env.LOCALAPPDATA),
+    wrapperPath: path.join(paths.wrapperDirectory, WRAPPER_EXE),
+    statusLineBridgePath: path.join(paths.wrapperDirectory, STATUSLINE_EXE),
+    host: migrationHost()
+  });
+  output.info(summarizeMigration(migration));
+  for (const step of migration.steps) {
+    const line = `Upgrade · ${step.artifact}: ${step.state}${step.detail ? ` — ${step.detail}` : ""}`;
+    if (step.state === "failed") {
+      output.error(line);
+    } else {
+      output.info(line);
+    }
+  }
+
   const registry = new ProfileRegistry(paths);
   try {
     await registry.initialize();
@@ -44,7 +190,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       `Shared registry validation failed: ${error instanceof Error ? error.message : "unknown error"}`
     );
     const choice = await vscode.window.showErrorMessage(
-      "Claude Account Guard preserved an invalid shared registry and guarded Claude launches remain blocked. Restore or repair the registry before continuing.",
+      "Claude Workspace Accounts preserved an invalid shared registry, so per-workspace accounts are not being applied. Restore or repair the registry before continuing.",
       "Reveal Registry"
     );
     if (choice === "Reveal Registry") {
@@ -56,7 +202,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const repository = new UsageRepository(paths.database);
   repository.mirrorRegistry(await registry.read());
   repository.applyRetention(
-    vscode.workspace.getConfiguration("claudeAccountGuard")
+    vscode.workspace.getConfiguration("claudeAccounts")
       .get<number>("telemetry.retentionDays", 30)
   );
 
@@ -77,11 +223,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const updateWorkspaceKey = async (): Promise<void> => {
     const activeWorkspace = await lockService.currentWorkspace();
     if (activeWorkspace) {
-      process.env.CLAUDE_ACCOUNT_GUARD_WORKSPACE_KEY = workspaceHash(
+      process.env.CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY = workspaceHash(
         activeWorkspace.uri.toString()
       );
     } else {
-      delete process.env.CLAUDE_ACCOUNT_GUARD_WORKSPACE_KEY;
+      delete process.env.CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY;
     }
   };
   await updateWorkspaceKey();
@@ -100,7 +246,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return "Not connected to Claude Code — per-workspace accounts are not applied";
     }
     return wrapperIntegration.isGuardWrapper(configured)
-      ? "Claude Code launches through Account Guard"
+      ? "Claude Code launches through Workspace Accounts"
       : `Another tool's wrapper is configured (${configured})`;
   };
   const statusBar = new StatusBarController(
@@ -154,7 +300,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   // Restore the integration only for users who already consented to it.
   const integrationOutcome = await commands.ensureIntegration(
-    "Account Guard needs Claude Code to launch through it.",
+    "Workspace Accounts needs Claude Code to launch through it.",
     { userInitiated: false, allowPrompt: false }
   );
   output.info(`Claude Code integration: ${integrationOutcome}.`);
@@ -172,9 +318,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * every usage table stayed empty and nothing said why.
    */
   const reconcileCollector = async (): Promise<void> => {
-    const enabled = vscode.workspace.getConfiguration("claudeAccountGuard")
+    const enabled = vscode.workspace.getConfiguration("claudeAccounts")
       .get<boolean>("telemetry.enabled", true);
-    const collectWorkspacePath = vscode.workspace.getConfiguration("claudeAccountGuard")
+    const collectWorkspacePath = vscode.workspace.getConfiguration("claudeAccounts")
       .get<boolean>("privacy.collectWorkspacePath", false);
     const currentRegistry = await registry.read();
     if (currentRegistry.integration.telemetryEnabled !== enabled
@@ -227,13 +373,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ));
         output.error(`Local collector failed: ${error instanceof Error ? error.message : "unknown error"}`);
         void vscode.window.showWarningMessage(
-          "Local usage collection could not start: Account Guard could not bind a loopback port for its collector. Quota snapshots from Claude's status line still work, and account switching and workspace locks are unaffected. Reload the window to retry.",
+          "Local usage collection could not start: Workspace Accounts could not bind a loopback port for its collector. Quota snapshots from Claude's status line still work, and account switching and workspace locks are unaffected. Reload the window to retry.",
           "Reload Window",
           "Show Diagnostics"
         ).then((choice) => choice === "Reload Window"
           ? vscode.commands.executeCommand("workbench.action.reloadWindow")
           : choice === "Show Diagnostics"
-            ? vscode.commands.executeCommand("claudeAccountGuard.diagnostics")
+            ? vscode.commands.executeCommand("claudeAccounts.diagnostics")
             : undefined);
       }
     }
@@ -243,14 +389,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const initial = await statusBar.refresh(true);
   if (initial?.requiredProfile && !initial.requiredProfile.expectedIdentity) {
-    // The account is applied either way; confirming its identity is what lets Account
-    // Guard notice later that the wrong Claude identity answered.
+    // The account is applied either way; confirming its identity is what lets Workspace
+    // Accounts notice later that the wrong Claude identity answered.
     void vscode.window.showInformationMessage(
-      `This workspace uses ${initial.requiredProfile.displayName}. Confirm its Claude identity once so Account Guard can warn you if that account changes.`,
+      `This workspace uses ${initial.requiredProfile.displayName}. Confirm its Claude identity once so Workspace Accounts can warn you if that account changes.`,
       "Confirm Identity",
       "Not Now"
     ).then((choice) => choice === "Confirm Identity"
-      ? vscode.commands.executeCommand("claudeAccountGuard.verifyAccount")
+      ? vscode.commands.executeCommand("claudeAccounts.verifyAccount")
       : undefined);
   }
 
@@ -268,14 +414,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ));
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("claudeAccountGuard")
+      if (event.affectsConfiguration("claudeAccounts")
         || event.affectsConfiguration("claudeCode.claudeProcessWrapper")) {
         repository.applyRetention(
-          vscode.workspace.getConfiguration("claudeAccountGuard")
+          vscode.workspace.getConfiguration("claudeAccounts")
             .get<number>("telemetry.retentionDays", 30)
         );
-        if (event.affectsConfiguration("claudeAccountGuard.telemetry.enabled")
-          || event.affectsConfiguration("claudeAccountGuard.privacy.collectWorkspacePath")) {
+        if (event.affectsConfiguration("claudeAccounts.telemetry.enabled")
+          || event.affectsConfiguration("claudeAccounts.privacy.collectWorkspacePath")) {
           void reconcileCollector().catch((error: unknown) => output.error(
             `Local collection could not be reconciled after a settings change: ${error instanceof Error ? error.message : "unknown error"}`
           ));
@@ -286,12 +432,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   runtimeServices = { collector, repository };
+  // Deferred to here rather than reported at the point of migration: the useful buttons —
+  // diagnostics, reload — only exist once commands are registered.
+  await reportMigration(migration, output).catch((error: unknown) => output.error(
+    `Upgrade reporting failed: ${error instanceof Error ? error.message : "unknown error"}`
+  ));
   // Explains the extension once, and afterwards only speaks up when this window's Claude
   // account is unregistered — the state in which nothing this extension shows can work.
-  void commands.firstRun().catch((error: unknown) => output.error(
-    `First-run guidance failed: ${error instanceof Error ? error.message : "unknown error"}`
-  ));
-  output.info("Claude Account Guard is active.");
+  // Suppressed for an upgrade that had something to say: two modals at once is noise.
+  if (!migration.changed && migration.failures.length === 0) {
+    void commands.firstRun().catch((error: unknown) => output.error(
+      `First-run guidance failed: ${error instanceof Error ? error.message : "unknown error"}`
+    ));
+  }
+  output.info("Claude Workspace Accounts is active.");
 }
 
 export async function deactivate(): Promise<void> {

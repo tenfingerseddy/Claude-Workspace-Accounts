@@ -3,6 +3,10 @@
 This file records what has actually been verified, what has not, and what a previously green gate
 failed to catch. A passing automated gate is not evidence that the product works; v0.1.0 proved that.
 
+Note on naming: v0.1.0 shipped as **Claude Account Guard**. Everything below that describes v0.1.0
+keeps that name deliberately — it is what the released thing was called, and renaming it here would
+make the record incoherent. From v0.2.0 the product is **Claude Workspace Accounts**.
+
 ## What v0.1.0 shipped, and why the gate missed it
 
 v0.1.0 passed lint, strict type-checking, 34 tests, the production bundle, and a wrapper smoke test
@@ -53,19 +57,29 @@ asserts "something happened" is worth very little here — assert the payload.
 - Binding coverage in `scripts/smoke-wrapper.mjs` asserts that two different bound workspaces resolve to
   two different `CLAUDE_CONFIG_DIR` values regardless of the ambient environment — the core product
   promise, previously untested.
+- `test/integration/legacyMigration.test.ts` covers the v0.1.0 → v0.2.0 rename migration: nothing to
+  migrate, a full old support directory, a partially migrated state, an already migrated state, a
+  foreign wrapper setting left untouched, a foreign status line left untouched, an unreadable
+  `settings.json` left untouched, a copy failure leaving the old directory intact and unmarked, and a
+  contract check that `SETTING_KEYS` covers every configuration property `package.json` contributes.
+  Every path is built from a fresh temporary directory; nothing is derived from the real environment.
 
 ## Verification status
 
 Populate from the actual run at reconciliation. Do not carry claims forward from a previous release;
 re-run and record what happened, including failures.
 
+Run on 2026-07-27 against the v0.2.0 rename, on Windows 11, Node 24:
+
 | Gate | Status |
 | --- | --- |
-| `npm run lint` | not yet run for this release |
-| `npm run typecheck` | not yet run for this release |
-| `npm test` | not yet run for this release |
-| `npm run test:e2e` (includes both wrapper gates) | not yet run for this release |
-| `npm run package` | not yet run for this release |
+| `npm run lint` | passed |
+| `npm run typecheck` | passed |
+| `npm test` | passed — 219 tests across 18 files |
+| `npm run test:e2e` (includes both wrapper gates) | passed — argument fidelity 69 checks, wrapper guard 70 checks, status-line bridge 25 checks, plus the runtime/core/registry/repository/collector smoke tests |
+| `npm run package` | passed — `artifacts/claude-workspace-accounts.vsix` |
+
+The argument-fidelity gate's check count is unchanged by the rename: 69 before and after.
 
 ## Required before release, and not yet done
 
@@ -83,6 +97,15 @@ and v0.1.0 was published without them.
 - Install, upgrade, disable, and uninstall each leave Claude Code functional. Specifically, uninstalling
   must not leave `claudeCode.claudeProcessWrapper` pointing at a wrapper that no longer exists — that is
   the defect which made v0.1.0 unrecoverable without hand-editing `settings.json`.
+- The rename migration runs against a real v0.1.0 installation: a populated
+  `%LOCALAPPDATA%\ClaudeAccountGuard` with a live `registry.json`, a real `usage.sqlite3` with WAL, and
+  the previous extension still installed. Verify that accounts and bindings appear, that usage history
+  survives, that `claudeCode.claudeProcessWrapper` is repointed, that the old directory is untouched
+  apart from the marker, and that a second activation changes nothing. Covered by unit and integration
+  tests, but not yet performed against a real installation.
+- Publishing under the new `name` creates a second Marketplace listing. Deprecate or unpublish
+  `ResonanceLattice-Semanticus.claude-account-guard` and point its description at the new listing,
+  otherwise both remain installable and users can end up with both.
 
 Repeat the interactive scenarios in `docs/feasibility.md`. Do not describe a release as ready until the
 above have been performed and recorded here with dates.

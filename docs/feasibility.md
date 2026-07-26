@@ -30,7 +30,7 @@ Primary references:
 - The registry is outside workspaces and contains metadata only.
 - Enforced locks fail closed when the registry exists but cannot be validated, the runtime profile differs, authentication is absent, or identity is unverifiable.
 - The stable wrapper lives outside the installed extension version directory so upgrades and disable/uninstall do not leave Claude pointing at a deleted file.
-- Existing wrappers are chained only after Account Guard preflight.
+- Existing wrappers are chained only after Workspace Accounts preflight.
 - Existing status-line commands are recorded and forwarded rather than overwritten.
 - SQLite uses the extension host's built-in `node:sqlite` API, avoiding native-addon ABI drift.
 

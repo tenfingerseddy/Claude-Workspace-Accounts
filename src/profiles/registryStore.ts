@@ -39,7 +39,7 @@ export function resolveSupportPaths(options: SupportPathOptions): SupportPaths {
   const localAppData = process.env.LOCALAPPDATA;
   const root = options.root
     ?? (localAppData
-      ? path.join(localAppData, "ClaudeAccountGuard")
+      ? path.join(localAppData, "ClaudeWorkspaceAccounts")
       : path.join(options.fallbackRoot, "shared"));
   return {
     root,

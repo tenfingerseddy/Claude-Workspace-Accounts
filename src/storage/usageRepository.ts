@@ -1436,7 +1436,7 @@ export class UsageRepository {
     const agent = text(attributes["agent.name"], text(attributes.agent_id));
     // Current Anthropic metrics carry the dotted `mcp_server.name` / `mcp_tool.name`. `server_name`
     // only appears on mcp_server_connection events and only when tool details are enabled, which
-    // Account Guard forces off — so reading it alone left MCP attribution permanently empty.
+    // Workspace Accounts forces off — so reading it alone left MCP attribution permanently empty.
     const server = text(attributes["mcp_server.name"], text(attributes.server_name));
     const tool = text(attributes["mcp_tool.name"], text(attributes.tool_name));
     const dimensions: Array<[AttributionDimension, string]> = [

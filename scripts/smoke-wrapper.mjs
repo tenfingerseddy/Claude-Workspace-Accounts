@@ -13,7 +13,7 @@ import process from "node:process";
 import { spawn, spawnSync } from "node:child_process";
 import { FOREIGN_OTEL_VARIABLES } from "../src/telemetry/otelEnvironment.ts";
 
-const WRAPPER = path.resolve("bin/native/win-x64/claude-account-guard-wrapper.exe");
+const WRAPPER = path.resolve("bin/native/win-x64/claude-workspace-accounts-wrapper.exe");
 const CLI_SCRIPT = path.resolve("test/fixtures/fake-claude-cli.js");
 const CLI_BATCH = path.resolve("test/fixtures/fake-claude.cmd");
 
@@ -37,9 +37,9 @@ function check(label, condition, detail = "") {
 // The canonical long form, because Windows expands 8.3 short names when it sets a process's
 // working directory - and a binding that compared against the short form would never match.
 const directory = realpathSync.native(
-  await mkdtemp(path.join(os.tmpdir(), "claude-account-guard-wrapper-"))
+  await mkdtemp(path.join(os.tmpdir(), "claude-workspace-accounts-wrapper-"))
 );
-const supportRoot = path.join(directory, "ClaudeAccountGuard");
+const supportRoot = path.join(directory, "ClaudeWorkspaceAccounts");
 await mkdir(supportRoot, { recursive: true });
 const registryPath = path.join(supportRoot, "registry.json");
 const healthPath = path.join(supportRoot, "wrapper-health.json");
@@ -118,8 +118,8 @@ function baseEnvironment() {
     LOCALAPPDATA: directory,
     CLAUDE_CONFIG_DIR: undefined,
     CLAUDE_SECURESTORAGE_CONFIG_DIR: undefined,
-    CLAUDE_ACCOUNT_GUARD_DISABLE: undefined,
-    CLAUDE_ACCOUNT_GUARD_WORKSPACE_KEY: undefined,
+    CLAUDE_WORKSPACE_ACCOUNTS_DISABLE: undefined,
+    CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY: undefined,
     CLAUDE_CODE_ENABLE_TELEMETRY: undefined,
     OTEL_RESOURCE_ATTRIBUTES: undefined,
     // Every variable the guard treats as somebody else's exporter, so the injection checks
@@ -172,7 +172,7 @@ try {
   const bound = await launchAndCaptureEnvironment({
     env: {
       CLAUDE_CONFIG_DIR: AMBIENT_CONFIG_DIR,
-      CLAUDE_ACCOUNT_GUARD_WORKSPACE_KEY: "0123456789abcdef"
+      CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY: "0123456789abcdef"
     }
   });
   check(
@@ -185,7 +185,7 @@ try {
   );
 
   const boundWithoutAmbient = await launchAndCaptureEnvironment({
-    env: { CLAUDE_ACCOUNT_GUARD_WORKSPACE_KEY: "0123456789abcdef" }
+    env: { CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY: "0123456789abcdef" }
   });
   check(
     "a bound workspace sets a config directory where there was none",
@@ -294,7 +294,7 @@ try {
     "a lock in 'warn' mode binds and never blocks on a mismatch",
     warned.result.status === 0
       && warned.environment.CLAUDE_CONFIG_DIR === WORK_CONFIG_DIR
-      && !warned.result.stderr.includes("CLAUDE_ACCOUNT_GUARD_BLOCKED"),
+      && !warned.result.stderr.includes("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED"),
     `status ${warned.result.status}, stderr ${JSON.stringify(warned.result.stderr)}`
   );
   check(
@@ -312,7 +312,7 @@ try {
     "a lock in 'enforce' mode blocks a genuine identity mismatch",
     enforcedMismatch.status === 78
       && enforcedMismatch.stderr.includes(
-        "CLAUDE_ACCOUNT_GUARD_BLOCKED category=identity_mismatch"
+        "CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED category=identity_mismatch"
       )
       && !enforcedMismatch.stdout.includes("FAKE_CLAUDE_LAUNCHED"),
     `status ${enforcedMismatch.status}, stderr ${JSON.stringify(enforcedMismatch.stderr)}`
@@ -347,7 +347,7 @@ try {
     "a signed-out bound profile still launches, so the user can sign in",
     signedOut.result.status === 0
       && signedOut.environment.CLAUDE_CONFIG_DIR === WORK_CONFIG_DIR
-      && !signedOut.result.stderr.includes("CLAUDE_ACCOUNT_GUARD_BLOCKED"),
+      && !signedOut.result.stderr.includes("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED"),
     `status ${signedOut.result.status}, stderr ${JSON.stringify(signedOut.result.stderr)}`
   );
   check(
@@ -389,7 +389,7 @@ try {
   check(
     "a corrupt registry forwards rather than blocks",
     cachedBinding.result.status === 0
-      && !cachedBinding.result.stderr.includes("CLAUDE_ACCOUNT_GUARD_BLOCKED"),
+      && !cachedBinding.result.stderr.includes("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED"),
     `status ${cachedBinding.result.status}, stderr ${JSON.stringify(cachedBinding.result.stderr)}`
   );
   check(
@@ -476,7 +476,7 @@ try {
     cwd: parentWorkspace,
     env: {
       CLAUDE_CONFIG_DIR: AMBIENT_CONFIG_DIR,
-      CLAUDE_ACCOUNT_GUARD_DISABLE: "1",
+      CLAUDE_WORKSPACE_ACCOUNTS_DISABLE: "1",
       FAKE_ACCOUNT_ID: "acct-somebody-else"
     }
   });
@@ -540,7 +540,7 @@ try {
   check(
     "a CLI exit of 78 is not reported as a guard block",
     collision.status === 78
-      && !collision.stderr.includes("CLAUDE_ACCOUNT_GUARD_BLOCKED")
+      && !collision.stderr.includes("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED")
       && collisionHealth?.category === "forwarded",
     `stderr ${JSON.stringify(collision.stderr)}, health ${JSON.stringify(collisionHealth)}`
   );
@@ -567,7 +567,7 @@ try {
       && injected.environment.OTEL_EXPORTER_OTLP_HEADERS
         === "Authorization=Bearer collector-token"
       && injected.environment.CLAUDE_CODE_ENABLE_TELEMETRY === "1"
-      && injected.environment.CLAUDE_ACCOUNT_GUARD_PROFILE_ID === "work",
+      && injected.environment.CLAUDE_WORKSPACE_ACCOUNTS_PROFILE_ID === "work",
     `status ${injected.result.status}, environment ${JSON.stringify(injected.environment)}`
   );
   check(
@@ -579,7 +579,7 @@ try {
   );
   check(
     "spans are refused rather than beta-enabled",
-    // The collector does not accept traces, and enabling them needs a beta flag Account Guard
+    // The collector does not accept traces, and enabling them needs a beta flag Workspace Accounts
     // will not set for the user. `none` explicitly, so an inherited `otlp` cannot aim spans at a
     // route that rejects them.
     injected.environment.OTEL_TRACES_EXPORTER === "none"

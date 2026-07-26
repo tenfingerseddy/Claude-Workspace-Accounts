@@ -58,7 +58,7 @@ export const REQUIRED_COLLECTOR_VARIABLES = {
   OTEL_METRICS_EXPORTER: "otlp",
   OTEL_LOGS_EXPORTER: "otlp",
   /**
-   * Spans require `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, which Account Guard will not set on a
+   * Spans require `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, which Workspace Accounts will not set on a
    * user's behalf. Set `none` explicitly rather than leaving it unset, so an `otlp` value inherited
    * from the user's shell cannot aim spans at an endpoint that refuses them.
    */
@@ -80,7 +80,7 @@ export const FORCED_PRIVACY_VARIABLES = {
 } as const;
 
 /**
- * Beta telemetry modes Account Guard must never enable. Opting a user into a beta collection mode
+ * Beta telemetry modes Workspace Accounts must never enable. Opting a user into a beta collection mode
  * they did not ask for is worse than not collecting the signal at all.
  */
 export const FORBIDDEN_BETA_VARIABLES = [

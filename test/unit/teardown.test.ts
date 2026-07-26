@@ -7,7 +7,7 @@ import {
   summarizeTeardown
 } from "../../src/commands/uxModel.js";
 
-const WRAPPER = "C:\\Users\\dev\\AppData\\Local\\ClaudeAccountGuard\\wrapper\\claude-account-guard-wrapper.exe";
+const WRAPPER = "C:\\Users\\dev\\AppData\\Local\\ClaudeWorkspaceAccounts\\wrapper\\claude-workspace-accounts-wrapper.exe";
 
 /**
  * Every rule here encodes a way cleanup once left a user unable to start Claude Code. They are
@@ -66,7 +66,7 @@ describe("status line teardown (finding 2)", () => {
     expect(plan.manual).toContain("settings.json");
   });
 
-  it("keeps the account when an Account Guard status line is still installed", () => {
+  it("keeps the account when an Workspace Accounts status line is still installed", () => {
     const plan = planStatusLineTeardown({
       ...base,
       restored: "unchanged",
@@ -125,9 +125,9 @@ describe("teardown reporting (finding 5)", () => {
     const steps: TeardownStep[] = [
       { artifact: "Collected usage", state: "removed" },
       {
-        artifact: "Account Guard wrapper files",
+        artifact: "Workspace Accounts wrapper files",
         state: "kept",
-        detail: "The setting still points at Account Guard.",
+        detail: "The setting still points at Workspace Accounts.",
         manual: "Clear the setting, then delete the folder."
       }
     ];
@@ -135,7 +135,7 @@ describe("teardown reporting (finding 5)", () => {
     expect(summary.complete).toBe(false);
     expect(summary.headline).toContain("need");
     expect(summary.manual).toHaveLength(1);
-    expect(summary.manual[0]).toContain("Account Guard wrapper files");
+    expect(summary.manual[0]).toContain("Workspace Accounts wrapper files");
   });
 
   it("counts failures as well as retentions", () => {

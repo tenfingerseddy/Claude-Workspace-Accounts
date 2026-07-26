@@ -4,7 +4,7 @@ Local usage collection has two independent sources.
 
 ## Status snapshots
 
-The profile-specific Claude `statusLine` command receives documented session JSON. Account Guard installs a bridge only after confirmation. The bridge:
+The profile-specific Claude `statusLine` command receives documented session JSON. Workspace Accounts installs a bridge only after confirmation. The bridge:
 
 - parses the JSON from standard input;
 - writes only model, session, context, cost, lines, rate-limit, workspace label, and workspace hash fields;
@@ -31,7 +31,7 @@ It also normalizes API request/error spans and events, trace-derived request lat
 
 Only these analysis attributes are allowlisted: model, query source, token type, hashed workspace plus short label, safe skill/plugin/agent labels, durations, success, decision source, status/error category, and server/tool name. Attribute strings are bounded before persistence. User email, command lines, request bodies, and other unlisted resource/span attributes are discarded.
 
-Changing `claudeAccountGuard.telemetry.enabled` to false removes the collector registration and updates shared guard state immediately. Extension shutdown also disables collection; the next activation restores it only when the setting remains enabled.
+Changing `claudeAccounts.telemetry.enabled` to false removes the collector registration and updates the shared account state immediately. Extension shutdown also disables collection; the next activation restores it only when the setting remains enabled.
 
 ## Provenance
 

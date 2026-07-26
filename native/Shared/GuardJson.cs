@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 
-namespace ClaudeAccountGuard
+namespace ClaudeWorkspaceAccounts
 {
     internal enum JsonKind
     {
@@ -25,7 +25,7 @@ namespace ClaudeAccountGuard
     }
 
     /// <summary>
-    /// The smallest JSON document model that can read the Account Guard registry and a
+    /// The smallest JSON document model that can read the Workspace Accounts registry and a
     /// <c>claude auth status</c> response.
     ///
     /// The wrapper is compiled by the in-box .NET Framework compiler and must run with no

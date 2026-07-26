@@ -5,7 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace ClaudeAccountGuard
+namespace ClaudeWorkspaceAccounts
 {
     /// <summary>
     /// Reading values out of a registry or payload the same way everywhere.

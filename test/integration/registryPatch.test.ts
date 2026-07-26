@@ -23,7 +23,7 @@ function supportPaths(root: string): SupportPaths {
 }
 
 async function registry(): Promise<ProfileRegistry> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "claude-account-guard-patch-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "claude-workspace-accounts-patch-"));
   const store = new ProfileRegistry(supportPaths(root));
   await store.initialize();
   return store;

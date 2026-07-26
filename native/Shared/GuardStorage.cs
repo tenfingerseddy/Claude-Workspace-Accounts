@@ -5,7 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 
-namespace ClaudeAccountGuard
+namespace ClaudeWorkspaceAccounts
 {
     /// <summary>
     /// Replaces a file in one step.

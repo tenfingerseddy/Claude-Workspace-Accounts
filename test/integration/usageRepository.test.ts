@@ -15,7 +15,7 @@ import { normalizeOtlp, normalizeStatusSnapshot } from "../../src/telemetry/norm
 const repositories: UsageRepository[] = [];
 
 function openRepository(): UsageRepository {
-  const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-"));
+  const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-"));
   const repository = new UsageRepository(path.join(directory, "usage.sqlite3"));
   repositories.push(repository);
   return repository;
@@ -33,7 +33,7 @@ afterEach(() => {
 
 describe("SQLite usage repository", () => {
   it("reconciles normalized metrics, events, and status snapshots", () => {
-    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-"));
     const repository = new UsageRepository(path.join(directory, "usage.sqlite3"));
     repositories.push(repository);
     const metricPayload = JSON.parse(readFileSync("test/fixtures/otel-metrics.json", "utf8"));
@@ -144,7 +144,7 @@ describe("SQLite usage repository", () => {
   it("classifies a transient storage failure as retryable rather than as bad client data", () => {
     // The collector answered 400 for every ingest error, and Claude's exporter treats 400 as
     // non-retryable — so a five-second busy timeout permanently destroyed real usage.
-    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-"));
     const repository = new UsageRepository(
       path.join(directory, "usage.sqlite3"),
       { busyTimeoutMs: 150 }
@@ -222,7 +222,7 @@ describe("SQLite usage repository", () => {
   it("reports an unreadable database size as absent rather than as zero bytes", () => {
     // A failed stat used to return 0, which reads as a plausible empty database — so "we could not
     // measure it" and "there is nothing in it" looked identical in the diagnostics report.
-    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-"));
     const repository = new UsageRepository(path.join(directory, "usage.sqlite3"));
     expect(repository.collectionHealth(undefined).storage.databaseSizeBytes).toBeGreaterThan(0);
     repository.close();
@@ -241,7 +241,7 @@ describe("SQLite usage repository", () => {
   it("survives an existing database created by another window without remigrating", () => {
     // PRAGMA journal_mode and the migration used to run unconditionally with a 5 s busy timeout and
     // no retry, and the throw happened before any telemetry service existed, so activation failed.
-    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-"));
     const databasePath = path.join(directory, "usage.sqlite3");
     const first = new UsageRepository(databasePath);
     repositories.push(first);
@@ -258,7 +258,7 @@ describe("SQLite usage repository", () => {
   });
 
   it("deletes local usage without deleting registry metadata tables", () => {
-    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-"));
     const repository = new UsageRepository(path.join(directory, "usage.sqlite3"));
     repositories.push(repository);
     const snapshot = normalizeStatusSnapshot(
@@ -270,7 +270,7 @@ describe("SQLite usage repository", () => {
   });
 
   it("deletes personal verification metadata separately from pseudonymous usage", () => {
-    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-"));
     const databasePath = path.join(directory, "usage.sqlite3");
     const repository = new UsageRepository(databasePath);
     repositories.push(repository);
@@ -298,7 +298,7 @@ describe("SQLite usage repository", () => {
   });
 
   it("mirrors only hashes for profile and workspace paths", () => {
-    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-"));
     const databasePath = path.join(directory, "usage.sqlite3");
     const repository = new UsageRepository(databasePath);
     repositories.push(repository);
@@ -497,7 +497,7 @@ describe("SQLite usage repository", () => {
   });
 
   it("migrates the pre-thread-scope attribution schema without losing rows", () => {
-    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-account-guard-"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "claude-workspace-accounts-"));
     const databasePath = path.join(directory, "usage.sqlite3");
     const legacy = new DatabaseSync(databasePath);
     legacy.exec(`

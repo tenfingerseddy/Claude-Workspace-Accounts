@@ -67,7 +67,7 @@ interface ProfileExport {
 const CONSENT_STATE_KEY = "wrapper.consent";
 const ONBOARDED_STATE_KEY = "onboarding.completed";
 const UNREGISTERED_NOTICE_STATE_KEY = "onboarding.unregisteredNotices";
-/** Workspaces whose terminal environment Account Guard wrote, so removal can name them. */
+/** Workspaces whose terminal environment Workspace Accounts wrote, so removal can name them. */
 const TERMINAL_WORKSPACES_STATE_KEY = "terminal.boundWorkspaces";
 
 export type IntegrationOutcome =
@@ -116,31 +116,31 @@ export class CommandController {
 
   public register(): void {
     const registrations: Array<[string, (...args: unknown[]) => unknown]> = [
-      ["claudeAccountGuard.openMenu", () => this.openMenu()],
-      ["claudeAccountGuard.configureWrapper", () => this.configureIntegration()],
-      ["claudeAccountGuard.disableWrapper", () => this.disableIntegration()],
-      ["claudeAccountGuard.removeAllData", () => this.removeAllData()],
-      ["claudeAccountGuard.enableUsageCollection", () => this.enableUsageCollection()],
-      ["claudeAccountGuard.openDashboard", () => this.dashboard.open()],
-      ["claudeAccountGuard.addProfile", () => this.addProfile()],
-      ["claudeAccountGuard.registerCurrentProfile", () => this.registerCurrentProfile()],
+      ["claudeAccounts.openMenu", () => this.openMenu()],
+      ["claudeAccounts.configureWrapper", () => this.configureIntegration()],
+      ["claudeAccounts.disableWrapper", () => this.disableIntegration()],
+      ["claudeAccounts.removeAllData", () => this.removeAllData()],
+      ["claudeAccounts.enableUsageCollection", () => this.enableUsageCollection()],
+      ["claudeAccounts.openDashboard", () => this.dashboard.open()],
+      ["claudeAccounts.addProfile", () => this.addProfile()],
+      ["claudeAccounts.registerCurrentProfile", () => this.registerCurrentProfile()],
       // Retained IDs. "switch" and "lock" now mean the same thing — choose the Claude
       // account this workspace uses — because that is the only account switch there is.
-      ["claudeAccountGuard.switchProfile", (profileId) => this.bindWorkspace(
+      ["claudeAccounts.switchProfile", (profileId) => this.bindWorkspace(
         typeof profileId === "string" ? profileId : undefined
       )],
-      ["claudeAccountGuard.lockWorkspace", (profileId) => this.bindWorkspace(
+      ["claudeAccounts.bindWorkspace", (profileId) => this.bindWorkspace(
         typeof profileId === "string" ? profileId : undefined
       )],
-      ["claudeAccountGuard.unlockWorkspace", () => this.unbindWorkspace()],
-      ["claudeAccountGuard.bindTerminal", () => this.bindTerminalEnvironment()],
-      ["claudeAccountGuard.updateExpectedIdentity", () => this.updateExpectedIdentity()],
-      ["claudeAccountGuard.verifyAccount", () => this.verifyAccount()],
-      ["claudeAccountGuard.login", () => this.login()],
-      ["claudeAccountGuard.manageProfiles", () => this.manageProfiles()],
-      ["claudeAccountGuard.diagnostics", () => this.diagnostics.show()],
-      ["claudeAccountGuard.deleteUsageData", () => this.deleteUsageData()],
-      ["claudeAccountGuard.exportUsage", (profileId) => this.exportUsage(
+      ["claudeAccounts.unbindWorkspace", () => this.unbindWorkspace()],
+      ["claudeAccounts.bindTerminal", () => this.bindTerminalEnvironment()],
+      ["claudeAccounts.updateExpectedIdentity", () => this.updateExpectedIdentity()],
+      ["claudeAccounts.verifyAccount", () => this.verifyAccount()],
+      ["claudeAccounts.login", () => this.login()],
+      ["claudeAccounts.manageProfiles", () => this.manageProfiles()],
+      ["claudeAccounts.diagnostics", () => this.diagnostics.show()],
+      ["claudeAccounts.deleteUsageData", () => this.deleteUsageData()],
+      ["claudeAccounts.exportUsage", (profileId) => this.exportUsage(
         typeof profileId === "string" ? profileId : undefined
       )]
     ];
@@ -176,7 +176,7 @@ export class CommandController {
     if (plan === "onboarding") {
       await this.context.globalState.update(ONBOARDED_STATE_KEY, true);
       const choice = await vscode.window.showInformationMessage(
-        `Claude Account Guard lets each VS Code workspace use its own Claude account, so switching accounts in one project does not change any other. Pick the account for this workspace and Account Guard does the rest; it will ask once before changing how Claude Code launches, and there is a one-step way to undo everything.`,
+        `Claude Workspace Accounts lets each VS Code workspace use its own Claude account, so switching accounts in one project does not change any other. Pick the account for this workspace and Workspace Accounts does the rest; it will ask once before changing how Claude Code launches, and there is a one-step way to undo everything.`,
         "Choose This Workspace's Account",
         "Not Now"
       );
@@ -187,7 +187,7 @@ export class CommandController {
     }
     await this.rememberUnregisteredNotice(normalizeWindowsPath(account.runtimeConfigDir));
     const choice = await vscode.window.showInformationMessage(
-      `This workspace uses your default Claude account (${account.runtimeConfigDir}), which Account Guard does not track, so its usage will not appear in the dashboard. Give this workspace a specific account, or add the default one so its usage is collected too.`,
+      `This workspace uses your default Claude account (${account.runtimeConfigDir}), which Workspace Accounts does not track, so its usage will not appear in the dashboard. Give this workspace a specific account, or add the default one so its usage is collected too.`,
       "Choose This Workspace's Account",
       "Track The Default Account",
       "Not Now"
@@ -205,7 +205,7 @@ export class CommandController {
     const selected = await vscode.window.showQuickPick(items, {
       title: state.workspaceLabel
         ? `Claude account for ${state.workspaceLabel}`
-        : "Claude Account Guard",
+        : "Claude Workspace Accounts",
       placeHolder: "Every action below says what it will change",
       matchOnDescription: true,
       matchOnDetail: true
@@ -346,7 +346,7 @@ export class CommandController {
     const collector = selected ? document.collectors[selected.id] : undefined;
     const detailed = this.detailedHealth(selected?.id);
     return diagnoseCollection({
-      telemetryEnabledSetting: vscode.workspace.getConfiguration("claudeAccountGuard")
+      telemetryEnabledSetting: vscode.workspace.getConfiguration("claudeAccounts")
         .get<boolean>("telemetry.enabled", true),
       runtimeRegistered: Boolean(active),
       runtimeConfigDir: active?.configDir ?? runtime.configDir,
@@ -380,7 +380,7 @@ export class CommandController {
    */
   private detailedHealth(profileId?: string): CollectionHealth | undefined {
     const context: CollectionHealthContext = {
-      telemetryEnabled: vscode.workspace.getConfiguration("claudeAccountGuard")
+      telemetryEnabled: vscode.workspace.getConfiguration("claudeAccounts")
         .get<boolean>("telemetry.enabled", true),
       runtimeProfileRegistered: Boolean(profileId)
     };
@@ -412,7 +412,7 @@ export class CommandController {
       case "open_settings":
         await vscode.commands.executeCommand(
           "workbench.action.openSettings",
-          "claudeAccountGuard.telemetry.enabled"
+          "claudeAccounts.telemetry.enabled"
         );
         break;
       case "enable_profile_usage":
@@ -458,17 +458,17 @@ export class CommandController {
       await Promise.all([
         vscode.commands.executeCommand(
           "setContext",
-          "claudeAccountGuard.hasProfiles",
+          "claudeAccounts.hasProfiles",
           document.profiles.length > 0
         ),
         vscode.commands.executeCommand(
           "setContext",
-          "claudeAccountGuard.locked",
+          "claudeAccounts.locked",
           Boolean(lock)
         ),
         vscode.commands.executeCommand(
           "setContext",
-          "claudeAccountGuard.wrapperConfigured",
+          "claudeAccounts.wrapperConfigured",
           this.wrapperState() === "guard"
         )
       ]);
@@ -498,7 +498,7 @@ export class CommandController {
     options: { userInitiated: boolean; allowPrompt: boolean }
   ): Promise<IntegrationOutcome> {
     const plan = planWrapperConsent({
-      autoConfigure: vscode.workspace.getConfiguration("claudeAccountGuard")
+      autoConfigure: vscode.workspace.getConfiguration("claudeAccounts")
         .get<boolean>("wrapper.autoConfigure", true),
       storedConsent: this.consent(),
       configuredWrapper: this.wrapper.configuredWrapper(),
@@ -512,11 +512,11 @@ export class CommandController {
       try {
         await this.wrapper.installSupportFiles();
       } catch (error) {
-        this.report("refreshing the Account Guard wrapper files", error);
+        this.report("refreshing the Workspace Accounts wrapper files", error);
       }
       if (!(await this.wrapperExecutableExists())) {
         void vscode.window.showWarningMessage(
-          `Claude Code is configured to launch through Account Guard, but its wrapper is missing from ${this.wrapper.wrapperPath} — antivirus or a cleanup tool may have removed it. Every Claude Code launch fails until this is repaired.`,
+          `Claude Code is configured to launch through Workspace Accounts, but its wrapper is missing from ${this.wrapper.wrapperPath} — antivirus or a cleanup tool may have removed it. Every Claude Code launch fails until this is repaired.`,
           "Repair Now",
           "Disconnect From Claude Code"
         ).then((choice) => choice === "Repair Now"
@@ -531,13 +531,13 @@ export class CommandController {
     if (plan.kind === "blocked_by_setting") {
       if (options.userInitiated) {
         const choice = await vscode.window.showWarningMessage(
-          "claudeAccountGuard.wrapper.autoConfigure is off, so Account Guard will not change how Claude Code launches. Per-workspace accounts and token telemetry stay inactive until you turn it on.",
+          "claudeAccounts.wrapper.autoConfigure is off, so Workspace Accounts will not change how Claude Code launches. Per-workspace accounts and token telemetry stay inactive until you turn it on.",
           "Open Settings"
         );
         if (choice === "Open Settings") {
           await vscode.commands.executeCommand(
             "workbench.action.openSettings",
-            "claudeAccountGuard.wrapper.autoConfigure"
+            "claudeAccounts.wrapper.autoConfigure"
           );
         }
       }
@@ -550,7 +550,7 @@ export class CommandController {
 
     if (plan.kind === "ask" || plan.kind === "previously_declined") {
       const choice = await vscode.window.showInformationMessage(
-        `${reason}\n\nTo do that, Account Guard changes one global VS Code setting that belongs to the Claude Code extension:\n\n${this.wrapperSummary()}\n\nClaude Code then starts through Account Guard, which sets this workspace's account and then launches Claude unchanged. Undo it any time with “Claude Account Guard: Disconnect From Claude Code”, or set ${DISABLE_ENVIRONMENT_VARIABLE}=1 in your environment to bypass it entirely.`,
+        `${reason}\n\nTo do that, Workspace Accounts changes one global VS Code setting that belongs to the Claude Code extension:\n\n${this.wrapperSummary()}\n\nClaude Code then starts through Workspace Accounts, which sets this workspace's account and then launches Claude unchanged. Undo it any time with “Claude Workspace Accounts: Disconnect From Claude Code”, or set ${DISABLE_ENVIRONMENT_VARIABLE}=1 in your environment to bypass it entirely.`,
         { modal: true },
         "Connect To Claude Code",
         "Not Now"
@@ -562,7 +562,7 @@ export class CommandController {
       }
     } else if (plan.kind === "ask_chain") {
       const choice = await vscode.window.showWarningMessage(
-        `Claude Code already launches through another wrapper:\n\n${plan.foreignWrapper}\n\nAccount Guard can select this workspace's account first and then chain that wrapper, by setting ${WRAPPER_SETTING_ID} to its own wrapper and remembering yours. That wrapper then runs with the environment Account Guard prepared, which includes this workspace's CLAUDE_CONFIG_DIR and, when usage collection is on, the local collector's bearer token. Only chain a wrapper you trust with those. Disconnecting later restores your wrapper.`,
+        `Claude Code already launches through another wrapper:\n\n${plan.foreignWrapper}\n\nWorkspace Accounts can select this workspace's account first and then chain that wrapper, by setting ${WRAPPER_SETTING_ID} to its own wrapper and remembering yours. That wrapper then runs with the environment Workspace Accounts prepared, which includes this workspace's CLAUDE_CONFIG_DIR and, when usage collection is on, the local collector's bearer token. Only chain a wrapper you trust with those. Disconnecting later restores your wrapper.`,
         { modal: true },
         "Chain And Connect",
         "Keep My Wrapper"
@@ -585,14 +585,14 @@ export class CommandController {
           // longer covers what would be chained. Ask again against the new value rather than
           // handing the environment to a binary the user was never shown.
           void vscode.window.showWarningMessage(
-            "Claude Code's process wrapper changed while Account Guard was asking about it, so nothing was configured. Review the new wrapper and connect again."
+            "Claude Code's process wrapper changed while Workspace Accounts was asking about it, so nothing was configured. Review the new wrapper and connect again."
           );
           return "declined";
         }
         await this.context.globalState.update(CONSENT_STATE_KEY, "granted");
         await this.updateContextKeys();
         void vscode.window.showInformationMessage(
-          `Account Guard now runs before your existing wrapper. ${this.wrapperSummary()}`
+          `Workspace Accounts now runs before your existing wrapper. ${this.wrapperSummary()}`
         );
         return "chained";
       }
@@ -607,13 +607,13 @@ export class CommandController {
       }
       if (plan.kind !== "configure") {
         void vscode.window.showInformationMessage(
-          `Claude Code now launches through Account Guard, so each workspace gets its own account. Changed setting: ${this.wrapperSummary()}. Reverse it with “Claude Account Guard: Disconnect From Claude Code”.`
+          `Claude Code now launches through Workspace Accounts, so each workspace gets its own account. Changed setting: ${this.wrapperSummary()}. Reverse it with “Claude Workspace Accounts: Disconnect From Claude Code”.`
         );
       }
       return outcome === "already_configured" ? "already_configured" : "configured";
     } catch (error) {
       void vscode.window.showErrorMessage(
-        `Account Guard could not configure ${WRAPPER_SETTING_ID}: ${error instanceof Error ? error.message : "unknown error"}. Per-workspace accounts cannot be applied until this succeeds.`
+        `Workspace Accounts could not configure ${WRAPPER_SETTING_ID}: ${error instanceof Error ? error.message : "unknown error"}. Per-workspace accounts cannot be applied until this succeeds.`
       );
       return "failed";
     }
@@ -630,12 +630,12 @@ export class CommandController {
 
   private async configureIntegration(): Promise<void> {
     const outcome = await this.ensureIntegration(
-      "Account Guard is about to connect itself to Claude Code so each workspace can use its own Claude account and local usage can be collected.",
+      "Workspace Accounts is about to connect itself to Claude Code so each workspace can use its own Claude account and local usage can be collected.",
       { userInitiated: true, allowPrompt: true }
     );
     if (outcome === "already_configured") {
       void vscode.window.showInformationMessage(
-        `Claude Code already launches through Account Guard. ${this.wrapperSummary()}`
+        `Claude Code already launches through Workspace Accounts. ${this.wrapperSummary()}`
       );
     }
     await this.statusBar.refresh();
@@ -646,21 +646,21 @@ export class CommandController {
    * The supported way out.
    *
    * The wrapper setting is global and deliberately outlives the extension directory, so
-   * uninstalling Account Guard without clearing it leaves Claude Code launching through a
+   * uninstalling Workspace Accounts without clearing it leaves Claude Code launching through a
    * path that may no longer exist. This command is what makes that recoverable from the UI.
    */
   private async disableIntegration(): Promise<void> {
     const configured = this.wrapper.configuredWrapper();
     if (configured && this.wrapperState() === "foreign") {
       void vscode.window.showInformationMessage(
-        `${WRAPPER_SETTING_ID} points at another tool's wrapper (${configured}), so Account Guard left it alone. Claude Code does not launch through Account Guard.`
+        `${WRAPPER_SETTING_ID} points at another tool's wrapper (${configured}), so Workspace Accounts left it alone. Claude Code does not launch through Workspace Accounts.`
       );
       return;
     }
     const document = await this.registry.read();
     const bindings = document.workspaceLocks.filter((lock) => lock.mode !== "off").length;
     const confirmed = await vscode.window.showWarningMessage(
-      `Disconnect Claude Code from Account Guard?\n\nThis clears the global setting ${WRAPPER_SETTING_ID}${configured ? ` (currently ${configured})` : ""}, or restores the third-party wrapper Account Guard chained.\n\n${bindings > 0 ? `${bindings} workspace${bindings === 1 ? "" : "s"} currently choose their own Claude account. They will all go back to your default account` : "Per-workspace Claude accounts stop being applied"}, and token telemetry stops. Accounts, bindings, and collected usage are kept, so reconnecting restores them.`,
+      `Disconnect Claude Code from Workspace Accounts?\n\nThis clears the global setting ${WRAPPER_SETTING_ID}${configured ? ` (currently ${configured})` : ""}, or restores the third-party wrapper Workspace Accounts chained.\n\n${bindings > 0 ? `${bindings} workspace${bindings === 1 ? "" : "s"} currently choose their own Claude account. They will all go back to your default account` : "Per-workspace Claude accounts stop being applied"}, and token telemetry stops. Accounts, bindings, and collected usage are kept, so reconnecting restores them.`,
       { modal: true },
       "Disconnect Claude Code"
     );
@@ -674,27 +674,27 @@ export class CommandController {
     await this.statusBar.refresh();
     await this.dashboard.refresh();
     const message = outcome === "restored_upstream"
-      ? `${WRAPPER_SETTING_ID} was restored to the wrapper that was configured before Account Guard. Reload the window so Claude Code picks it up.`
+      ? `${WRAPPER_SETTING_ID} was restored to the wrapper that was configured before Workspace Accounts. Reload the window so Claude Code picks it up.`
       : outcome === "cleared"
         ? `${WRAPPER_SETTING_ID} was cleared. Every workspace uses your default Claude account again after a reload.`
         : `${WRAPPER_SETTING_ID} was already unset, so nothing changed. Claude Code launches directly.`;
     const actions = outcome === "not_configured"
-      ? ["Remove Account Guard Data…"]
-      : ["Reload Window", "Remove Account Guard Data…"];
+      ? ["Remove Workspace Accounts Data…"]
+      : ["Reload Window", "Remove Workspace Accounts Data…"];
     const choice = await vscode.window.showInformationMessage(message, ...actions);
     if (choice === "Reload Window") {
       await vscode.commands.executeCommand("workbench.action.reloadWindow");
-    } else if (choice === "Remove Account Guard Data…") {
+    } else if (choice === "Remove Workspace Accounts Data…") {
       await this.removeAllData();
     }
   }
 
   /**
-   * Remove everything Account Guard installed, verifying each artifact.
+   * Remove everything Workspace Accounts installed, verifying each artifact.
    *
    * Ordering is a safety property, not a style choice: the wrapper executable is deleted only
    * after the global setting has been re-read and no longer names it, and a profile's metadata
-   * survives while its Claude settings still run Account Guard's status line. Every artifact
+   * survives while its Claude settings still run the Workspace Accounts status line. Every artifact
    * reports its own verified state, and anything left behind is named with the manual step.
    */
   private async removeAllData(): Promise<void> {
@@ -704,10 +704,10 @@ export class CommandController {
         && Date.now() - Date.parse(collector.updatedAt) < 120_000
     );
     const otherWindows = foreignCollectors.length > 0
-      ? `\n\n${foreignCollectors.length} other VS Code window${foreignCollectors.length === 1 ? " is" : "s are"} still collecting usage. Close them first: while one is running it can rewrite the usage database after this removal, and Account Guard cannot coordinate teardown across windows.`
+      ? `\n\n${foreignCollectors.length} other VS Code window${foreignCollectors.length === 1 ? " is" : "s are"} still collecting usage. Close them first: while one is running it can rewrite the usage database after this removal, and Workspace Accounts cannot coordinate teardown across windows.`
       : "";
     const confirmed = await vscode.window.showWarningMessage(
-      `Remove all Claude Account Guard data?\n\nAccount Guard will disconnect from Claude Code (${WRAPPER_SETTING_ID}), restore any status-line command it chained, delete its wrapper files, and delete all accounts, per-workspace bindings, and locally collected usage from ${this.registry.paths.root}.\n\nClaude Code's own configuration directories and credentials are never touched, so no account is signed out.${otherWindows}`,
+      `Remove all Claude Workspace Accounts data?\n\nWorkspace Accounts will disconnect from Claude Code (${WRAPPER_SETTING_ID}), restore any status-line command it chained, delete its wrapper files, and delete all accounts, per-workspace bindings, and locally collected usage from ${this.registry.paths.root}.\n\nClaude Code's own configuration directories and credentials are never touched, so no account is signed out.${otherWindows}`,
       { modal: true },
       "Remove Everything"
     );
@@ -734,7 +734,7 @@ export class CommandController {
     }
 
     // 2. Terminal settings. Only this workspace's file is writable from here; any other
-    //    workspace Account Guard touched is reported with its exact path.
+    //    workspace Workspace Accounts touched is reported with its exact path.
     steps.push(...await this.teardownTerminalEnvironment());
 
     // 3. Detach from Claude Code, then prove it.
@@ -750,11 +750,11 @@ export class CommandController {
       artifact: "Claude Code integration",
       state: stillReferencesGuard || !disableOutcome ? "failed" : "removed",
       detail: stillReferencesGuard
-        ? `${WRAPPER_SETTING_ID} still names Account Guard's wrapper.`
+        ? `${WRAPPER_SETTING_ID} still names the Workspace Accounts wrapper.`
         : disableError
           ? `Detaching reported: ${disableError}.`
           : disableOutcome === "restored_upstream"
-            ? "The wrapper configured before Account Guard was restored."
+            ? "The wrapper configured before Workspace Accounts was restored."
             : disableOutcome === "cleared"
               ? `${WRAPPER_SETTING_ID} was cleared.`
               : `${WRAPPER_SETTING_ID} was not set.`,
@@ -771,25 +771,25 @@ export class CommandController {
       wrapperPath: this.wrapper.wrapperPath
     });
     if (removal.remove && retainedProfiles.length > 0) {
-      // A retained Account Guard status line still executes the bridge that lives beside the
+      // A retained Workspace Accounts status line still executes the bridge that lives beside the
       // wrapper, so the files stay until that command is gone from the user's settings.
       steps.push({
-        artifact: "Account Guard wrapper files",
+        artifact: "Workspace Accounts wrapper files",
         state: "kept",
-        detail: `Kept because ${retainedProfiles.length} account${retainedProfiles.length === 1 ? "" : "s"} still run Account Guard's status line, which needs the files beside the wrapper.`,
+        detail: `Kept because ${retainedProfiles.length} account${retainedProfiles.length === 1 ? "" : "s"} still run the Workspace Accounts status line, which needs the files beside the wrapper.`,
         manual: `After clearing those status lines, delete ${this.registry.paths.wrapperDirectory}.`
       });
     } else if (removal.remove) {
       try {
         await this.wrapper.removeSupportFiles();
         steps.push({
-          artifact: "Account Guard wrapper files",
+          artifact: "Workspace Accounts wrapper files",
           state: "removed",
           detail: removal.detail
         });
       } catch (error) {
         steps.push({
-          artifact: "Account Guard wrapper files",
+          artifact: "Workspace Accounts wrapper files",
           state: "failed",
           detail: error instanceof Error ? error.message : "unknown error",
           manual: `Delete ${this.registry.paths.wrapperDirectory} by hand.`
@@ -797,7 +797,7 @@ export class CommandController {
       }
     } else {
       steps.push({
-        artifact: "Account Guard wrapper files",
+        artifact: "Workspace Accounts wrapper files",
         state: "kept",
         detail: removal.detail,
         manual: removal.manual
@@ -811,13 +811,13 @@ export class CommandController {
     ));
 
     // 6. Registry contents: accounts and bindings. Profiles whose status line survived are
-    //    kept so the user can still detach them from inside Account Guard.
+    //    kept so the user can still detach them from inside Workspace Accounts.
     for (const profile of document.profiles) {
       if (retainedProfiles.includes(profile.id)) {
         steps.push({
           artifact: `Account ${profile.displayName}`,
           state: "kept",
-          detail: "Kept so Account Guard can still restore its status line."
+          detail: "Kept so Workspace Accounts can still restore its status line."
         });
         continue;
       }
@@ -883,7 +883,7 @@ export class CommandController {
     }
 
     const summary = summarizeTeardown(steps);
-    this.log(`Account Guard teardown: ${summary.detail.join(" | ")}`);
+    this.log(`Workspace Accounts teardown: ${summary.detail.join(" | ")}`);
     if (summary.complete) {
       const choice = await vscode.window.showInformationMessage(
         `${summary.headline} Reload the window so Claude Code stops using the wrapper, then uninstall the extension if you are done.`,
@@ -909,7 +909,7 @@ export class CommandController {
     if (choice === "Show Details") {
       const details = await vscode.workspace.openTextDocument({
         language: "markdown",
-        content: `# Claude Account Guard — removal report\n\n## Still to do by hand\n\n${summary.manual.map((step) => `- ${step}`).join("\n")}\n\n## Every artifact\n\n${steps.map((step) => `- **${step.artifact}** — ${step.state}${step.detail ? `: ${step.detail}` : ""}`).join("\n")}\n`
+        content: `# Claude Workspace Accounts — removal report\n\n## Still to do by hand\n\n${summary.manual.map((step) => `- ${step}`).join("\n")}\n\n## Every artifact\n\n${steps.map((step) => `- **${step.artifact}** — ${step.state}${step.detail ? `: ${step.detail}` : ""}`).join("\n")}\n`
       });
       await vscode.window.showTextDocument(details, { preview: true });
     } else if (choice === "Reload Window") {
@@ -937,7 +937,7 @@ export class CommandController {
   }
 
   /**
-   * True when this account's Claude settings still run an Account Guard status line.
+   * True when this account's Claude settings still run an Workspace Accounts status line.
    *
    * An unreadable settings file counts as "still there": the safe assumption is the one that
    * keeps the files the status line needs.
@@ -951,7 +951,7 @@ export class CommandController {
       const command = typeof parsed.statusLine?.command === "string"
         ? parsed.statusLine.command.toLowerCase()
         : "";
-      return command.includes("claude-account-guard") || command.includes("statusline-bridge");
+      return command.includes("claude-workspace-accounts") || command.includes("statusline-bridge");
     } catch (failure) {
       return (failure as NodeJS.ErrnoException).code !== "ENOENT";
     }
@@ -992,7 +992,7 @@ export class CommandController {
 
   /**
    * Clear the terminal variable from this workspace, and name every other workspace where
-   * Account Guard wrote one. VS Code can only write the settings of the workspace it has
+   * Workspace Accounts wrote one. VS Code can only write the settings of the workspace it has
    * open, so the rest have to be reported rather than silently left behind.
    */
   private async teardownTerminalEnvironment(): Promise<TeardownStep[]> {
@@ -1017,7 +1017,7 @@ export class CommandController {
       steps.push({
         artifact: "Terminal account variable (other workspaces)",
         state: "kept",
-        detail: `Account Guard also set it in: ${others.join(", ")}.`,
+        detail: `Workspace Accounts also set it in: ${others.join(", ")}.`,
         manual: `Remove CLAUDE_CONFIG_DIR from terminal.integrated.env.windows in the .vscode/settings.json of: ${others.join(", ")}.`
       });
     }
@@ -1035,13 +1035,13 @@ export class CommandController {
     await this.updateContextKeys();
     if (outcome === "reinstalled") {
       void vscode.window.showInformationMessage(
-        `Claude Account Guard reinstalled its missing process wrapper, so Claude Code launches keep working. ${this.wrapperSummary()}`
+        `Claude Workspace Accounts reinstalled its missing process wrapper, so Claude Code launches keep working. ${this.wrapperSummary()}`
       );
     } else if (outcome === "cleared") {
       // Not awaited: this runs during activation, and a notification with buttons stays
       // until the user dismisses it.
       void vscode.window.showWarningMessage(
-        `Claude Code was configured to launch through an Account Guard wrapper that no longer exists, which would have broken every launch. ${WRAPPER_SETTING_ID} has been cleared, so Claude Code launches directly again. Per-workspace accounts are remembered but not applied until you reconnect.`,
+        `Claude Code was configured to launch through an Workspace Accounts wrapper that no longer exists, which would have broken every launch. ${WRAPPER_SETTING_ID} has been cleared, so Claude Code launches directly again. Per-workspace accounts are remembered but not applied until you reconnect.`,
         "Reload Window",
         "Reconnect",
         "Show Diagnostics"
@@ -1066,7 +1066,7 @@ export class CommandController {
     const profile = account.profile;
     if (!profile) {
       const choice = await vscode.window.showWarningMessage(
-        `Usage is collected per Claude account, and this workspace's account (${account.runtimeConfigDir}) is not one Account Guard knows about yet.`,
+        `Usage is collected per Claude account, and this workspace's account (${account.runtimeConfigDir}) is not one Workspace Accounts knows about yet.`,
         "Choose An Account For This Workspace",
         "Track The Default Account"
       );
@@ -1077,16 +1077,16 @@ export class CommandController {
       }
       return;
     }
-    if (!vscode.workspace.getConfiguration("claudeAccountGuard")
+    if (!vscode.workspace.getConfiguration("claudeAccounts")
       .get<boolean>("telemetry.enabled", true)) {
       const choice = await vscode.window.showWarningMessage(
-        "claudeAccountGuard.telemetry.enabled is off, so nothing would be collected even with the status-line bridge installed.",
+        "claudeAccounts.telemetry.enabled is off, so nothing would be collected even with the status-line bridge installed.",
         "Open Settings"
       );
       if (choice === "Open Settings") {
         await vscode.commands.executeCommand(
           "workbench.action.openSettings",
-          "claudeAccountGuard.telemetry.enabled"
+          "claudeAccounts.telemetry.enabled"
         );
       }
       return;
@@ -1103,20 +1103,20 @@ export class CommandController {
     profile.telemetryEnabled = true;
     const recorded = await this.registry.patchProfile(profile.id, { telemetryEnabled: true });
     await this.ensureIntegration(
-      `Token and cost detail for ${profile.displayName} is injected by Account Guard when Claude Code launches.`,
+      `Token and cost detail for ${profile.displayName} is injected by Workspace Accounts when Claude Code launches.`,
       { userInitiated: false, allowPrompt: true }
     );
     await this.synchronizeAndRefresh();
     if (!recorded) {
       void vscode.window.showWarningMessage(
-        `The status line in ${profile.configDir}\\settings.json now reports to Account Guard, but that account is no longer in its registry, so nothing will be stored.`
+        `The status line in ${profile.configDir}\\settings.json now reports to Workspace Accounts, but that account is no longer in its registry, so nothing will be stored.`
       );
       return;
     }
     void vscode.window.showInformationMessage(
       result === "already_installed"
         ? `${profile.displayName} already reports usage through the status line in ${profile.configDir}\\settings.json. Numbers appear after the next Claude response.`
-        : `Usage collection is on for ${profile.displayName}. The status line in ${profile.configDir}\\settings.json now reports quota to Account Guard and then runs your previous status line. Numbers appear after the next Claude response.`
+        : `Usage collection is on for ${profile.displayName}. The status line in ${profile.configDir}\\settings.json now reports quota to Workspace Accounts and then runs your previous status line. Numbers appear after the next Claude response.`
     );
   }
 
@@ -1131,7 +1131,7 @@ export class CommandController {
     const runtime = this.runtimeDetector.detect(document.profiles);
     if (runtime.profile) {
       void vscode.window.showInformationMessage(
-        `${runtime.configDir} is already known to Account Guard as ${runtime.profile.displayName}.`
+        `${runtime.configDir} is already known to Workspace Accounts as ${runtime.profile.displayName}.`
       );
       return;
     }
@@ -1241,7 +1241,7 @@ export class CommandController {
     if (created !== "created") {
       void vscode.window.showErrorMessage(
         created === "duplicate_config_dir"
-          ? `Another Account Guard account already uses ${configDir}. Choose a different name.`
+          ? `Another Workspace Accounts account already uses ${configDir}. Choose a different name.`
           : `An account named ${displayName} was just added by another window. Choose a different name.`
       );
       return undefined;
@@ -1292,7 +1292,7 @@ export class CommandController {
     terminal.show();
     terminal.sendText(binary ? `& "${binary}" auth login` : "claude auth login");
     const choice = await vscode.window.showInformationMessage(
-      `Complete the Claude sign-in in the “${terminal.name}” terminal. It is signing in to ${profile.configDir}, so your other accounts are unaffected. When it finishes, confirm the identity so Account Guard can spot a wrong-account mismatch later.`,
+      `Complete the Claude sign-in in the “${terminal.name}” terminal. It is signing in to ${profile.configDir}, so your other accounts are unaffected. When it finishes, confirm the identity so Workspace Accounts can spot a wrong-account mismatch later.`,
       "Confirm Identity",
       "Later"
     );
@@ -1388,8 +1388,8 @@ export class CommandController {
       );
       return;
     }
-    const mode = vscode.workspace.getConfiguration("claudeAccountGuard")
-      .get<LockMode>("defaultLockMode", "enforce");
+    const mode = vscode.workspace.getConfiguration("claudeAccounts")
+      .get<LockMode>("defaultBindMode", "enforce");
     const previous = await this.lockService.currentLock();
     await this.lockService.lock(profile, mode);
     // The wrapper's cache is what it falls back to when the registry cannot be read, so a
@@ -1401,12 +1401,12 @@ export class CommandController {
     // The binding is applied by the wrapper at launch, so without the wrapper it does
     // nothing at all. This is the moment where changing the global setting is justified.
     const outcome = await this.ensureIntegration(
-      `${workspace.label} is now set to use the Claude account “${profile.displayName}”. Account Guard applies that by setting CLAUDE_CONFIG_DIR for each Claude Code launch in this workspace, which requires Claude Code to start through Account Guard.`,
+      `${workspace.label} is now set to use the Claude account “${profile.displayName}”. Workspace Accounts applies that by setting CLAUDE_CONFIG_DIR for each Claude Code launch in this workspace, which requires Claude Code to start through Workspace Accounts.`,
       { userInitiated: false, allowPrompt: true }
     );
     if (outcome === "declined" || outcome === "blocked_by_setting" || outcome === "failed") {
       const choice = await vscode.window.showWarningMessage(
-        `${workspace.label} is set to use ${profile.displayName}, but the choice is not being applied: Claude Code is not launching through Account Guard, so it still uses your default account here.`,
+        `${workspace.label} is set to use ${profile.displayName}, but the choice is not being applied: Claude Code is not launching through Workspace Accounts, so it still uses your default account here.`,
         "Connect To Claude Code",
         "Leave It"
       );
@@ -1417,7 +1417,7 @@ export class CommandController {
     }
     if (mode === "off") {
       void vscode.window.showWarningMessage(
-        `${workspace.label} recorded ${profile.displayName}, but claudeAccountGuard.defaultLockMode is "off", so no account is applied. Set it to "enforce" to make per-workspace accounts take effect.`
+        `${workspace.label} recorded ${profile.displayName}, but claudeAccounts.defaultBindMode is "off", so no account is applied. Set it to "enforce" to make per-workspace accounts take effect.`
       );
       return;
     }
@@ -1548,7 +1548,7 @@ export class CommandController {
    * The wrapper writes `binding-cache.json` so a workspace keeps its account even when the
    * registry cannot be read. That makes it authoritative enough to be dangerous once a
    * binding is removed, and it holds workspace paths and expected emails, so it has to go
-   * whenever bindings or Account Guard data are removed. The wrapper rebuilds what it still
+   * whenever bindings or Workspace Accounts data are removed. The wrapper rebuilds what it still
    * needs on the next launch.
    */
   private async invalidateBindingCache(change: BindingChange): Promise<void> {
@@ -1563,7 +1563,7 @@ export class CommandController {
       // just stopped using, so the user has to be told rather than left guessing.
       this.report("clearing the workspace binding cache", error);
       void vscode.window.showWarningMessage(
-        `Account Guard could not clear its binding cache (${target}). If its account registry ever becomes unreadable, Claude Code may fall back to the previous account for this workspace. Delete that file to be sure.`,
+        `Workspace Accounts could not clear its binding cache (${target}). If its account registry ever becomes unreadable, Claude Code may fall back to the previous account for this workspace. Delete that file to be sure.`,
         "Reveal File"
       ).then((choice) => choice === "Reveal File"
         ? vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(target))
@@ -1572,7 +1572,7 @@ export class CommandController {
   }
 
   /**
-   * Remove only the variable Account Guard added, leaving any other terminal env alone.
+   * Remove only the variable Workspace Accounts added, leaving any other terminal env alone.
    *
    * The tri-state matters during teardown: "absent" and "failed" used to be the same `false`,
    * so a setting that could not be written was reported as nothing to do.
@@ -1633,7 +1633,7 @@ export class CommandController {
     const account = await this.effectiveAccount();
     if (!account.profile) {
       const choice = await vscode.window.showWarningMessage(
-        `There is nothing to verify yet: this workspace has no Claude account of its own, and the default account (${account.runtimeConfigDir}) is not one Account Guard knows about.`,
+        `There is nothing to verify yet: this workspace has no Claude account of its own, and the default account (${account.runtimeConfigDir}) is not one Workspace Accounts knows about.`,
         "Choose An Account For This Workspace",
         "Track The Default Account"
       );
@@ -1690,7 +1690,7 @@ export class CommandController {
       const structural = classifyVerification(verification) === "signed_in_unidentified";
       const choice = await vscode.window.showWarningMessage(
         structural
-          ? `${profile.displayName} is signed in, but this version of Claude Code does not report account details when a per-workspace account is in use, so there is no identity to record. The account works normally; Account Guard simply cannot tell you if that directory is signed into a different account.${enforcing ? " Because it can never confirm a match, this workspace's enforcing setting behaves like warn." : ""}`
+          ? `${profile.displayName} is signed in, but this version of Claude Code does not report account details when a per-workspace account is in use, so there is no identity to record. The account works normally; Workspace Accounts simply cannot tell you if that directory is signed into a different account.${enforcing ? " Because it can never confirm a match, this workspace's enforcing setting behaves like warn." : ""}`
           : `Claude could not be asked about ${profile.displayName} (${verification.errorCategory ?? "unavailable"}), so the expected identity was not changed.${enforcing ? " While this workspace enforces its account, a mismatch the wrapper has already found will keep stopping launches." : ""}`,
         ...(enforcing ? ["Only Warn In This Workspace"] : []),
         "Show Diagnostics"
@@ -1706,7 +1706,7 @@ export class CommandController {
     const actual = verification.email ?? verification.accountId ?? "an unnamed identity";
     if (recorded && compareIdentity(recorded, verification) === "match") {
       void vscode.window.showInformationMessage(
-        `${profile.displayName} still answers as ${actual}, which matches the identity Account Guard expects. Nothing needed changing.`
+        `${profile.displayName} still answers as ${actual}, which matches the identity Workspace Accounts expects. Nothing needed changing.`
       );
       await this.synchronizeAndRefresh(true);
       return;
@@ -1717,8 +1717,8 @@ export class CommandController {
     }
     const choice = await vscode.window.showWarningMessage(
       recorded
-        ? `${profile.displayName} now answers as ${actual}.\n\nAccount Guard expected ${recorded.email ?? recorded.accountId ?? "a different identity"}, which is why launches in this workspace are being stopped.\n\nRecord the new identity if you signed that account directory into ${actual} on purpose. If you did not, sign that directory back into the intended account instead.`
-        : `${profile.displayName} answers as ${actual}. Record it as the expected identity so Account Guard can tell you if it ever changes?`,
+        ? `${profile.displayName} now answers as ${actual}.\n\nWorkspace Accounts expected ${recorded.email ?? recorded.accountId ?? "a different identity"}, which is why launches in this workspace are being stopped.\n\nRecord the new identity if you signed that account directory into ${actual} on purpose. If you did not, sign that directory back into the intended account instead.`
+        : `${profile.displayName} answers as ${actual}. Record it as the expected identity so Workspace Accounts can tell you if it ever changes?`,
       { modal: true },
       ...options
     );
@@ -1782,8 +1782,8 @@ export class CommandController {
         !stored
           ? `${profile.displayName} is no longer a known account, so nothing was recorded.`
           : identified
-            ? `${profile.displayName} is signed in as ${verification.email ?? verification.accountId}. Account Guard will notice if that changes.`
-            : `${profile.displayName} is signed in and ready to use. This version of Claude Code does not report account details when a per-workspace account is in use, so Account Guard cannot record which account it is — or warn you if it changes.`
+            ? `${profile.displayName} is signed in as ${verification.email ?? verification.accountId}. Workspace Accounts will notice if that changes.`
+            : `${profile.displayName} is signed in and ready to use. This version of Claude Code does not report account details when a per-workspace account is in use, so Workspace Accounts cannot record which account it is — or warn you if it changes.`
       );
     }
   }
@@ -1793,7 +1793,7 @@ export class CommandController {
     const account = await this.effectiveAccount();
     if (!account.profile) {
       const choice = await vscode.window.showWarningMessage(
-        `Account Guard signs in one account at a time, and this workspace has no account of its own yet. Choose one first — or sign in with Claude Code directly, which Account Guard never interferes with.`,
+        `Workspace Accounts signs in one account at a time, and this workspace has no account of its own yet. Choose one first — or sign in with Claude Code directly, which Workspace Accounts never interferes with.`,
         "Choose An Account For This Workspace",
         "Add A Claude Account"
       );
@@ -1836,9 +1836,9 @@ export class CommandController {
         ? [{ label: "Registered profiles", kind: vscode.QuickPickItemKind.Separator, action: "separator" }]
         : []),
       ...profiles.map((profile) => ({
-        label: `$(trash) Delete ${profile.displayName} from Account Guard`,
+        label: `$(trash) Delete ${profile.displayName} from Workspace Accounts`,
         description: profile.expectedIdentity?.email ?? "identity not confirmed",
-        detail: `Forgets Account Guard's metadata and locks for ${profile.configDir}. Claude's own settings and credentials there are left in place.`,
+        detail: `Forgets the Workspace Accounts metadata and locks for ${profile.configDir}. Claude's own settings and credentials there are left in place.`,
         action: "delete",
         profile
       }))
@@ -1875,7 +1875,7 @@ export class CommandController {
       return;
     }
     const target = await vscode.window.showSaveDialog({
-      title: "Export Claude Account Guard Profile Metadata",
+      title: "Export Claude Workspace Accounts Profile Metadata",
       defaultUri: vscode.Uri.file(path.join(os.homedir(), "claude-account-profiles.json")),
       filters: { JSON: ["json"] }
     });
@@ -1893,7 +1893,7 @@ export class CommandController {
   private async importProfiles(): Promise<void> {
     let imported = 0;
     const selected = await vscode.window.showOpenDialog({
-      title: "Import Claude Account Guard Profile Metadata",
+      title: "Import Claude Workspace Accounts Profile Metadata",
       canSelectMany: false,
       filters: { JSON: ["json"] }
     });
@@ -1988,7 +1988,7 @@ export class CommandController {
 
   private async deleteProfile(profile: AccountProfile): Promise<void> {
     const confirmed = await vscode.window.showWarningMessage(
-      `Delete only the Account Guard metadata for ${profile.displayName}? Claude settings and credentials remain in place; local usage is deleted separately.`,
+      `Delete only the Workspace Accounts metadata for ${profile.displayName}? Claude settings and credentials remain in place; local usage is deleted separately.`,
       { modal: true },
       "Delete Profile Metadata"
     );
@@ -2000,7 +2000,7 @@ export class CommandController {
     const teardown = await this.teardownStatusLine(profile);
     if (!teardown.safeToForgetProfile) {
       const choice = await vscode.window.showWarningMessage(
-        `${teardown.detail} ${profile.displayName} was kept in Account Guard so its status line can still be detached.`,
+        `${teardown.detail} ${profile.displayName} was kept in Workspace Accounts so its status line can still be detached.`,
         ...(teardown.manual ? ["Show What To Do"] : [])
       );
       if (choice === "Show What To Do" && teardown.manual) {
@@ -2014,7 +2014,7 @@ export class CommandController {
     await this.updateContextKeys();
     await this.synchronizeAndRefresh();
     void vscode.window.showInformationMessage(
-      `${profile.displayName} was removed from Account Guard. ${teardown.detail} Its Claude configuration directory and credentials were left untouched.`
+      `${profile.displayName} was removed from Workspace Accounts. ${teardown.detail} Its Claude configuration directory and credentials were left untouched.`
     );
   }
 
@@ -2191,12 +2191,12 @@ export class CommandController {
   }
 
   private async maybeInstallStatusBridge(profile: AccountProfile): Promise<void> {
-    if (!vscode.workspace.getConfiguration("claudeAccountGuard")
+    if (!vscode.workspace.getConfiguration("claudeAccounts")
       .get<boolean>("telemetry.enabled", true)) {
       return;
     }
     const choice = await vscode.window.showInformationMessage(
-      `Collect local usage for ${profile.displayName}?\n\nAccount Guard adds a status-line command to ${profile.configDir}\\settings.json — only that profile's Claude settings — which reports quota to this machine and then runs whatever status line you already had. You can turn it off later from the account menu.`,
+      `Collect local usage for ${profile.displayName}?\n\nWorkspace Accounts adds a status-line command to ${profile.configDir}\\settings.json — only that profile's Claude settings — which reports quota to this machine and then runs whatever status line you already had. You can turn it off later from the account menu.`,
       { modal: true },
       "Enable Local Usage",
       "Not Now"
@@ -2219,12 +2219,12 @@ export class CommandController {
     profile.telemetryEnabled = true;
     if (!(await this.registry.patchProfile(profile.id, { telemetryEnabled: true }))) {
       void vscode.window.showWarningMessage(
-        `${profile.displayName} now reports usage from ${profile.configDir}\\settings.json, but Account Guard could not record that, so nothing will be stored. Run “Collect Usage for This Workspace's Account” to retry.`
+        `${profile.displayName} now reports usage from ${profile.configDir}\\settings.json, but Workspace Accounts could not record that, so nothing will be stored. Run “Collect Usage for This Workspace's Account” to retry.`
       );
       return;
     }
     await this.ensureIntegration(
-      `Token and cost detail for ${profile.displayName} is injected by Account Guard when Claude Code launches.`,
+      `Token and cost detail for ${profile.displayName} is injected by Workspace Accounts when Claude Code launches.`,
       { userInitiated: false, allowPrompt: true }
     );
   }

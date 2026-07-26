@@ -6,7 +6,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
-namespace ClaudeAccountGuard
+namespace ClaudeWorkspaceAccounts
 {
     /// <summary>
     /// Windows command-line encoding.

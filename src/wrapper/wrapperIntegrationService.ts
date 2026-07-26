@@ -2,30 +2,19 @@ import { access, copyFile, mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import * as vscode from "vscode";
 import type { ProfileRegistry } from "../profiles/registryStore.js";
+import {
+  OBSOLETE_SUPPORT_FILES,
+  STATUSLINE_EXE,
+  WRAPPER_EXE,
+  isManagedWrapperPath
+} from "./wrapperPaths.js";
 
-const WRAPPER_EXE = "claude-account-guard-wrapper.exe";
-const STATUSLINE_EXE = "statusline-bridge.exe";
-
-/**
- * Files the launcher may place beside the wrapper. Support files are copied outside the
- * versioned extension directory so a Claude Code launch keeps working across extension
- * upgrades, and every entry is optional so removing one from the build cannot break
- * installation for users who upgrade from a release that still shipped it.
- */
-const SUPPORT_FILES: readonly { source: string; name: string }[] = [
-  { source: path.join("bin", "native", "win-x64", WRAPPER_EXE), name: WRAPPER_EXE },
-  { source: path.join("bin", "native", "win-x64", STATUSLINE_EXE), name: STATUSLINE_EXE }
-];
-
-/**
- * Files earlier releases installed that current releases no longer use. They are removed
- * on install so a stale copy can never be picked up by something that still looks for it —
- * both were PowerShell scripts, and both silently corrupted what they were handed.
- */
-const OBSOLETE_SUPPORT_FILES: readonly string[] = [
-  "claude-account-guard-wrapper.ps1",
-  "statusline-bridge.ps1"
-];
+export {
+  WRAPPER_EXE,
+  LEGACY_WRAPPER_EXE,
+  STATUSLINE_EXE,
+  isManagedWrapperPath
+} from "./wrapperPaths.js";
 
 const WRAPPER_SETTING = "claudeProcessWrapper";
 const CLAUDE_CODE_SECTION = "claudeCode";
@@ -49,6 +38,17 @@ export interface InstalledSupportFiles {
   wrapperPath: string;
   statusLineBridgePath: string;
 }
+
+/**
+ * Support files the launcher places beside the wrapper. Copied outside the versioned extension
+ * directory so a Claude Code launch keeps working across extension upgrades, and every entry is
+ * optional so removing one from the build cannot break installation for someone upgrading from a
+ * release that still shipped it.
+ */
+const SUPPORT_FILES: readonly { source: string; name: string }[] = [
+  { source: path.join("bin", "native", "win-x64", WRAPPER_EXE), name: WRAPPER_EXE },
+  { source: path.join("bin", "native", "win-x64", STATUSLINE_EXE), name: STATUSLINE_EXE }
+];
 
 async function exists(candidate: string): Promise<boolean> {
   try {
@@ -101,22 +101,15 @@ export class WrapperIntegrationService {
     return value && value.trim() ? value : undefined;
   }
 
-  /** True when a configured wrapper path belongs to Account Guard rather than another tool. */
+  /** True when a configured wrapper path belongs to Workspace Accounts rather than another tool. */
   public isGuardWrapper(candidate: string | undefined): boolean {
-    if (!candidate) {
-      return false;
-    }
-    const normalized = path.normalize(candidate).toLowerCase();
-    return (
-      normalized === path.normalize(this.wrapperPath).toLowerCase()
-      || path.basename(normalized) === WRAPPER_EXE
-    );
+    return isManagedWrapperPath(candidate, this.wrapperPath);
   }
 
   public async configure(wrapperPath: string): Promise<WrapperConfigureOutcome> {
     if (
       !vscode.workspace
-        .getConfiguration("claudeAccountGuard")
+        .getConfiguration("claudeAccounts")
         .get<boolean>("wrapper.autoConfigure", true)
     ) {
       return "disabled";
@@ -201,10 +194,10 @@ export class WrapperIntegrationService {
   }
 
   /**
-   * Detach Claude Code from the Account Guard wrapper.
+   * Detach Claude Code from the Workspace Accounts wrapper.
    *
    * The wrapper setting is global and deliberately outlives the extension directory, so
-   * uninstalling Account Guard without clearing it leaves Claude Code launching through a
+   * uninstalling Workspace Accounts without clearing it leaves Claude Code launching through a
    * path that may no longer exist. This is the supported way back to an unwrapped Claude
    * Code, and it restores a chained third-party wrapper rather than discarding it.
    */
@@ -252,7 +245,7 @@ export class WrapperIntegrationService {
   /**
    * Reconcile the global wrapper setting with what is actually on disk.
    *
-   * A setting pointing at a missing Account Guard wrapper breaks every Claude Code launch,
+   * A setting pointing at a missing Workspace Accounts wrapper breaks every Claude Code launch,
    * which is exactly the state left behind by uninstalling an earlier release. Reinstall
    * when possible; clear the setting when not, because a working unwrapped Claude Code is
    * always better than a broken wrapped one.

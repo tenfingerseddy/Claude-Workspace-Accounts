@@ -5,7 +5,7 @@ using System.IO;
 using System.Reflection;
 using System.Text;
 
-namespace ClaudeAccountGuard.StatusLineBridge
+namespace ClaudeWorkspaceAccounts.StatusLineBridge
 {
     /// <summary>
     /// The status-line bridge: Claude's <c>statusLine</c> hook, wearing two hats.
@@ -13,7 +13,7 @@ namespace ClaudeAccountGuard.StatusLineBridge
     /// Claude runs this on every status-line refresh with the session JSON on stdin and takes its
     /// stdout as the line to display. It does two things with that: it records a privacy-minimized
     /// usage snapshot for the account this process is bound to, and it hands the refresh on to
-    /// whatever status-line command the user had before Account Guard was installed.
+    /// whatever status-line command the user had before Workspace Accounts was installed.
     ///
     /// Two constraints shape everything here. It runs many times per session, so it must be a
     /// single native process - the PowerShell version it replaces paid roughly a second of
@@ -24,7 +24,7 @@ namespace ClaudeAccountGuard.StatusLineBridge
     /// </summary>
     internal static class Program
     {
-        private const string FailureMarker = "[account-guard: status line unavailable]";
+        private const string FailureMarker = "[workspace-accounts: status line unavailable]";
         private const int ChainTimeoutMilliseconds = 10000;
 
         public static int Main(string[] args)
@@ -274,7 +274,7 @@ namespace ClaudeAccountGuard.StatusLineBridge
         }
 
         /// <summary>
-        /// The status-line command Account Guard replaced.
+        /// The status-line command Workspace Accounts replaced.
         ///
         /// The record inside the profile's own Claude directory is the primary copy, but a user who
         /// clears that directory would lose their status line permanently, so the installer keeps a
@@ -331,7 +331,7 @@ namespace ClaudeAccountGuard.StatusLineBridge
             {
                 locations.Add(SafeCombine(
                     configDirectory,
-                    ".claude-account-guard",
+                    ".claude-workspace-accounts",
                     "statusline-next.json"
                 ));
             }
