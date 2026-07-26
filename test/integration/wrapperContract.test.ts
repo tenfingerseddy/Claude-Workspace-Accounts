@@ -47,6 +47,28 @@ function methodBody(source: string, start: string, end: string): string {
   return source.slice(from, to);
 }
 
+/**
+ * Every statement that *calls* a named method, declarations excluded.
+ *
+ * Counting one construction form is how two direct `Block("binary_missing", …)` calls emitted the
+ * blocked marker for a malformed invocation while the test that was supposed to forbid it counted
+ * `new GuardBlockException(` and passed. Enumerating call sites is the only form of that assertion
+ * that can fail.
+ */
+function callSites(source: string, name: string): string[] {
+  const sites: string[] = [];
+  for (const match of source.matchAll(new RegExp(`(?<![A-Za-z0-9_.])${name}\\(`, "g"))) {
+    const index = match.index ?? 0;
+    const line = source.slice(source.lastIndexOf("\n", index) + 1, index);
+    // A declaration, not a call.
+    if (/\b(private|public|internal|protected)\b/.test(line)) {
+      continue;
+    }
+    sites.push(source.slice(index, source.indexOf(";", index) + 1).replace(/\s+/g, " "));
+  }
+  return sites;
+}
+
 describe("native component security contract", () => {
   it("keeps every interpreter off the launch and refresh paths", () => {
     expect(sourcesIn(WRAPPER)).toContain("Program.cs");
@@ -119,6 +141,65 @@ describe("native component security contract", () => {
     expect(program).toContain("outcome == \"identity_mismatch\" && binding.Enforced");
     expect(program).toContain("GuardExitCode = 78");
     expect(program).toContain("\"CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED category=\" + category");
+  });
+
+  it("emits the blocked marker and exit 78 from exactly one reachable place", () => {
+    // Every site that can produce the marker or the exit code, enumerated rather than counted by
+    // one construction form. `Block("binary_missing", …)` used to be called directly for an empty
+    // argument vector and for a target-resolution failure, so a malformed invocation announced
+    // itself as the guard's single deliberate refusal and this test could not notice.
+    expect(program.match(/CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED/g) ?? []).toHaveLength(1);
+    const block = methodBody(
+      program,
+      "private static int Block(",
+      "private static int InvalidInvocation("
+    );
+    expect(block).toContain("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED");
+    // Counted over code rather than prose: the exit code names itself once and is used twice,
+    // both inside Block, and the literal 78 exists only as the constant's definition.
+    const uncommented = (source: string): string => source.replace(/\/\/\/?[^\n]*/g, "");
+    const code = uncommented(program);
+    expect(code.match(/GuardExitCode/g) ?? []).toHaveLength(3);
+    expect(uncommented(block).match(/GuardExitCode/g) ?? []).toHaveLength(2);
+    expect(code.match(/\b78\b/g) ?? []).toHaveLength(1);
+    // And Block is called from the handler for the one refusal, and nowhere else.
+    expect(callSites(program, "Block")).toEqual(["Block(blocked.Category, blocked.Message);"]);
+
+    // A malformed invocation is an ordinary launch failure with its own exit code.
+    expect(program).toContain("InvocationExitCode = 64");
+    const invalid = methodBody(
+      program,
+      "private static int InvalidInvocation(",
+      "private static void WriteGuardHealth("
+    );
+    expect(invalid).toContain("WriteGuardHealth(\"invalid_invocation\", InvocationExitCode)");
+    expect(invalid).not.toContain("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED");
+    expect(invalid).not.toContain("GuardExitCode");
+    expect(callSites(program, "InvalidInvocation")).toEqual([
+      "InvalidInvocation();",
+      "InvalidInvocation();"
+    ]);
+    // `binary_missing` survives only where it always belonged: a forwarded launch.
+    const main = methodBody(program, "public static int Main(", "private static bool IsGuardDisabled(");
+    expect(main).toContain("GuardResolution.Unbound(null, null, \"binary_missing\")");
+    expect(program.match(/"binary_missing"/g) ?? []).toHaveLength(2);
+  });
+
+  it("honours the kill switch under the name v0.1.0 shipped as well as its own", () => {
+    // A `setx` value or a checked-in workspace `terminal.integrated.env.windows` entry survives a
+    // rename and no migration can reach either, so dropping the old name left a user who had set
+    // the documented escape hatch believing the wrapper was bypassed while it was not.
+    expect(program).toContain("DisableVariable = \"CLAUDE_WORKSPACE_ACCOUNTS_DISABLE\"");
+    expect(program).toContain("LegacyDisableVariable = \"CLAUDE_ACCOUNT_GUARD_DISABLE\"");
+    const disabled = methodBody(
+      program,
+      "private static bool IsGuardDisabled(",
+      "private static GuardResolution Resolve("
+    );
+    expect(disabled).toContain("IsSetToOne(DisableVariable)");
+    expect(disabled).toContain("IsSetToOne(LegacyDisableVariable)");
+    // Either name, on its own, is enough.
+    expect(disabled).toMatch(/IsSetToOne\(DisableVariable\)\s*\|\|\s*IsSetToOne\(LegacyDisableVariable\)/);
   });
 
   it("never blocks a user out of signing in, or out of a broken registry", () => {
@@ -225,11 +306,57 @@ describe("wrapper OpenTelemetry contract", () => {
     );
   });
 
-  it("forces every content-telemetry flag off", () => {
+  it("forces every content-telemetry flag off from one place, on every launch", () => {
+    expect(Object.keys(FORCED_PRIVACY_VARIABLES)).toHaveLength(5);
+    const forced = methodBody(
+      program,
+      "private static void ForceContentTelemetryOff(",
+      "private static bool HasUserExporterConfiguration("
+    );
     for (const [name, value] of Object.entries(FORCED_PRIVACY_VARIABLES)) {
       expect(program).toContain(`Environment.SetEnvironmentVariable("${name}", "${value}");`);
+      // Set in the one unconditional method and nowhere else. They used to be set only at the end
+      // of collector injection, so no registry, no registration, a stale registration, or
+      // telemetry disabled left an inherited OTEL_LOG_USER_PROMPTS=1 in place all the way to the
+      // child - and with no endpoint configured OTLP falls back to localhost.
+      expect(program.match(new RegExp(`SetEnvironmentVariable\\("${name}"`, "g")) ?? [])
+        .toHaveLength(1);
+      expect(forced).toContain(`Environment.SetEnvironmentVariable("${name}", "${value}");`);
     }
-    expect(Object.keys(FORCED_PRIVACY_VARIABLES)).toHaveLength(5);
+    const injection = methodBody(
+      program,
+      "private static void ApplyCollectorEnvironment(",
+      "private static void ForceContentTelemetryOff("
+    );
+    for (const name of Object.keys(FORCED_PRIVACY_VARIABLES)) {
+      expect(injection).not.toContain(name);
+    }
+
+    // Applied before every forward, and before injection: the exemption below reads the very
+    // variables injection writes, so running it afterwards would mistake the wrapper's own
+    // loopback exporter for somebody else's and skip the flags entirely.
+    const forward = methodBody(
+      program,
+      "private static int Forward(",
+      "private static void ApplyCollectorEnvironment("
+    );
+    expect(forward.indexOf("ForceContentTelemetryOff()")).toBeGreaterThan(0);
+    expect(forward.indexOf("ForceContentTelemetryOff()")).toBeLessThan(
+      forward.indexOf("ApplyCollectorEnvironment(")
+    );
+    expect(callSites(program, "ForceContentTelemetryOff")).toEqual([
+      "ForceContentTelemetryOff();"
+    ]);
+
+    // Two exemptions, both deliberate and both documented in docs/privacy.md: the kill switch,
+    // which has to be total, and a user's own OTEL pipeline, whose content flags are their
+    // explicit configuration rather than something of ours to override — nothing is injected on
+    // that path, so no Workspace Accounts collector can receive content either way.
+    expect(forward).toContain("if (!resolution.Bypassed)");
+    expect(forced).toContain("if (HasUserExporterConfiguration())");
+    expect(program).toContain("public static GuardResolution KillSwitch()");
+    expect(methodBody(program, "public static int Main(", "private static bool IsGuardDisabled("))
+      .toContain("Forward(target, GuardResolution.KillSwitch(), \"launch_failed\")");
   });
 
   it("never enables a beta telemetry mode on the user's behalf", () => {
@@ -251,6 +378,71 @@ describe("wrapper OpenTelemetry contract", () => {
     expect(program).toContain("claude.account_guard.workspace_label=");
     expect(core).toContain("\"[^A-Za-z0-9_.-]\"");
     expect(program).not.toContain("claude.account_guard.workspace_path");
+  });
+});
+
+/**
+ * `binding-cache.json` is the wrapper's own file, written outside the extension host and left behind
+ * by an uninstall. It used to serialize the literal workspace directory of every workspace that had
+ * ever been bound, which is the one thing the workspace-path invariant forbids without an opt-in.
+ * `smoke-wrapper.mjs` asserts what actually lands on disk; these assertions pin the shape that
+ * produced it, and the resolution semantics that had to survive the change.
+ */
+describe("binding cache contract", () => {
+  const storage = read(SHARED, "GuardStorage.cs");
+
+  it("writes a workspace as a hash and a label, never as a path", () => {
+    const serialized = methodBody(
+      storage,
+      "public string ToJson()",
+      "public static WorkspaceBinding FromJson("
+    );
+    expect(serialized).toContain("\\\"workspaceHash\\\"");
+    expect(serialized).toContain("\\\"workspaceLabel\\\"");
+    expect(serialized).not.toContain("\\\"workspace\\\":");
+    expect(serialized).not.toContain("Quote(workspace)");
+    // The serialized object cannot write a path down because it does not hold one.
+    expect(storage).not.toContain("private readonly string workspace;");
+    expect(storage).toContain("GuardPaths.WorkspaceHash(normalizedWorkspace)");
+  });
+
+  it("keeps longest-prefix resolution without a path to compare", () => {
+    // Hashes cannot be tested for containment, so the lookup walks the launch directory's own
+    // ancestors from the deepest upwards; the first hit is the longest matching prefix, which is
+    // what lets a nested workspace stay on a different account than the tree it sits in.
+    expect(storage).toContain("private static List<string> AncestorHashes(");
+    const match = methodBody(
+      storage,
+      "public static WorkspaceBinding Match(",
+      "public static void Remember("
+    );
+    expect(match).toContain("AncestorHashes(normalizedWorkspace)");
+    expect(match).not.toContain("StartsWith");
+  });
+
+  it("does not leave a cache written with literal paths sitting on disk", () => {
+    expect(storage).toContain("public static void PurgeLiteralPaths(");
+    expect(storage).toContain("public static bool CarriesLiteralPath(");
+    // Run before anything decides whether the cache is read or written, because a missing registry
+    // returns without touching it on any other line.
+    const resolve = methodBody(
+      program,
+      "private static GuardResolution Resolve(",
+      "private static void ApplyBinding("
+    );
+    expect(resolve.indexOf("BindingCache.PurgeLiteralPaths(cachePath)")).toBeGreaterThan(0);
+    expect(resolve.indexOf("BindingCache.PurgeLiteralPaths(cachePath)")).toBeLessThan(
+      resolve.indexOf("File.Exists(registryPath)")
+    );
+    // A legacy entry is migrated rather than dropped: hashing the path it recorded produces the
+    // same key, so the user keeps the binding.
+    const fromJson = methodBody(
+      storage,
+      "public static WorkspaceBinding FromJson(",
+      "public static bool CarriesLiteralPath("
+    );
+    expect(fromJson).toContain("value[\"workspace\"].AsText()");
+    expect(fromJson).toContain("HashFor(legacyPath)");
   });
 });
 

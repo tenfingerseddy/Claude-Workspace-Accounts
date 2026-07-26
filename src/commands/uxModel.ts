@@ -11,6 +11,58 @@ import type { BindingIdentityState } from "../core/statusState.js";
 export const WRAPPER_SETTING_ID = "claudeCode.claudeProcessWrapper";
 export const DISABLE_ENVIRONMENT_VARIABLE = "CLAUDE_WORKSPACE_ACCOUNTS_DISABLE";
 
+/**
+ * The v0.1.0 name for the kill switch, honoured permanently.
+ *
+ * It was documented, and a `setx CLAUDE_ACCOUNT_GUARD_DISABLE 1` survives the rename with nothing
+ * able to rewrite it — so a stranded value would silently disable per-workspace accounts with no
+ * setting anywhere to explain it. The wrapper honours both; the surfaces must be able to name both.
+ */
+export const LEGACY_DISABLE_ENVIRONMENT_VARIABLE = "CLAUDE_ACCOUNT_GUARD_DISABLE";
+
+/** Which kill-switch variables are actually set in this environment, by name. */
+export function activeDisableVariables(
+  environment: Record<string, string | undefined>
+): string[] {
+  return [DISABLE_ENVIRONMENT_VARIABLE, LEGACY_DISABLE_ENVIRONMENT_VARIABLE]
+    .filter((name) => (environment[name] ?? "").trim().length > 0);
+}
+
+/**
+ * Every `claudeAccountGuard.` command ID v0.1.0 shipped, mapped to the ID that replaced it.
+ *
+ * The rename dropped these rather than aliasing them. A new Marketplace listing carries no
+ * compatibility burden of its own, but a user's `keybindings.json`, `tasks.json`, and any
+ * `command:` URI in their own notes still name the old IDs — and those fail with "command not
+ * found", which looks like the extension is broken. Aliases are registered but deliberately not
+ * contributed to `package.json`, so they work everywhere a command ID is accepted and appear
+ * nowhere in the Command Palette.
+ *
+ * Two changed name as well as namespace, because they described a product that blocked launches
+ * rather than one that selects an account.
+ */
+export const LEGACY_COMMAND_ALIASES: Readonly<Record<string, string>> = {
+  "claudeAccountGuard.openMenu": "claudeAccounts.openMenu",
+  "claudeAccountGuard.configureWrapper": "claudeAccounts.configureWrapper",
+  "claudeAccountGuard.disableWrapper": "claudeAccounts.disableWrapper",
+  "claudeAccountGuard.removeAllData": "claudeAccounts.removeAllData",
+  "claudeAccountGuard.enableUsageCollection": "claudeAccounts.enableUsageCollection",
+  "claudeAccountGuard.openDashboard": "claudeAccounts.openDashboard",
+  "claudeAccountGuard.addProfile": "claudeAccounts.addProfile",
+  "claudeAccountGuard.registerCurrentProfile": "claudeAccounts.registerCurrentProfile",
+  "claudeAccountGuard.switchProfile": "claudeAccounts.switchProfile",
+  "claudeAccountGuard.lockWorkspace": "claudeAccounts.bindWorkspace",
+  "claudeAccountGuard.unlockWorkspace": "claudeAccounts.unbindWorkspace",
+  "claudeAccountGuard.bindTerminal": "claudeAccounts.bindTerminal",
+  "claudeAccountGuard.updateExpectedIdentity": "claudeAccounts.updateExpectedIdentity",
+  "claudeAccountGuard.verifyAccount": "claudeAccounts.verifyAccount",
+  "claudeAccountGuard.login": "claudeAccounts.login",
+  "claudeAccountGuard.manageProfiles": "claudeAccounts.manageProfiles",
+  "claudeAccountGuard.diagnostics": "claudeAccounts.diagnostics",
+  "claudeAccountGuard.deleteUsageData": "claudeAccounts.deleteUsageData",
+  "claudeAccountGuard.exportUsage": "claudeAccounts.exportUsage"
+};
+
 /** What `claudeCode.claudeProcessWrapper` currently points at. */
 export type WrapperState = "guard" | "foreign" | "none";
 
@@ -90,8 +142,17 @@ export interface CollectionInput {
   /** True when the status-line bridge was accepted for the inspected profile. */
   profileTelemetryEnabled: boolean;
   wrapperState: WrapperState;
-  /** True when the user configured their own OTLP exporter, which the wrapper never overrides. */
-  foreignOtelExporter: boolean;
+  /**
+   * The user's own OTEL variables, by **name only**, from the one shared detector in
+   * `telemetry/otelEnvironment.ts`.
+   *
+   * Two call sites used to hand-check four and two variables respectively, while the wrapper
+   * correctly refused to inject on any of twenty-five — so a user whose
+   * `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`, compression, certificate or per-signal headers stopped
+   * injection was told the collector was at fault. Values are never carried: a headers variable
+   * holds a bearer token.
+   */
+  foreignOtelVariables: readonly string[];
   collectorRegistered: boolean;
   snapshotSeen: boolean;
   lastEventAt?: string;
@@ -141,7 +202,7 @@ export function diagnoseCollection(input: CollectionInput): CollectionDiagnosis 
     return {
       state: "blocked",
       headline: "This window's Claude account is not registered",
-      detail: `Claude Code here uses ${input.runtimeConfigDir}, which is not one of your Workspace Accounts profiles. No usage is collected and no workspace lock applies until you register it.`,
+      detail: `Claude Code here uses ${input.runtimeConfigDir}, which is not one of your Workspace Accounts profiles. No quota is reported for it and no workspace binding applies until you register it.`,
       action: "register_runtime",
       actionLabel: "Register This Account"
     };
@@ -158,26 +219,26 @@ export function diagnoseCollection(input: CollectionInput): CollectionDiagnosis 
   if (!input.profileTelemetryEnabled) {
     return {
       state: "blocked",
-      headline: "Local usage is not enabled for this profile",
-      detail: "Quota numbers come from a status-line bridge in this profile's Claude settings.json. It is not installed yet; your own status line is chained, not replaced.",
+      headline: "Claude cannot report quota for this account yet",
+      detail: "The 5-hour and 7-day figures are Claude's own, delivered through a status-line bridge in this account's Claude settings.json. It is not installed yet; your own status line is chained, not replaced.",
       action: "enable_profile_usage",
-      actionLabel: "Enable Local Usage"
+      actionLabel: "Enable Quota Reporting"
     };
   }
   if (input.wrapperState !== "guard") {
     return {
       state: "partial",
-      headline: "Quota snapshots only — token-level telemetry is off",
-      detail: `Token, cost, and tool detail arrive over OpenTelemetry, which Workspace Accounts injects when Claude Code launches through its wrapper. ${WRAPPER_SETTING_ID} is not pointing at Workspace Accounts, so only status-line quota snapshots are collected.`,
+      headline: "Quota is reported; local token detail is not collected",
+      detail: `Claude's 5-hour and 7-day quota still arrives through the status line. The secondary local numbers — tokens, cost, tools — arrive over OpenTelemetry, which Workspace Accounts injects when Claude Code launches through its wrapper, and ${WRAPPER_SETTING_ID} is not pointing at Workspace Accounts.`,
       action: "configure_wrapper",
       actionLabel: "Enable Integration"
     };
   }
-  if (input.foreignOtelExporter) {
+  if (input.foreignOtelVariables.length > 0) {
     return {
       state: "partial",
-      headline: "Your own OpenTelemetry exporter is in use",
-      detail: "OTEL_EXPORTER_OTLP_* is already set in this environment, so Workspace Accounts deliberately does not redirect Claude's telemetry to its local collector. Quota snapshots still arrive.",
+      headline: "Your own OpenTelemetry configuration is in use",
+      detail: `Workspace Accounts refuses to override an OTEL configuration of your own, so it does not redirect Claude's telemetry to its local collector. Set in this environment: ${[...input.foreignOtelVariables].join(", ")}. Quota from Claude's status line still arrives.`,
       action: "none"
     };
   }
@@ -221,6 +282,16 @@ export function diagnoseCollection(input: CollectionInput): CollectionDiagnosis 
         detail: `Batches are being accepted and normalise to no usable measurement.${reason} The diagnostics report lists the counted causes.`,
         action: "none"
       };
+    case "storage_failed":
+      // Named, with its category, rather than reported as healthy collection. Everything on
+      // screen — including any quota percentage — is as old as the last successful write.
+      return {
+        state: "blocked",
+        headline: "Local usage storage is failing",
+        detail: `The local database is refusing writes, so nothing new is being recorded and any figure on screen may be frozen.${reason} Close other VS Code windows using this account, check free disk space and that %LOCALAPPDATA%\\ClaudeWorkspaceAccounts is writable, then reload the window. Account switching and workspace bindings are unaffected.`,
+        action: "reload_window",
+        actionLabel: "Reload Window"
+      };
     default:
       break;
   }
@@ -236,8 +307,8 @@ export function diagnoseCollection(input: CollectionInput): CollectionDiagnosis 
   if (!input.snapshotSeen && input.phase !== "collecting") {
     return {
       state: "awaiting_data",
-      headline: "Waiting for the first Claude response",
-      detail: "Collection is configured. Numbers appear after Claude Code answers once in this profile; quota windows only exist for supported subscription sessions.",
+      headline: "No Claude session has run under this account yet",
+      detail: "Everything is configured and nothing has failed. Claude reports quota through the status line of a running session, so the 5-hour and 7-day figures appear once Claude Code answers in a workspace that uses this account. Quota reaches a status line only for Claude.ai subscription accounts, and each window can be absent independently.",
       action: "none"
     };
   }
@@ -474,7 +545,10 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
     entries.push({
       kind: "item",
       label: `$(check) Verify ${state.accountName} now`,
-      detail: `Runs claude auth status for that account and records the identity, which is what lets Workspace Accounts spot a wrong-account mismatch later. Last verified: ${state.lastVerifiedLabel ?? "never"}.`,
+      // Do not promise drift detection. Claude Code returns email and orgId as null whenever
+      // CLAUDE_CONFIG_DIR is set, which is always true for a bound account, so the recorded
+      // identity has nothing comparable to answer it and the check cannot fire.
+      detail: `Runs claude auth status for that account and records whatever identity Claude returns. Later mismatch detection only works while Claude returns a comparable identity, which on this Claude version means your default account only — for a per-workspace account it reports being signed in and nothing more. Last verified: ${state.lastVerifiedLabel ?? "never"}.`,
       action: "verify"
     });
   }
@@ -499,7 +573,7 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
   entries.push({ kind: "separator", label: "Usage" });
   entries.push({
     kind: "item",
-    label: "$(graph) Open usage dashboard",
+    label: "$(graph) Open the quota and usage dashboard",
     description: state.usageLabel,
     detail: state.collection.state === "active"
       ? state.collection.detail

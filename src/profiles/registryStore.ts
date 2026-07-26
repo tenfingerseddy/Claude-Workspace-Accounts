@@ -226,6 +226,20 @@ function validateRegistry(value: unknown): SharedRegistryDocument {
 }
 
 /**
+ * The same validation `read` applies, for callers that must decide whether a registry is usable
+ * before anything acts on it.
+ *
+ * The rename migration needs exactly this and nothing else from here: it has to know whether the
+ * registry it just copied is one the extension host can actually load, because `activate` refuses
+ * to continue on an invalid one. Repointing Claude Code at the new wrapper first and discovering
+ * the registry is unusable second leaves a global setting applying no bindings and no UI left to
+ * manage it. Exported rather than duplicated so the two can never disagree about "usable".
+ */
+export function assertValidRegistry(value: unknown): SharedRegistryDocument {
+  return validateRegistry(value);
+}
+
+/**
  * Cross-process write coordination.
  *
  * The in-process queue only serialises writers inside one extension host. Multiple VS Code windows

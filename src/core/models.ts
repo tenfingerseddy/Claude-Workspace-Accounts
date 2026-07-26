@@ -127,6 +127,71 @@ export interface StatusSnapshot {
   };
 }
 
+/**
+ * Quota, as Claude reports it.
+ *
+ * These are the only plan-headroom figures any third party can obtain: the status-line payload
+ * carries `rate_limits.five_hour` and `rate_limits.seven_day`, each with a `used_percentage` and a
+ * `resets_at` in Unix epoch seconds. Verified against the schema embedded in Claude Code 2.1.220's
+ * own binary. Per-model windows (`seven_day_sonnet`, `seven_day_opus`) and the `extra_usage` credit
+ * pool exist, but only in the response of the private `/api/oauth/usage` endpoint the official
+ * extension calls — they never reach a status line, so nothing here may pretend to know them.
+ */
+export type QuotaWindowKey = "five_hour" | "seven_day";
+
+export interface QuotaWindowReading {
+  window: QuotaWindowKey;
+  /** "5-hour window" — for headings. */
+  label: string;
+  /** "5h" — for the status bar, where every character costs. */
+  shortLabel: string;
+  usedPercentage: number;
+  /** What is left. The number the user actually acts on. */
+  remainingPercentage: number;
+  severity: "normal" | "warning" | "critical";
+  /** Exactly as Claude reported it: Unix epoch seconds. */
+  resetsAt?: number;
+  resetsAtIso?: string;
+  /** "in 2h 40m", or "due now". Absent when Claude reported no reset time. */
+  resetsInLabel?: string;
+  /**
+   * The reset time has already passed, so this percentage describes a window that no longer
+   * exists. Showing it as current headroom would be actively misleading.
+   */
+  expired: boolean;
+}
+
+/** Why a window has no figure. Absence is always explained; it is never rendered as 0%. */
+export type QuotaAbsence =
+  /** No status snapshot at all: no Claude session has run under this account. */
+  | "no_session"
+  /** A snapshot exists and carries no quota at all — normal for plans Claude does not report. */
+  | "not_reported_for_account"
+  /** A snapshot exists, the other window was reported, this one was not. Independently optional. */
+  | "window_not_reported";
+
+export interface QuotaAbsentWindow {
+  window: QuotaWindowKey;
+  label: string;
+  reason: QuotaAbsence;
+  /** The one sentence every surface shows for this absence. */
+  detail: string;
+}
+
+export interface QuotaReport {
+  /** Reported windows, five-hour first. */
+  windows: QuotaWindowReading[];
+  /** Windows with no figure, each carrying the reason. */
+  absent: QuotaAbsentWindow[];
+  /** When Claude produced the reading. A percentage without this is not interpretable. */
+  capturedAt?: string;
+  ageMs?: number;
+  ageLabel?: string;
+  freshness: "fresh" | "stale" | "none";
+  /** The window that decides the status bar's severity. */
+  worst?: QuotaWindowReading;
+}
+
 export interface GuardStatusInput {
   runtime: RuntimeProfile;
   verification?: AuthVerification;
@@ -137,6 +202,16 @@ export interface GuardStatusInput {
   criticalThreshold: number;
   showUsage: boolean;
   verifying: boolean;
+  /**
+   * The collection phase, when it could be read.
+   *
+   * The status bar used to ignore collection health entirely, so a database that had gone locked,
+   * full, read-only or corrupt after one successful write left the last quota figure on screen
+   * indefinitely with nothing to say it had stopped moving.
+   */
+  collectionPhase?: CollectionPhase;
+  /** A sanitized category from the health record — never payload content, never a path. */
+  collectionDetail?: string;
 }
 
 export type GuardStatusKind =
@@ -156,7 +231,23 @@ export interface GuardStatus {
   severity: "normal" | "warning" | "error";
   usageLabel?: string;
   usagePercentage?: number;
-  usageWindow?: "five_hour" | "seven_day";
+  usageWindow?: QuotaWindowKey;
+  /** Everything known about plan headroom, so no consumer has to re-derive it. */
+  quota?: QuotaReport;
+  /**
+   * Set when local usage storage is failing. Rendered by the status bar rather than only
+   * recorded, because a frozen quota figure that looks healthy is worse than no figure.
+   */
+  collectionWarning?: string;
+  /**
+   * True when the bound account's identity can no longer be compared with the one recorded, so
+   * drift detection is inactive.
+   *
+   * A flag rather than a state three consumers each rediscovered by testing whether the rendered
+   * status text contained the word "unverified" — the same substring-matching-a-string-we-built
+   * pattern that has already caused two defects in this codebase.
+   */
+  identityCheckInactive?: boolean;
   detail: string;
 }
 
@@ -295,6 +386,16 @@ export type CollectionPhase =
   | "rejecting"
   /** Batches are arriving and being acknowledged, but normalise to nothing storable. */
   | "accepted_empty"
+  /**
+   * The most recent storage event was a failure: the database is locked, full, read-only, corrupt
+   * or otherwise refusing writes, and nothing has been written since.
+   *
+   * This has to outrank `collecting`, because it did not: one successful write early on left
+   * `lastSuccessfulWriteAt` set forever, so a database that went bad afterwards reported
+   * "collecting" on every surface while every OTLP request failed. It clears itself the moment a
+   * write succeeds again, which is why it compares the two timestamps rather than a wall clock.
+   */
+  | "storage_failed"
   /** Everything is configured and nothing has failed; no data has arrived yet. */
   | "awaiting_data"
   /** Data has been stored. */

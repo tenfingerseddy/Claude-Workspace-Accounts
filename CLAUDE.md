@@ -39,6 +39,31 @@ Its rules are load-bearing:
 - `SETTING_KEYS` is checked against `package.json` by a test, so a configuration property added later
   cannot be silently stranded in the old namespace.
 
+### Names a rename must not touch
+
+A blanket rename is dangerous in exactly one place: strings that must keep naming the *old* thing.
+Four defects of this shape were found in this one rename, so check this list before any future sweep.
+
+- `CLAUDE_ACCOUNT_GUARD_DISABLE` is a **permanent alias** for the kill switch. It was documented and
+  shipped in v0.1.0; a `setx` value or a checked-in `terminal.integrated.env.windows` entry survives a
+  rename and no migration can reach either, so dropping it would leave someone believing the wrapper
+  was bypassed while binding and telemetry were quietly active again.
+- `claude-account-guard-wrapper.exe` must stay in `OBSOLETE_SUPPORT_FILES` and must stay recognised by
+  `isManagedWrapperPath`, or upgrade cleanup becomes a no-op and Disconnect refuses to detach a wrapper
+  it installed itself.
+- `.claude-account-guard` remains a read-only fallback location for a profile's `statusline-next.json`,
+  consulted after the migrated `.claude-workspace-accounts`. When the migration cannot move that
+  directory it holds the only record of the user's previous status line.
+- The `claude.account_guard.*` OTLP resource attributes are a wire contract between the wrapper and
+  `normalizers.ts`/`usageRepository.ts`. Renaming them would silently split usage history in two.
+  During an upgrade the *old* wrapper can still be emitting to the *new* collector, so they are
+  deliberately unrenamed.
+
+Conversely, `GuardSupport.Resolve()` deliberately has **no** fallback to the old support root. The
+wrapper only ever runs once the new extension has installed and configured it, which is after the
+migration copied `registry.json`; a legacy-root fallback would give the wrapper a second source of
+truth for bindings, which is worse than not finding one.
+
 Registry schema stays at version 1 with no migration. In particular `workspaceLocks` and its `mode`
 field keep their names because both native binaries read them; only what the *user* sees says
 "bind" rather than "lock".
@@ -212,8 +237,19 @@ without changing the documentation in the same commit.
   `claude auth status`.
 - Telemetry is loopback-only with an ephemeral token, and the wrapper forces `OTEL_LOG_USER_PROMPTS`,
   `OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`, and
-  `OTEL_LOG_RAW_API_BODIES` to `"0"`. It refuses to inject any OTEL configuration if the user already
-  has their own exporter or endpoint set.
+  `OTEL_LOG_RAW_API_BODIES` to `"0"` **before anything else touches the environment, on every wrapped
+  launch**, regardless of whether collection is running. They were previously set only inside the
+  successful-injection branch, so every early return left them as inherited — and with
+  `CLAUDE_CODE_ENABLE_TELEMETRY=1` and no endpoint configured, OTLP falls back to localhost, so an
+  inherited `OTEL_LOG_USER_PROMPTS=1` could export prompt content to whatever was listening.
+  Two exemptions are deliberate and are spelled out in `docs/privacy.md`: a user who has configured
+  their own OTEL pipeline (we inject nothing and override nothing — silently disabling their content
+  logging would veto an explicit choice while protecting nothing of ours), and the kill switch (an
+  escape hatch that still edited the environment could not be used to escape a defect in how the
+  wrapper edits the environment). Neither lets this extension collect content.
+- It refuses to inject any OTEL configuration if the user already has their own exporter, endpoint,
+  protocol, compression, header, or client-certificate variable set. The authoritative list lives in
+  `src/telemetry/otelEnvironment.ts` and is mirrored in C#; a test fails if the two drift.
 - `wrapper-health.json` carries only `{schemaVersion, updatedAt, category, exitCode, pid}`. Never add
   arguments, environment, paths, or auth output to it.
 - Workspace paths are stored as a label plus a SHA-256 prefix unless the user opts in via

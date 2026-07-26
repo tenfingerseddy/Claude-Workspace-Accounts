@@ -3,7 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { AccountProfile } from "../../src/core/models.js";
-import { StatusLineBridgeService } from "../../src/telemetry/statusLineBridgeService.js";
+import {
+  StatusLineBridgeService,
+  isStatusLineBridgeCommand
+} from "../../src/telemetry/statusLineBridgeService.js";
 
 interface Scenario {
   directory: string;
@@ -32,6 +35,69 @@ async function scenario(statusLine: Record<string, unknown> | undefined): Promis
     }
   };
 }
+
+/**
+ * Ownership decides whether a user's status line gets overwritten without a copy being kept, so a
+ * false positive destroys a command this extension never installed. The predicate used to answer on
+ * a *substring* of the whole command, which claimed anything that so much as mentioned the bridge's
+ * filename anywhere in it — including inside an argument to somebody else's script.
+ */
+describe("recognising a status-line command as ours", () => {
+  it("claims a bridge this or any earlier release installed", () => {
+    for (const command of [
+      "\"C:\\Users\\dev\\AppData\\Local\\ClaudeWorkspaceAccounts\\wrapper\\statusline-bridge.exe\"",
+      "C:\\Users\\dev\\AppData\\Local\\ClaudeWorkspaceAccounts\\wrapper\\statusline-bridge.exe",
+      "\"C:\\Program Files\\Claude Accounts\\statusline-bridge.exe\" --json",
+      "c:/tools/STATUSLINE-BRIDGE.EXE",
+      // v0.1.0's command, verbatim.
+      "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+        + "-File \"C:\\Users\\dev\\AppData\\Local\\ClaudeAccountGuard\\wrapper\\statusline-bridge.ps1\"",
+      "pwsh -File 'C:\\old\\statusline-bridge.ps1'",
+      "\"C:\\old\\statusline-bridge.ps1\""
+    ]) {
+      expect(isStatusLineBridgeCommand(command), command).toBe(true);
+    }
+  });
+
+  it("leaves a command alone when the bridge's name is only part of a longer filename", () => {
+    for (const command of [
+      // Every one of these was claimed as ours by the substring match.
+      "node C:\\tools\\statusline-bridge.exe-helper.js",
+      "C:\\tools\\statusline-bridge.exe-helper.exe",
+      "C:\\tools\\my-statusline-bridge.exe",
+      "C:\\tools\\statusline-bridge.exe.bak",
+      "C:\\tools\\statusline-bridge.ps1.disabled",
+      "statusline-bridge.exe.cmd"
+    ]) {
+      expect(isStatusLineBridgeCommand(command), command).toBe(false);
+    }
+  });
+
+  it("leaves a command alone when the bridge is only mentioned in an argument", () => {
+    for (const command of [
+      "node C:\\tools\\my-line.js --bridge \"statusline-bridge.exe\"",
+      "node C:\\tools\\my-line.js --note statusline-bridge.ps1",
+      "python wrap.py C:\\old\\statusline-bridge.exe",
+      "powershell.exe -NoProfile -Command \"Write-Host statusline-bridge.ps1\"",
+      // The script the host was actually told to run is somebody else's.
+      "powershell.exe -File \"C:\\tools\\other.ps1\" C:\\old\\statusline-bridge.ps1"
+    ]) {
+      expect(isStatusLineBridgeCommand(command), command).toBe(false);
+    }
+  });
+
+  it("has no opinion about a command that is plainly not ours, or absent", () => {
+    for (const command of [
+      undefined,
+      "",
+      "   ",
+      "node existing-status.js",
+      "powershell.exe -File \"C:\\tools\\other.ps1\""
+    ]) {
+      expect(isStatusLineBridgeCommand(command), String(command)).toBe(false);
+    }
+  });
+});
 
 describe("status-line bridge settings preservation", () => {
   it("restores the complete previous status-line object", async () => {

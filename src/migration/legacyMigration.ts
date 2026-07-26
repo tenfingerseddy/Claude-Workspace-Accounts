@@ -19,11 +19,28 @@
  *    record is written to disk so the failure is retrievable rather than silent, in the same
  *    way `wrapper-health.json` records the wrapper's last outcome.
  *
+ * Failing open is not the same as declaring success, and the difference nearly destroyed data. If
+ * the `registry.json` copy failed, activation continued, `ProfileRegistry.initialize()` created an
+ * *empty* registry at the destination, and the next activation treated that empty file as proof the
+ * copy had happened — wrote the marker, repointed the wrapper, and told the user the old directory
+ * was safe to delete. Their accounts and bindings went with it. Two rules answer that:
+ *
+ * 4. **Prove, never infer.** The mere existence of a file at the destination is not evidence this
+ *    migration put it there. Every artifact this module copies is recorded in
+ *    `migration-provenance.json` with its source path, size and digest, and only a proven artifact
+ *    — or one whose bytes still match the source — counts as migrated.
+ * 5. **An unprovable registry is a barrier, not a warning.** Nothing downstream runs until the
+ *    copied registry is present, provably ours, and valid: not the wrapper setting, not the
+ *    settings namespace, not the marker. A wrapper repointed at an installation with no bindings
+ *    silently applies no accounts, and `activate` cannot load an invalid registry, so there would
+ *    be no UI left to explain it.
+ *
  * Nothing here imports `vscode`: settings access and extension lookup arrive through
  * {@link MigrationHost} so every branch is testable without an extension host, and so no test
  * can reach a real installation by accident.
  */
 
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import {
   access,
@@ -32,10 +49,13 @@ import {
   mkdir,
   readFile,
   rename,
+  rm,
   stat,
   writeFile
 } from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { assertValidRegistry } from "../profiles/registryStore.js";
 import { isStatusLineBridgeCommand } from "../telemetry/statusLineBridgeService.js";
 import { LEGACY_WRAPPER_EXE } from "../wrapper/wrapperPaths.js";
 
@@ -62,22 +82,35 @@ export const WRAPPER_SETTING = "claudeProcessWrapper";
 export const MIGRATION_MARKER = "migrated-to-claude-workspace-accounts.json";
 /** Written into the new support directory so a partial migration is retrievable, not silent. */
 export const MIGRATION_REPORT = "migration-report.json";
+/**
+ * Written into the new support directory to record *what this migration copied and from where*.
+ *
+ * Without it there is no way to tell an artifact this migration produced from one something else
+ * created at the same path — and `ProfileRegistry.initialize()` creates an empty `registry.json`
+ * the moment activation continues past a failed copy. Inferring "already migrated" from mere
+ * existence is what turned one failed copy into a destroyed set of accounts and bindings.
+ */
+export const MIGRATION_PROVENANCE = "migration-provenance.json";
+
+/** The registry is the artifact whose loss cannot be recovered from anywhere else. */
+const REGISTRY_FILE = "registry.json";
+/** Snapshotted rather than copied; see {@link snapshotUsageDatabase}. */
+const USAGE_DATABASE = "usage.sqlite3";
+/** SQLite's sidecars. Only ever removed from *our* staging copy, never read at the destination. */
+const USAGE_SIDECARS: readonly string[] = ["-wal", "-shm"];
 
 /**
- * Files copied from the old support directory, in the order they matter.
+ * Files copied byte-for-byte from the old support directory, in the order they matter.
  *
- * `wrapper/` is deliberately absent: the new binaries are installed fresh under their new name,
- * and copying the old ones would leave an executable nothing manages. `handoffs/` and `vscode/`
- * are absent because they belong to the isolated-window launcher, which no longer exists.
- * `wrapper-health.json` is absent because it describes the previous wrapper's last launch.
+ * `usage.sqlite3` is absent because a live SQLite database cannot be copied a file at a time; see
+ * {@link snapshotUsageDatabase}. `wrapper/` is deliberately absent: the new binaries are installed
+ * fresh under their new name, and copying the old ones would leave an executable nothing manages.
+ * `handoffs/` and `vscode/` are absent because they belong to the isolated-window launcher, which
+ * no longer exists. `wrapper-health.json` is absent because it describes the previous wrapper's
+ * last launch.
  */
 const MIGRATED_FILES: readonly string[] = [
-  "registry.json",
-  "usage.sqlite3",
-  // SQLite leaves a write-ahead log and a shared-memory file beside the database. Copying the
-  // database without them can lose the most recent committed transactions.
-  "usage.sqlite3-wal",
-  "usage.sqlite3-shm",
+  REGISTRY_FILE,
   "binding-cache.json"
 ];
 
@@ -199,10 +232,43 @@ export interface LegacyMigrationReport {
   legacyExtensionInstalled: boolean;
   /** Kept, never deleted: the copy above is not a move. */
   legacyRoot?: string;
+  /**
+   * Why the migration stopped short of repointing anything, when it did.
+   *
+   * Set only when the copied registry could not be proven present and valid. Everything after the
+   * support copy is deliberately skipped in that state, so this is the difference between "some
+   * items need attention" and "your previous installation is still the one in charge".
+   */
+  blockedBy?: string;
   steps: MigrationStep[];
   /** Sanitised messages for everything that could not be migrated. */
   failures: string[];
 }
+
+/** What this migration copied, from where, and what it looked like at the time. */
+interface ProvenanceEntry {
+  source: string;
+  method: "copy" | "sqlite-snapshot";
+  sourceBytes: number;
+  /** Of the copied bytes. Absent for a snapshot, whose output is not a byte copy of its source. */
+  sha256?: string;
+  copiedAt: string;
+}
+
+interface ProvenanceDocument {
+  schemaVersion: 1;
+  artifacts: Record<string, ProvenanceEntry>;
+}
+
+/**
+ * A legacy database that copied cleanly but is not a usable database.
+ *
+ * Distinguished from an I/O failure on purpose. An unreadable file suggests something systemic —
+ * antivirus, permissions — that threatens the registry copy too, so it halts the migration. A
+ * database whose contents do not survive an integrity check is just corrupt at the source, and
+ * usage history is the least precious thing here: discard it, say so, and let the accounts through.
+ */
+class UnusableDatabaseError extends Error {}
 
 /**
  * The previous support root for this machine, or undefined when there cannot be one.
@@ -253,6 +319,221 @@ async function atomicWrite(target: string, content: string): Promise<void> {
   const temporary = `${target}.${process.pid}.migration.tmp`;
   await writeFile(temporary, content, { encoding: "utf8", mode: 0o600 });
   await rename(temporary, target);
+}
+
+/**
+ * Copy over a file that already exists, byte for byte and atomically.
+ *
+ * The only caller replaces a registry it has proven holds nothing, and the rename means a reader in
+ * another process — the wrapper reads this file on every Claude launch — never sees a partial one. A
+ * byte copy rather than a text round trip: this is the one place this module writes somebody's
+ * registry, so it must not be able to re-encode it.
+ */
+async function atomicReplace(source: string, destination: string): Promise<void> {
+  const temporary = `${destination}.${process.pid}.migration.tmp`;
+  try {
+    await copyFile(source, temporary);
+    await rename(temporary, destination);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+function samePath(left: string, right: string): boolean {
+  return path.normalize(left).toLocaleLowerCase() === path.normalize(right).toLocaleLowerCase();
+}
+
+async function digest(file: string): Promise<string> {
+  return createHash("sha256").update(await readFile(file)).digest("hex");
+}
+
+/**
+ * The provenance this migration has recorded so far, or an empty record.
+ *
+ * Anything unreadable reads as empty rather than throwing: a lost provenance file must cost the
+ * user an unnecessary re-check, never a migration that refuses to run.
+ */
+async function readProvenance(root: string): Promise<ProvenanceDocument> {
+  try {
+    const raw = (await readFile(path.join(root, MIGRATION_PROVENANCE), "utf8"))
+      .replace(/^\uFEFF/, "");
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const artifacts = (parsed as { artifacts?: unknown }).artifacts;
+      if (artifacts && typeof artifacts === "object" && !Array.isArray(artifacts)) {
+        return { schemaVersion: 1, artifacts: artifacts as Record<string, ProvenanceEntry> };
+      }
+    }
+  } catch {
+    // Absent, unreadable, or not JSON. Treated as "nothing has been proven yet".
+  }
+  return { schemaVersion: 1, artifacts: {} };
+}
+
+/**
+ * Record one artifact's provenance immediately, before anything downstream can rely on it.
+ *
+ * Written per artifact rather than once at the end: a crash between the copy and a batched write
+ * would leave a correctly copied registry looking unproven on the next activation, which is the
+ * barrier state, and stalling a migration that actually succeeded is its own kind of failure.
+ */
+async function recordProvenance(
+  root: string,
+  provenance: ProvenanceDocument,
+  artifact: string,
+  entry: ProvenanceEntry
+): Promise<void> {
+  provenance.artifacts[artifact] = entry;
+  try {
+    await atomicWrite(
+      path.join(root, MIGRATION_PROVENANCE),
+      `${JSON.stringify(provenance, null, 2)}\n`
+    );
+  } catch {
+    // The copy itself succeeded, and re-verifying it by digest on the next activation reaches the
+    // same answer. Never a reason to fail the migration.
+  }
+}
+
+/** True when the file at the destination is byte-identical to the source, whoever put it there. */
+async function sameContent(source: string, destination: string): Promise<boolean> {
+  try {
+    const [left, right] = await Promise.all([stat(source), stat(destination)]);
+    if (left.size !== right.size) {
+      return false;
+    }
+    return (await digest(source)) === (await digest(destination));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when a registry holds no accounts and no bindings at all.
+ *
+ * This is the fingerprint of the file `ProfileRegistry.initialize()` writes when it finds none: a
+ * schema-valid document with nothing of the user's in it. It is the one destination registry that
+ * can be replaced by the legacy copy without risking data, because there is provably no data in it
+ * — and leaving it in place is what stranded an upgrading user with no accounts and a marker
+ * claiming the migration had succeeded.
+ */
+async function isEmptyPlaceholderRegistry(file: string): Promise<boolean> {
+  try {
+    const raw = (await readFile(file, "utf8")).replace(/^\uFEFF/, "");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return false;
+    }
+    const document = parsed as Record<string, unknown>;
+    return document.schemaVersion === 1
+      && Array.isArray(document.profiles) && document.profiles.length === 0
+      && Array.isArray(document.workspaceLocks) && document.workspaceLocks.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Copy the legacy usage database as a single consistent snapshot, then prove it is one.
+ *
+ * A live SQLite database in WAL mode is not three independent files. The previous implementation
+ * copied `usage.sqlite3`, `-wal` and `-shm` one after another while the old extension could still
+ * be committing; a checkpoint landing between the copies produces a destination that fails
+ * `PRAGMA integrity_check` outright and silently loses rows. Reproduced: 950 rows in the source,
+ * 400 in the copy, and a page-allocation error from the integrity check.
+ *
+ * Three deliberate choices:
+ *
+ * - **The `-wal` is copied before the main database.** Whatever a checkpoint does in between, the
+ *   copied log then holds a prefix of frames the copied database has already absorbed, and
+ *   replaying those is idempotent. The other order replays *older* pages over newer ones.
+ * - **`-shm` is never copied.** It is shared-memory state SQLite rebuilds from the log; a stale one
+ *   is worse than none.
+ * - **The check happens on our own staging copy, opened read-write.** SQLite cannot read a WAL
+ *   database without an `-shm`, and creating one in the old support directory would break the rule
+ *   that the marker is the only write this module ever makes there — and would fail outright if the
+ *   old directory were read-only, which is exactly the situation this is defending against.
+ *
+ * The staged copy is checkpointed so a single file lands at the destination with no sidecars.
+ * Retried, because a torn copy is a race and losing to it twice is unlikely; discarded and reported
+ * if it never verifies, because importing a corrupt database is worse than importing no history.
+ */
+async function snapshotUsageDatabase(source: string, destination: string): Promise<void> {
+  const staged = `${destination}.${process.pid}.migration.tmp`;
+  const stagedFiles = [staged, ...USAGE_SIDECARS.map((suffix) => `${staged}${suffix}`)];
+  const discard = async (): Promise<void> => {
+    for (const file of stagedFiles) {
+      await rm(file, { force: true }).catch(() => undefined);
+    }
+  };
+
+  let lastCheck = "the database was never verified";
+  let attempts = 0;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const previousCheck = attempt > 1 ? lastCheck : undefined;
+    attempts = attempt;
+    await discard();
+    for (const suffix of ["-wal", ""]) {
+      const from = `${source}${suffix}`;
+      if (await exists(from)) {
+        await copyFile(from, `${staged}${suffix}`);
+      }
+    }
+    try {
+      lastCheck = verifyDatabase(staged);
+    } catch (error) {
+      lastCheck = reason(error);
+    }
+    if (lastCheck === "ok") {
+      try {
+        await Promise.all(
+          USAGE_SIDECARS.map((suffix) => rm(`${staged}${suffix}`, { force: true }))
+        );
+        // COPYFILE_EXCL for the same reason as every other artifact: never clobber a destination.
+        await copyFile(staged, destination, constants.COPYFILE_EXCL);
+      } finally {
+        await discard();
+      }
+      return;
+    }
+    if (lastCheck === previousCheck) {
+      // The same complaint twice is the source being corrupt, not a copy losing a race. Copying a
+      // large database again to learn the same thing only delays activation.
+      break;
+    }
+  }
+  await discard();
+  throw new UnusableDatabaseError(
+    `the copied database did not pass an integrity check after `
+    + `${attempts} attempt${attempts === 1 ? "" : "s"} (${lastCheck})`
+  );
+}
+
+/**
+ * Open a staged database, fold its log in, and return `"ok"` only if it is genuinely intact.
+ *
+ * `integrity_check` catches the structural damage a torn copy causes; reading `sqlite_master` is
+ * what catches a schema that cannot be parsed, which is how a truncated file presents.
+ */
+function verifyDatabase(file: string): string {
+  const database = new DatabaseSync(file);
+  try {
+    const checked = database.prepare("PRAGMA integrity_check").get() as
+      { integrity_check?: unknown } | undefined;
+    const outcome = typeof checked?.integrity_check === "string"
+      ? checked.integrity_check
+      : "the integrity check returned nothing";
+    if (outcome !== "ok") {
+      return outcome.split("\n")[0] ?? outcome;
+    }
+    database.prepare("SELECT count(*) AS tables FROM sqlite_master").get();
+    // Fold the log into the database file so one file, with no sidecars, lands at the destination.
+    database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    return "ok";
+  } finally {
+    database.close();
+  }
 }
 
 /**
@@ -314,12 +595,38 @@ export async function migrateLegacyInstallation(
     }
   };
 
+  /**
+   * Why nothing may be repointed at the new installation, once something says so.
+   *
+   * Only the support copy and the validation of what it produced can set this. Everything after
+   * them is a change to what Claude Code launches or where settings live, and none of that is safe
+   * while the copied registry is unproven: a repointed wrapper with no bindings applies no accounts
+   * at all, and an invalid registry stops `activate` before any UI exists to explain it.
+   */
+  let blockedBy: string | undefined;
+
   if (legacyRootPresent && legacyRoot) {
-    await phase(
-      "Support directory",
-      () => migrateSupportDirectory(legacyRoot, options.root, record)
-    );
-    await phase("Recorded wrapper path", () => rewriteMigratedRegistry(options, record));
+    try {
+      const copy = await migrateSupportDirectory(
+        legacyRoot,
+        options.root,
+        record,
+        () => validateMigratedRegistry(options.root, record)
+      );
+      changed = copy.changed || changed;
+      blockedBy = copy.blockedBy;
+    } catch (error) {
+      record({
+        artifact: "Support directory",
+        state: "failed",
+        detail: reason(error),
+        manual: `Keep ${legacyRoot}; nothing was copied out of it.`
+      });
+      blockedBy = `${legacyRoot} could not be copied (${reason(error)})`;
+    }
+    if (!blockedBy) {
+      await phase("Recorded wrapper path", () => rewriteMigratedRegistry(options, record));
+    }
   } else {
     record({
       artifact: "Support directory",
@@ -330,9 +637,29 @@ export async function migrateLegacyInstallation(
     });
   }
 
-  await phase("Claude Code wrapper setting", () => migrateWrapperSetting(options, record));
-  await phase("Settings namespace", () => migrateSettingsNamespace(options, record));
-  await phase("Account directories", () => migrateProfileDirectories(options, record));
+  if (blockedBy) {
+    for (const artifact of [
+      "Claude Code wrapper setting",
+      "Settings namespace",
+      "Account directories"
+    ]) {
+      record({
+        artifact,
+        state: "skipped",
+        detail:
+          `Not touched, because ${blockedBy}. Your previous installation is still the one in `
+          + "charge: Claude Code keeps launching through it and your settings still live in the old "
+          + "namespace, so nothing has been half-moved.",
+        manual:
+          "Resolve the support-directory failure listed above, then reload the window to retry. "
+          + "Do not delete the old support directory."
+      });
+    }
+  } else {
+    await phase("Claude Code wrapper setting", () => migrateWrapperSetting(options, record));
+    await phase("Settings namespace", () => migrateSettingsNamespace(options, record));
+    await phase("Account directories", () => migrateProfileDirectories(options, record));
+  }
 
   if (legacyExtensionInstalled) {
     record({
@@ -353,11 +680,55 @@ export async function migrateLegacyInstallation(
     changed,
     legacyExtensionInstalled,
     legacyRoot: legacyRootPresent ? legacyRoot : undefined,
+    blockedBy,
     steps,
     failures
   };
   await writeReport(options.root, report);
   return report;
+}
+
+/**
+ * Refuse to go further unless the copied registry is one the extension host can actually load.
+ *
+ * `activate` rethrows on a registry it cannot validate, so a migration that repoints
+ * `claudeCode.claudeProcessWrapper` first and validates second produces the worst available state:
+ * the new wrapper is configured, it fails open to the ambient account, no binding applies, and the
+ * commands, diagnostics and repair UI never activate to say why. Validating here is what keeps the
+ * legacy wrapper setting — which still works — in place until the copy is genuinely usable.
+ *
+ * Absent is fine: an old installation with no registry has no accounts to strand.
+ */
+async function validateMigratedRegistry(
+  root: string,
+  record: (step: MigrationStep) => void
+): Promise<string | undefined> {
+  const registryPath = path.join(root, REGISTRY_FILE);
+  if (!(await exists(registryPath))) {
+    record({
+      artifact: "Migrated registry",
+      state: "not_present",
+      detail: "The previous installation had no registry, so there were no accounts to carry over."
+    });
+    return undefined;
+  }
+  try {
+    assertValidRegistry(JSON.parse((await readFile(registryPath, "utf8")).replace(/^\uFEFF/, "")));
+  } catch (error) {
+    record({
+      artifact: "Migrated registry",
+      state: "failed",
+      detail:
+        `${registryPath} is not a registry this version can load (${reason(error)}), so nothing `
+        + "was repointed at it. It was left exactly as it is, in case it is the only copy.",
+      manual:
+        `Repair or delete ${registryPath} — the previous copy is still in the old support `
+        + "directory — then reload the window."
+    });
+    return `${registryPath} could not be loaded (${reason(error)})`;
+  }
+  record({ artifact: "Migrated registry", state: "already_migrated" });
+  return undefined;
 }
 
 function safeIsInstalled(host: MigrationHost): boolean {
@@ -403,40 +774,108 @@ function hasLegacyWrapperSetting(host: MigrationHost): boolean {
  * been copied or confirmed absent, so a failure part way through leaves the marker off and the
  * next activation resumes — and because nothing at the destination is ever overwritten, resuming
  * cannot undo work that already succeeded.
+ *
+ * "Confirmed absent" used to include "there is already a file at the destination", and that was the
+ * hole. After a failed `registry.json` copy, activation continues and `ProfileRegistry.initialize()`
+ * writes an empty registry at exactly that path; the next activation saw a file, called the artifact
+ * done, wrote the marker, and told the user the old directory was safe to delete. Every destination
+ * is now reconciled against recorded provenance or against the source's own bytes, and a registry
+ * that can be neither proven nor safely replaced halts the whole migration.
  */
 async function migrateSupportDirectory(
   legacyRoot: string,
   root: string,
-  record: (step: MigrationStep) => void
-): Promise<boolean> {
+  record: (step: MigrationStep) => void,
+  /** Returns why the copy cannot be trusted, or undefined. Runs before the marker, never after. */
+  verify: () => Promise<string | undefined>
+): Promise<{ changed: boolean; blockedBy?: string }> {
   const markerPath = path.join(legacyRoot, MIGRATION_MARKER);
   if (await exists(markerPath)) {
+    // Verified even here. "Delete the old directory" and "the copy is unusable" must never be the
+    // advice of the same run, and a marker from an earlier activation is not a promise that what it
+    // marked still loads.
+    const unusable = await verify();
     record({
       artifact: "Support directory",
-      state: "already_migrated",
-      detail: `${legacyRoot} was migrated by an earlier activation and is left in place.`,
-      manual: `Delete ${legacyRoot} once you are satisfied nothing is missing.`
+      state: unusable ? "skipped" : "already_migrated",
+      detail: unusable
+        ? `${legacyRoot} was marked as migrated by an earlier activation, but ${unusable}, so it is `
+          + "still the only complete copy."
+        : `${legacyRoot} was migrated by an earlier activation and is left in place.`,
+      manual: unusable
+        ? `Keep ${legacyRoot} until the registry problem listed above is resolved.`
+        : `Delete ${legacyRoot} once you are satisfied nothing is missing.`
     });
-    return false;
+    return { changed: false, blockedBy: unusable };
   }
 
   await mkdir(root, { recursive: true });
+  const provenance = await readProvenance(root);
   const copied: string[] = [];
   let anyFailure = false;
+  let blockedBy: string | undefined;
 
   for (const name of MIGRATED_FILES) {
     const source = path.join(legacyRoot, name);
     const destination = path.join(root, name);
+    const essential = name === REGISTRY_FILE;
     try {
-      if (!(await exists(source)) || await exists(destination)) {
+      if (!(await exists(source))) {
+        continue;
+      }
+      if (await exists(destination)) {
+        const proven = await isProvenCopy(name, source, destination, provenance);
+        if (proven) {
+          continue;
+        }
+        // Not ours and not the same bytes. For the registry there is one safe repair: the empty
+        // document ProfileRegistry writes when it finds none holds no accounts and no bindings, so
+        // replacing it cannot lose anything — and leaving it is what strands the upgrading user.
+        if (essential && await isEmptyPlaceholderRegistry(destination)) {
+          await atomicReplace(source, destination);
+          await recordProvenance(root, provenance, name, await describeCopy(source, "copy"));
+          copied.push(name);
+          record({
+            artifact: `Support file ${name}`,
+            state: "migrated",
+            detail:
+              `${destination} held an empty registry with no accounts and no bindings — the `
+              + "placeholder written when an earlier copy failed — so the previous registry "
+              + "replaced it."
+          });
+          continue;
+        }
+        const detail = essential
+          ? `${destination} already exists, holds accounts or bindings this migration did not put `
+            + "there, and does not match the previous registry. It was left untouched rather than "
+            + "overwritten, and nothing was repointed at it."
+          : `${destination} already exists and was not produced by this migration, so it was left `
+            + "in place.";
+        record({
+          artifact: `Support file ${name}`,
+          state: essential ? "failed" : "skipped",
+          detail,
+          manual: essential
+            ? `Compare ${source} with ${destination} and keep whichever holds your accounts. `
+              + `Nothing was deleted; ${source} is still intact.`
+            : undefined
+        });
+        if (essential) {
+          anyFailure = true;
+          blockedBy ??= `${destination} could not be proven to be a copy of ${source}`;
+        }
         continue;
       }
       // COPYFILE_EXCL rather than a plain copy: the existence check above is not atomic, and
       // clobbering a newer file at the destination is the one outcome worse than not copying.
       await copyFile(source, destination, constants.COPYFILE_EXCL);
+      await recordProvenance(root, provenance, name, await describeCopy(source, "copy"));
       copied.push(name);
     } catch (error) {
       anyFailure = true;
+      if (essential) {
+        blockedBy ??= `${source} could not be copied to ${destination} (${reason(error)})`;
+      }
       record({
         artifact: `Support file ${name}`,
         state: "failed",
@@ -444,6 +883,17 @@ async function migrateSupportDirectory(
         manual: `Copy ${source} to ${destination} by hand.`
       });
     }
+  }
+
+  const database = await migrateUsageDatabase(legacyRoot, root, provenance, record);
+  if (database.copied) {
+    copied.push(USAGE_DATABASE);
+  }
+  if (database.failed) {
+    anyFailure = true;
+  }
+  if (database.blockedBy) {
+    blockedBy ??= database.blockedBy;
   }
 
   for (const name of MIGRATED_DIRECTORIES) {
@@ -471,18 +921,24 @@ async function migrateSupportDirectory(
     }
   }
 
-  if (anyFailure) {
+  // Before the marker, never after. The marker is what tells the user the old directory is safe to
+  // delete, and a copy the extension host cannot load has not really migrated anything.
+  blockedBy ??= await verify();
+
+  if (anyFailure || blockedBy) {
     // No marker: the old directory is still authoritative for whatever did not arrive, and the
     // next activation must try again.
     record({
       artifact: "Support directory",
-      state: "failed",
-      detail:
-        `Some of ${legacyRoot} could not be copied to ${root}, so it was not marked as `
-        + "migrated and will be retried on the next reload. Nothing was deleted.",
+      state: anyFailure ? "failed" : "skipped",
+      detail: anyFailure
+        ? `Some of ${legacyRoot} could not be copied to ${root}, so it was not marked as `
+          + "migrated and will be retried on the next reload. Nothing was deleted."
+        : `${legacyRoot} was copied to ${root} but not marked as migrated, because ${blockedBy}. `
+          + "Nothing was deleted, and nothing was repointed at the copy.",
       manual: `Keep ${legacyRoot} until the items listed above are present in ${root}.`
     });
-    return copied.length > 0;
+    return { changed: copied.length > 0, blockedBy };
   }
 
   try {
@@ -512,7 +968,120 @@ async function migrateSupportDirectory(
       ? `${legacyRoot} was copied, not moved. Delete it once you are satisfied nothing is missing.`
       : undefined
   });
-  return copied.length > 0;
+  return { changed: copied.length > 0 };
+}
+
+/**
+ * Whether the file at the destination is provably the one this migration put there.
+ *
+ * Two kinds of proof, and nothing else counts. A provenance entry naming the same source is the
+ * direct one. Identical bytes are the indirect one — whoever wrote them, the data has arrived — and
+ * it is what keeps a lost provenance file from turning a completed copy into a barrier.
+ */
+async function isProvenCopy(
+  name: string,
+  source: string,
+  destination: string,
+  provenance: ProvenanceDocument
+): Promise<boolean> {
+  const entry = provenance.artifacts[name];
+  if (entry && typeof entry.source === "string" && samePath(entry.source, source)) {
+    return true;
+  }
+  return sameContent(source, destination);
+}
+
+async function describeCopy(
+  source: string,
+  method: ProvenanceEntry["method"]
+): Promise<ProvenanceEntry> {
+  return {
+    source,
+    method,
+    sourceBytes: (await stat(source)).size,
+    // A snapshot is not a byte copy of its source, so a digest of one would be a false claim.
+    sha256: method === "copy" ? await digest(source) : undefined,
+    copiedAt: new Date().toISOString()
+  };
+}
+
+/**
+ * Carry the usage database over as a snapshot, and never at the cost of the accounts.
+ *
+ * The three outcomes are deliberately different in weight. An I/O failure reading the old database
+ * suggests something — antivirus, a permission problem — that puts the registry copy in doubt too,
+ * so it halts the migration. A database that copies but does not verify is discarded with a note:
+ * usage history is the least precious thing here and importing a corrupt file would only break the
+ * dashboard. A destination database this migration cannot account for is left alone, because a
+ * newer local database is more useful than an older imported one.
+ */
+async function migrateUsageDatabase(
+  legacyRoot: string,
+  root: string,
+  provenance: ProvenanceDocument,
+  record: (step: MigrationStep) => void
+): Promise<{ copied: boolean; failed: boolean; blockedBy?: string }> {
+  const artifact = `Support file ${USAGE_DATABASE}`;
+  const source = path.join(legacyRoot, USAGE_DATABASE);
+  const destination = path.join(root, USAGE_DATABASE);
+  if (!(await exists(source))) {
+    return { copied: false, failed: false };
+  }
+  if (await exists(destination)) {
+    const entry = provenance.artifacts[USAGE_DATABASE];
+    if (entry && typeof entry.source === "string" && samePath(entry.source, source)) {
+      return { copied: false, failed: false };
+    }
+    record({
+      artifact,
+      state: "skipped",
+      detail:
+        `${destination} already exists and was not produced by this migration, so it was left in `
+        + "place and the previous usage history was not imported.",
+      manual:
+        `Delete ${destination} and reload the window if you would rather have the history from `
+        + `${source}. Account and binding migration is unaffected either way.`
+    });
+    return { copied: false, failed: false };
+  }
+  try {
+    await snapshotUsageDatabase(source, destination);
+  } catch (error) {
+    if (error instanceof UnusableDatabaseError) {
+      record({
+        artifact,
+        state: "failed",
+        detail:
+          `${source} could not be snapshotted consistently: ${error.message}. Nothing was imported `
+          + "and nothing was deleted; only local usage history is affected, and collection starts "
+          + "fresh.",
+        manual:
+          `Keep ${source} if you want that history; nothing else about the upgrade depends on it.`
+      });
+      return { copied: false, failed: true };
+    }
+    // A destination that appeared between the check above and the copy is a race, not a systemic
+    // I/O problem, so it must not halt the account migration.
+    const raced = (error as NodeJS.ErrnoException).code === "EEXIST";
+    record({
+      artifact,
+      state: raced ? "skipped" : "failed",
+      detail: reason(error),
+      manual: raced ? undefined : `Copy ${source} to ${destination} by hand.`
+    });
+    return {
+      copied: false,
+      failed: !raced,
+      blockedBy: raced ? undefined : `${source} could not be read (${reason(error)})`
+    };
+  }
+  await recordProvenance(
+    root,
+    provenance,
+    USAGE_DATABASE,
+    await describeCopy(source, "sqlite-snapshot")
+  );
+  return { copied: true, failed: false };
 }
 
 /**
@@ -996,6 +1565,10 @@ export function summarizeMigration(report: LegacyMigrationReport): string {
   const detail = [...counts.entries()]
     .map(([state, count]) => `${state}: ${count}`)
     .join(", ");
+  if (report.blockedBy) {
+    return `Halted migrating the previous installation because ${report.blockedBy}; nothing was `
+      + `repointed and nothing was deleted (${detail}).`;
+  }
   return `${report.changed ? "Migrated" : "Checked"} the previous installation (${detail}).`;
 }
 

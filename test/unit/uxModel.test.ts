@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
+import { readdirSync, readFileSync } from "node:fs";
 import type { CollectionInput, MenuState } from "../../src/commands/uxModel.js";
 import {
+  activeDisableVariables,
   buildAccountMenu,
   describeBinding,
   describeWrapper,
   diagnoseCollection,
+  LEGACY_COMMAND_ALIASES,
   planFirstRun,
   planWrapperConsent
 } from "../../src/commands/uxModel.js";
+import { FOREIGN_OTEL_VARIABLES } from "../../src/telemetry/otelEnvironment.js";
 
 const WRAPPER_PATH = "C:\\Users\\dev\\AppData\\Local\\ClaudeWorkspaceAccounts\\wrapper\\claude-workspace-accounts-wrapper.exe";
 const DEFAULT_CONFIG_DIR = "C:\\Users\\dev\\.claude";
@@ -20,7 +24,7 @@ function collection(overrides: Partial<CollectionInput> = {}): CollectionInput {
     selectedIsRuntime: true,
     profileTelemetryEnabled: true,
     wrapperState: "guard",
-    foreignOtelExporter: false,
+    foreignOtelVariables: [],
     collectorRegistered: true,
     snapshotSeen: true,
     ...overrides
@@ -160,10 +164,41 @@ describe("diagnoseCollection", () => {
     expect(diagnosis.action).toBe("configure_wrapper");
   });
 
-  it("says it deliberately will not override a user's own OTLP exporter", () => {
-    const diagnosis = diagnoseCollection(collection({ foreignOtelExporter: true }));
+  it("names the user's own OTEL variables rather than blaming the collector", () => {
+    // Two call sites hand-checked four and two variables against the twenty-five the wrapper
+    // refuses to override, so a per-signal protocol or compression setting of the user's own made
+    // the UI report a collector fault instead of the real cause.
+    const diagnosis = diagnoseCollection(collection({
+      foreignOtelVariables: ["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "OTEL_EXPORTER_OTLP_HEADERS"]
+    }));
     expect(diagnosis.state).toBe("partial");
     expect(diagnosis.action).toBe("none");
+    expect(diagnosis.detail).toContain("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL");
+    expect(diagnosis.detail).toContain("OTEL_EXPORTER_OTLP_HEADERS");
+  });
+
+  it("can name every variable the wrapper refuses to override", () => {
+    // A variable the wrapper honours but no surface can name would send the user hunting again.
+    const diagnosis = diagnoseCollection(collection({
+      foreignOtelVariables: [...FOREIGN_OTEL_VARIABLES]
+    }));
+    for (const name of FOREIGN_OTEL_VARIABLES) {
+      expect(diagnosis.detail).toContain(name);
+    }
+  });
+
+  it("reports a storage failure as blocked, with its category", () => {
+    // The phase used to be unreachable: one successful write left `collecting` set forever, so a
+    // database that went read-only, full, locked or corrupt afterwards read as healthy everywhere.
+    const diagnosis = diagnoseCollection(collection({
+      phase: "storage_failed",
+      phaseDetail: "readonly"
+    }));
+    expect(diagnosis.state).toBe("blocked");
+    expect(diagnosis.headline).toBe("Local usage storage is failing");
+    expect(diagnosis.detail).toContain("readonly");
+    expect(diagnosis.detail).toMatch(/frozen/);
+    expect(diagnosis.action).toBe("reload_window");
   });
 
   it("suggests a reload when the collector never registered", () => {
@@ -202,6 +237,142 @@ describe("diagnoseCollection", () => {
   it("distinguishes awaiting data from blocked", () => {
     expect(diagnoseCollection(collection({ snapshotSeen: false })).state).toBe("awaiting_data");
     expect(diagnoseCollection(collection()).state).toBe("active");
+  });
+
+  it("says precisely why quota is missing rather than looking like breakage", () => {
+    // The owner's actual state: `status_snapshots` has no rows because the bridge only runs inside
+    // a Claude session under a bound account, and none had run.
+    const diagnosis = diagnoseCollection(collection({ snapshotSeen: false }));
+    expect(diagnosis.state).toBe("awaiting_data");
+    expect(diagnosis.headline).toBe("No Claude session has run under this account yet");
+    expect(diagnosis.detail).toContain("status line");
+    expect(diagnosis.detail).toContain("Claude.ai subscription accounts");
+    expect(diagnosis.detail).toContain("independently");
+    // Reads as an empty history, not as a defect: there is nothing here for the user to fix.
+    expect(diagnosis.action).toBe("none");
+    expect(diagnosis.detail).toMatch(/nothing has failed/);
+  });
+});
+
+describe("one predicate per question", () => {
+  it("never matches the status-line bridge by substring outside its own module", () => {
+    // Twice now a duplicated string-matching predicate has caused a defect: the legacy wrapper
+    // filename, then `command.includes("statusline-bridge")` in the teardown check, which claims a
+    // user's own `my-statusline-bridge-wrapper.ps1` as ours. `isStatusLineBridgeCommand` tokenises
+    // quote-aware and compares parsed basenames; there must be exactly one of it.
+    const offenders: string[] = [];
+    for (const file of readdirSync(new URL("../../src", import.meta.url), {
+      recursive: true,
+      encoding: "utf8"
+    })) {
+      if (!file.endsWith(".ts") || file.replaceAll("\\", "/").endsWith("statusLineBridgeService.ts")) {
+        continue;
+      }
+      const source = readFileSync(new URL(`../../src/${file}`, import.meta.url), "utf8");
+      for (const [index, line] of source.split(/\r?\n/).entries()) {
+        if (line.trimStart().startsWith("*") || line.trimStart().startsWith("//")) {
+          continue;
+        }
+        if (/(includes|indexOf|startsWith|endsWith|match)\s*\(\s*["'`][^"'`]*statusline-bridge/i
+          .test(line)) {
+          offenders.push(`${file}:${index + 1}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe("the kill switch", () => {
+  it("recognises the v0.1.0 name, which a persistent setx leaves behind", () => {
+    // Nothing can rewrite a machine-scoped setx across a rename, so a stranded
+    // CLAUDE_ACCOUNT_GUARD_DISABLE silently disables per-workspace accounts with no setting
+    // anywhere to explain it. Every surface has to be able to name the one that is set.
+    expect(activeDisableVariables({})).toEqual([]);
+    expect(activeDisableVariables({ CLAUDE_WORKSPACE_ACCOUNTS_DISABLE: "1" }))
+      .toEqual(["CLAUDE_WORKSPACE_ACCOUNTS_DISABLE"]);
+    expect(activeDisableVariables({ CLAUDE_ACCOUNT_GUARD_DISABLE: "1" }))
+      .toEqual(["CLAUDE_ACCOUNT_GUARD_DISABLE"]);
+    expect(activeDisableVariables({
+      CLAUDE_WORKSPACE_ACCOUNTS_DISABLE: "1",
+      CLAUDE_ACCOUNT_GUARD_DISABLE: "1"
+    })).toEqual(["CLAUDE_WORKSPACE_ACCOUNTS_DISABLE", "CLAUDE_ACCOUNT_GUARD_DISABLE"]);
+  });
+
+  it("treats an exported-but-blank value as unset", () => {
+    expect(activeDisableVariables({ CLAUDE_ACCOUNT_GUARD_DISABLE: "" })).toEqual([]);
+    expect(activeDisableVariables({ CLAUDE_ACCOUNT_GUARD_DISABLE: "  " })).toEqual([]);
+  });
+});
+
+describe("legacy command aliases", () => {
+  const manifest = JSON.parse(readFileSync(
+    new URL("../../package.json", import.meta.url),
+    "utf8"
+  )) as { contributes: { commands: Array<{ command: string }>; configuration: {
+    properties: Record<string, { default?: unknown; description?: string }>;
+  } } };
+
+  it("covers every command ID the 0.1.0 release shipped", () => {
+    // Dropping them was judged harmless because the new listing carries no upgrade path — but a
+    // keybinding, task, or command URI naming an old ID fails with "command not found", which
+    // reads as a broken extension rather than a rename.
+    for (const legacy of [
+      "openMenu",
+      "configureWrapper",
+      "disableWrapper",
+      "removeAllData",
+      "enableUsageCollection",
+      "openDashboard",
+      "addProfile",
+      "registerCurrentProfile",
+      "switchProfile",
+      "lockWorkspace",
+      "unlockWorkspace",
+      "bindTerminal",
+      "updateExpectedIdentity",
+      "verifyAccount",
+      "login",
+      "manageProfiles",
+      "diagnostics",
+      "deleteUsageData",
+      "exportUsage"
+    ]) {
+      expect(LEGACY_COMMAND_ALIASES).toHaveProperty(`claudeAccountGuard.${legacy}`);
+    }
+  });
+
+  it("maps the two commands that were renamed as well as re-namespaced", () => {
+    expect(LEGACY_COMMAND_ALIASES["claudeAccountGuard.lockWorkspace"])
+      .toBe("claudeAccounts.bindWorkspace");
+    expect(LEGACY_COMMAND_ALIASES["claudeAccountGuard.unlockWorkspace"])
+      .toBe("claudeAccounts.unbindWorkspace");
+  });
+
+  it("only ever targets a command the manifest contributes", () => {
+    const contributed = new Set(manifest.contributes.commands.map((entry) => entry.command));
+    for (const [legacy, current] of Object.entries(LEGACY_COMMAND_ALIASES)) {
+      expect(legacy.startsWith("claudeAccountGuard.")).toBe(true);
+      expect(contributed, legacy).toContain(current);
+    }
+  });
+
+  it("keeps the aliases out of the Command Palette", () => {
+    // Contributing them would put nineteen duplicate entries in the palette under a name the
+    // product no longer uses. They are registered only.
+    for (const entry of manifest.contributes.commands) {
+      expect(entry.command.startsWith("claudeAccounts.")).toBe(true);
+    }
+  });
+
+  it("does not default to a bind mode whose distinguishing behaviour cannot occur", () => {
+    // `enforce` only differs from `warn` when Claude returns a comparable identity, which it never
+    // does for a bound account on this CLI, so defaulting to it promised enforcement that is
+    // structurally impossible.
+    const setting = manifest.contributes.configuration.properties["claudeAccounts.defaultBindMode"];
+    expect(setting?.default).toBe("warn");
+    expect(setting?.description).toMatch(/behaves exactly like/i);
+    expect(setting?.description).toMatch(/CLAUDE_CONFIG_DIR/);
   });
 });
 

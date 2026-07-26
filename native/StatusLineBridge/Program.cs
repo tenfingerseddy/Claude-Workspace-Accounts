@@ -334,6 +334,16 @@ namespace ClaudeWorkspaceAccounts.StatusLineBridge
                     ".claude-workspace-accounts",
                     "statusline-next.json"
                 ));
+                // The same file under the name v0.1.0 wrote it. The rename migration moves this
+                // directory, but it records "failed" when it can neither rename nor copy - and in
+                // that state the legacy directory is the only copy of the user's previous status
+                // line. Read-only, and last of the per-profile locations, so a migrated directory
+                // always wins.
+                locations.Add(SafeCombine(
+                    configDirectory,
+                    ".claude-account-guard",
+                    "statusline-next.json"
+                ));
             }
             string profileId = GuardValues.Text(profile, "id");
             if (!GuardValues.IsBlank(profileId))

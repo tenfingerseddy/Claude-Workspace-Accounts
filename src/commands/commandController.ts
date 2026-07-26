@@ -31,6 +31,7 @@ import type {
   StatusLineBridgeService,
   StatusLineUninstallResult
 } from "../telemetry/statusLineBridgeService.js";
+import { isStatusLineBridgeCommand } from "../telemetry/statusLineBridgeService.js";
 import type { WrapperIntegrationService } from "../wrapper/wrapperIntegrationService.js";
 import type {
   BindingChange,
@@ -44,10 +45,13 @@ import type {
   WrapperConsent,
   WrapperState
 } from "./uxModel.js";
+import { detectForeignOtelConfiguration } from "../telemetry/otelEnvironment.js";
 import {
   buildAccountMenu,
   diagnoseCollection,
   DISABLE_ENVIRONMENT_VARIABLE,
+  LEGACY_COMMAND_ALIASES,
+  LEGACY_DISABLE_ENVIRONMENT_VARIABLE,
   planFirstRun,
   planStatusLineTeardown,
   planSupportFileRemoval,
@@ -146,6 +150,21 @@ export class CommandController {
     ];
     for (const [command, handler] of registrations) {
       this.context.subscriptions.push(vscode.commands.registerCommand(command, handler));
+    }
+    // Old IDs stay callable. They are not in `contributes.commands`, so they never appear in the
+    // Command Palette, but a keybinding, task, or command URI written against v0.1.0 keeps working
+    // instead of failing with "command not found".
+    const registered = new Set(registrations.map(([command]) => command));
+    for (const [legacy, current] of Object.entries(LEGACY_COMMAND_ALIASES)) {
+      if (!registered.has(current)) {
+        // A typo in the alias table would otherwise register a command that throws when invoked.
+        this.log(`Legacy command alias ${legacy} names an unregistered command ${current}.`);
+        continue;
+      }
+      this.context.subscriptions.push(vscode.commands.registerCommand(
+        legacy,
+        (...args: unknown[]) => vscode.commands.executeCommand(current, ...args)
+      ));
     }
     void this.updateContextKeys();
   }
@@ -353,12 +372,11 @@ export class CommandController {
       selectedIsRuntime: Boolean(selected) && selected?.id === active?.id,
       profileTelemetryEnabled: selected?.telemetryEnabled === true,
       wrapperState: this.wrapperState(),
-      foreignOtelExporter: Boolean(
-        process.env.OTEL_EXPORTER_OTLP_ENDPOINT
-        || process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-        || process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
-        || process.env.OTEL_EXPORTER_OTLP_HEADERS
-      ),
+      // The one shared detector, not a hand-written subset of it. Four variables were checked here
+      // against the twenty-five the wrapper actually refuses to override, so a user whose own
+      // per-signal protocol or compression setting stopped injection was told the collector had
+      // failed. Names only — a headers variable holds a bearer token.
+      foreignOtelVariables: detectForeignOtelConfiguration().variables,
       collectorRegistered: Boolean(collector),
       snapshotSeen: Boolean(selected && this.repository.latestStatusSnapshot(selected.id)),
       lastEventAt: health.lastEventAt
@@ -394,6 +412,11 @@ export class CommandController {
   private phaseDetail(health: CollectionHealth | undefined): string | undefined {
     if (!health) {
       return undefined;
+    }
+    // The storage category is the whole diagnosis for a storage failure — "locked" and "disk_full"
+    // need different actions — so it wins for that phase instead of losing to a rejection count.
+    if (health.phase === "storage_failed") {
+      return health.storage.lastFailureCategory;
     }
     const worst = [...health.requests.rejections, ...health.inbox.quarantines]
       .sort((left, right) => right.count - left.count)[0];
@@ -550,7 +573,7 @@ export class CommandController {
 
     if (plan.kind === "ask" || plan.kind === "previously_declined") {
       const choice = await vscode.window.showInformationMessage(
-        `${reason}\n\nTo do that, Workspace Accounts changes one global VS Code setting that belongs to the Claude Code extension:\n\n${this.wrapperSummary()}\n\nClaude Code then starts through Workspace Accounts, which sets this workspace's account and then launches Claude unchanged. Undo it any time with “Claude Workspace Accounts: Disconnect From Claude Code”, or set ${DISABLE_ENVIRONMENT_VARIABLE}=1 in your environment to bypass it entirely.`,
+        `${reason}\n\nTo do that, Workspace Accounts changes one global VS Code setting that belongs to the Claude Code extension:\n\n${this.wrapperSummary()}\n\nClaude Code then starts through Workspace Accounts, which sets this workspace's account and then launches Claude unchanged. Undo it any time with “Claude Workspace Accounts: Disconnect From Claude Code”, or set ${DISABLE_ENVIRONMENT_VARIABLE}=1 in your environment to bypass it entirely (${LEGACY_DISABLE_ENVIRONMENT_VARIABLE}=1, the name used up to v0.1.0, still works too).`,
         { modal: true },
         "Connect To Claude Code",
         "Not Now"
@@ -941,6 +964,12 @@ export class CommandController {
    *
    * An unreadable settings file counts as "still there": the safe assumption is the one that
    * keeps the files the status line needs.
+   *
+   * The predicate is the shared one, not a substring test of its own. This carried a second copy
+   * of `substring`-matching \u2014 `includes("statusline-bridge")` \u2014 which claims a user's own
+   * `pwsh my-statusline-bridge-wrapper.ps1` as ours. That is the second duplicated
+   * filename-matching predicate to cause a defect here, after the legacy wrapper filename, so
+   * there is exactly one now: it tokenises quote-aware and compares parsed basenames.
    */
   private async guardStatusLineRemains(profile: AccountProfile): Promise<boolean> {
     try {
@@ -948,10 +977,9 @@ export class CommandController {
       const parsed = JSON.parse(raw.replace(/^\uFEFF/, "")) as {
         statusLine?: { command?: unknown };
       };
-      const command = typeof parsed.statusLine?.command === "string"
-        ? parsed.statusLine.command.toLowerCase()
-        : "";
-      return command.includes("claude-workspace-accounts") || command.includes("statusline-bridge");
+      return isStatusLineBridgeCommand(
+        typeof parsed.statusLine?.command === "string" ? parsed.statusLine.command : undefined
+      );
     } catch (failure) {
       return (failure as NodeJS.ErrnoException).code !== "ENOENT";
     }
@@ -2020,7 +2048,7 @@ export class CommandController {
 
   private async deleteUsageData(): Promise<void> {
     const confirmed = await vscode.window.showWarningMessage(
-      "Delete all locally collected usage, status snapshots, and diagnostics? Profiles, workspace locks, Claude settings, and credentials are not deleted.",
+      "Delete all locally collected usage, status snapshots, and diagnostics? Accounts, workspace bindings, Claude settings, and credentials are not deleted.",
       { modal: true },
       "Delete Usage Data"
     );

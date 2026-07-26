@@ -282,6 +282,55 @@ try {
   } catch {
     failures.push("CLAUDE_WORKSPACE_ACCOUNTS_DISABLE=1 still forwards arguments intact: no vector written");
   }
+
+  // The same escape hatch under the name v0.1.0 documented and shipped. A persistent `setx`
+  // value or a checked-in workspace `terminal.integrated.env.windows` entry survives an
+  // extension rename, so both names bypass the guard permanently.
+  await rm(disabledDump, { force: true });
+  const legacyDisabled = spawnSync(WRAPPER, [argDump, "--print", "-p", "hello world", "--verbose"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      LOCALAPPDATA: directory,
+      CLAUDE_CONFIG_DIR: "C:\\profiles\\mismatched",
+      CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY: "0123456789abcdef",
+      CLAUDE_WORKSPACE_ACCOUNTS_DISABLE: undefined,
+      CLAUDE_ACCOUNT_GUARD_DISABLE: "1",
+      ARGDUMP_OUT: disabledDump
+    },
+    windowsHide: true,
+    encoding: "utf8"
+  });
+  check(
+    "CLAUDE_ACCOUNT_GUARD_DISABLE=1 bypasses the guard",
+    legacyDisabled.status === 0,
+    `status ${legacyDisabled.status}, `
+      + `stderr ${JSON.stringify((legacyDisabled.stderr ?? "").slice(0, 300))}`
+  );
+  try {
+    check(
+      "CLAUDE_ACCOUNT_GUARD_DISABLE=1 still forwards arguments intact",
+      JSON.stringify(JSON.parse(await readFile(disabledDump, "utf8")))
+        === JSON.stringify(["--print", "-p", "hello world", "--verbose"])
+    );
+  } catch {
+    failures.push("CLAUDE_ACCOUNT_GUARD_DISABLE=1 still forwards arguments intact: no vector written");
+  }
+
+  // A malformed invocation is a launch failure with its own exit code, not the guard's refusal.
+  const emptyInvocation = spawnSync(WRAPPER, [], {
+    cwd: process.cwd(),
+    env: { ...process.env, LOCALAPPDATA: directory },
+    windowsHide: true,
+    encoding: "utf8"
+  });
+  check(
+    "an empty invocation does not exit with the guard's blocked code",
+    emptyInvocation.status === 64
+      && !(emptyInvocation.stderr ?? "").includes("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED"),
+    `status ${emptyInvocation.status}, `
+      + `stderr ${JSON.stringify((emptyInvocation.stderr ?? "").slice(0, 300))}`
+  );
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

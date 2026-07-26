@@ -1,12 +1,14 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import type {
+  CollectionHealth,
   DashboardData,
   DashboardDateBounds,
   DashboardRange,
+  QuotaReport,
   SharedRegistryDocument
 } from "../core/models.js";
-import { bindingIdentityState } from "../core/statusState.js";
+import { bindingIdentityState, buildQuotaReport } from "../core/statusState.js";
 import type { CollectionDiagnosis, WrapperState } from "../commands/uxModel.js";
 import type { BindingIdentityState } from "../core/statusState.js";
 import type { WorkspaceLockService } from "../locks/workspaceLockService.js";
@@ -29,6 +31,20 @@ export interface DashboardActions {
 }
 
 interface DashboardPayload extends DashboardData {
+  /**
+   * The headline. Claude's own plan-headroom figures, derived by the one shared function so the
+   * dashboard, the status bar and diagnostics cannot disagree about what Claude said or how old
+   * the reading is. Everything else on this page is locally accumulated and therefore secondary:
+   * it starts when the extension is installed and measures nothing about the plan.
+   */
+  quota: QuotaReport;
+  /** Whether local usage storage is currently refusing writes, and why. */
+  storage: {
+    failing: boolean;
+    category?: string;
+    lastFailureAt?: string;
+    lastSuccessfulWriteAt?: string;
+  };
   setup: {
     /** How the bound account's identity compares with the one recorded for it. */
     identityState: BindingIdentityState;
@@ -108,7 +124,7 @@ export class DashboardProvider implements vscode.Disposable {
     if (!this.panel) {
       this.panel = vscode.window.createWebviewPanel(
         "claudeAccounts.usage",
-        "Claude Account Usage",
+        "Claude Quota and Usage",
         vscode.ViewColumn.Active,
         {
           enableScripts: true,
@@ -229,6 +245,20 @@ export class DashboardProvider implements vscode.Disposable {
     }
   }
 
+  /** Degrades to "no phase reported" rather than failing the whole panel. */
+  private collectionHealth(profileId?: string): CollectionHealth | undefined {
+    try {
+      return this.repository.collectionHealth(profileId, {
+        telemetryEnabled: vscode.workspace.getConfiguration("claudeAccounts")
+          .get<boolean>("telemetry.enabled", true),
+        runtimeProfileRegistered: Boolean(profileId)
+      });
+    } catch (error) {
+      this.log(`Collection health unavailable: ${error instanceof Error ? error.message : "unknown error"}`);
+      return undefined;
+    }
+  }
+
   private async buildData(): Promise<DashboardPayload> {
     const document = await this.registry.read();
     const runtime = this.runtimeDetector.detect(document.profiles);
@@ -259,8 +289,22 @@ export class DashboardProvider implements vscode.Disposable {
     const current = selected ? this.repository.latestStatusSnapshot(selected.id) : undefined;
     const health = selected ? this.repository.collectorHealth(selected.id) : {};
     const lastEventAge = health.lastEventAt ? Date.now() - Date.parse(health.lastEventAt) : Infinity;
+    const detailed = this.collectionHealth(selected?.id);
 
     return {
+      quota: buildQuotaReport({
+        snapshot: current,
+        warningThreshold: vscode.workspace.getConfiguration("claudeAccounts")
+          .get<number>("usage.warningThreshold", 70),
+        criticalThreshold: vscode.workspace.getConfiguration("claudeAccounts")
+          .get<number>("usage.criticalThreshold", 90)
+      }),
+      storage: {
+        failing: detailed?.phase === "storage_failed",
+        category: detailed?.storage.lastFailureCategory,
+        lastFailureAt: detailed?.storage.lastFailureAt,
+        lastSuccessfulWriteAt: detailed?.storage.lastSuccessfulWriteAt
+      },
       generatedAt: new Date().toISOString(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       selectedProfileId: selected?.id,
@@ -360,7 +404,7 @@ export class DashboardProvider implements vscode.Disposable {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
-  <title>Claude Account Usage</title>
+  <title>Claude Quota and Usage</title>
   <style nonce="${nonce}">
     :root {
       color-scheme: light dark;
@@ -475,6 +519,13 @@ export class DashboardProvider implements vscode.Disposable {
     .provenance { justify-content: space-between; flex-wrap: wrap; border-top: 1px solid var(--vscode-panel-border); padding-top: 13px; margin-top: 16px; }
     .spaced { margin-top: 16px; }
     .table-scroll { overflow-x: auto; }
+    .quota-lead { margin-bottom: 18px; }
+    .quota-lead h2 { margin: 0; font-size: 17px; }
+    .quota-lead .metric-row { margin-bottom: 12px; }
+    .quota-lead .metric { font-size: 30px; }
+    /* Secondary by construction: local history is collapsed so quota is what the page is about. */
+    details.secondary { margin-top: 22px; border-top: 1px solid var(--vscode-panel-border); padding-top: 12px; }
+    details.secondary > summary { font-weight: 600; color: var(--vscode-foreground); }
     @media (max-width: 720px) {
       .summary, .secondary-grid, .lower { grid-template-columns: 1fr; }
       .toolbar { width: 100%; flex-wrap: wrap; }
@@ -501,17 +552,6 @@ export class DashboardProvider implements vscode.Disposable {
       return (value / 3600).toFixed(1) + 'h';
     };
     const when = (value, timezone) => value ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short', timeZone: timezone }).format(new Date(value)) : 'Never';
-    const until = (value) => {
-      if (!value) return 'countdown unavailable';
-      const milliseconds = new Date(value).getTime() - Date.now();
-      if (!Number.isFinite(milliseconds)) return 'countdown unavailable';
-      if (milliseconds <= 0) return 'reset due';
-      const minutes = Math.ceil(milliseconds / 60000);
-      if (minutes < 60) return 'in ' + minutes + 'm';
-      const hours = Math.floor(minutes / 60);
-      const remainder = minutes % 60;
-      return 'in ' + hours + 'h' + (remainder ? ' ' + remainder + 'm' : '');
-    };
     const pctClass = (value, warning, critical) => value >= critical ? 'critical' : value >= warning ? 'warning' : '';
     const profile = (data) => data.profiles.find((item) => item.id === data.selectedProfileId);
     const aggregateDays = (rows) => {
@@ -528,23 +568,34 @@ export class DashboardProvider implements vscode.Disposable {
       }
       return [...map.values()].sort((a,b) => a.day.localeCompare(b.day));
     };
-    const quotaCard = (label, window, data) => {
-      const snapshot = data.current;
-      const limit = snapshot?.rateLimits?.[window];
-      const stale = snapshot && Date.now() - Date.parse(snapshot.capturedAt) > 15 * 60 * 1000;
-      if (!limit) {
-        const state = snapshot ? 'Awaiting first supported response' : 'Usage unavailable';
-        const detail = snapshot ? 'Claude has not exposed this subscription window.' : 'No graphical status snapshot has been collected.';
-        return \`<section class="card hero"><div class="metric-row"><h2>\${esc(label)}</h2><span class="badge">\${esc(state)}</span></div><div class="empty">\${esc(detail)}</div><div class="meta">Source · Claude status snapshot</div></section>\`;
-      }
-      const used = Math.max(0, Math.min(100, Number(limit.usedPercentage)));
-      const reset = limit.resetsAt ? new Date(limit.resetsAt * 1000).toISOString() : undefined;
-      return \`<section class="card hero">
-        <div class="metric-row"><h2>\${esc(label)}</h2>\${stale ? '<span class="badge warning">Stale</span>' : '<span class="badge">Exact</span>'}</div>
-        <div class="metric-row"><span class="metric">\${Math.round(used)}% used</span><span>\${Math.round(100-used)}% remaining</span></div>
-        <progress class="\${pctClass(used, data.thresholds.usageWarning, data.thresholds.usageCritical)}" max="100" value="\${used}" aria-label="\${esc(label)}: \${used}% used"></progress>
-        <div class="meta">Resets \${esc(reset ? when(reset, data.timezone) : 'not supplied')} · \${esc(until(reset))} · Updated \${esc(when(snapshot.capturedAt, data.timezone))}</div>
-        <div class="meta">Source · Claude status snapshot · Exact when present · Local alerts at \${num(data.thresholds.usageWarning)}% / \${num(data.thresholds.usageCritical)}%</div>
+    // Quota is the headline: Claude's own figure, with the headroom left, when it resets, and how
+    // old the reading is. A percentage without its age is not a measurement, and an absent window
+    // is stated as absent — never as 0%.
+    const quotaCard = (reading, data) => \`<section class="card hero">
+        <div class="metric-row"><h2>\${esc(reading.label)}</h2><span class="badge \${reading.severity === 'critical' ? 'error' : reading.severity === 'warning' ? 'warning' : ''}">\${reading.expired ? 'Window has reset' : data.quota.freshness === 'stale' ? 'Stale reading' : 'Reported by Claude'}</span></div>
+        <div class="metric-row"><span class="metric">\${Math.round(reading.remainingPercentage)}% left</span><span>\${Math.round(reading.usedPercentage)}% used</span></div>
+        <progress class="\${pctClass(reading.usedPercentage, data.thresholds.usageWarning, data.thresholds.usageCritical)}" max="100" value="\${reading.usedPercentage}" aria-label="\${esc(reading.label)}: \${Math.round(reading.usedPercentage)}% used, \${Math.round(reading.remainingPercentage)}% remaining"></progress>
+        <div class="meta">\${reading.resetsAtIso ? 'Resets ' + esc(when(reading.resetsAtIso, data.timezone)) + ' · ' + esc(reading.expired ? 'due now' : reading.resetsInLabel) : 'Claude did not report a reset time for this window'}</div>
+        <div class="meta">Reading taken \${esc(data.quota.capturedAt ? when(data.quota.capturedAt, data.timezone) : 'unknown')}\${data.quota.ageLabel ? ' · ' + esc(data.quota.ageLabel) : ''}\${data.quota.freshness === 'stale' ? ' · Claude has not refreshed it since, so this may not be current headroom' : ''}</div>
+        <div class="meta">Claude's own figure · Local alerts at \${num(data.thresholds.usageWarning)}% / \${num(data.thresholds.usageCritical)}% used, which are this extension's preferences and not Anthropic policy</div>
+      </section>\`;
+    const quotaAbsentCard = (entry) => \`<section class="card hero">
+        <div class="metric-row"><h2>\${esc(entry.label)}</h2><span class="badge">Not reported</span></div>
+        <div class="empty">\${esc(entry.detail)}</div>
+      </section>\`;
+    const quotaSection = (data) => {
+      const cards = [
+        ...data.quota.windows.map((reading) => quotaCard(reading, data)),
+        ...data.quota.absent.map(quotaAbsentCard)
+      ].join('');
+      const storage = data.storage.failing
+        ? \`<div class="lockline error"><strong>Local usage storage is failing\${data.storage.category ? ' (' + esc(data.storage.category) + ')' : ''}</strong><div class="meta">Nothing has been written since\${data.storage.lastFailureAt ? ' ' + esc(when(data.storage.lastFailureAt, data.timezone)) : ''}, so any figure on this page may be frozen. Account switching and workspace bindings are unaffected.</div></div>\`
+        : '';
+      return \`<section class="quota-lead">
+        <div class="metric-row"><h2>Plan quota, as reported by Claude</h2><span class="badge">\${data.quota.windows.length ? 'Live from Claude' : 'Awaiting Claude'}</span></div>
+        \${storage}
+        <div class="grid summary">\${cards}</div>
+        <div class="disclaimer">These two windows are all Claude exposes to a status line, so they are all Workspace Accounts can show. Per-model quotas — a Sonnet-only or Opus-only weekly window — and extra-usage credit pools exist, but only inside a private endpoint the official extension calls; they never reach a third-party extension, and Workspace Accounts will not guess at them from token counts.</div>
       </section>\`;
     };
     const activity = (days) => {
@@ -599,7 +650,7 @@ export class DashboardProvider implements vscode.Disposable {
     function render(data) {
       const selected = profile(data);
       if (!selected) {
-        app.innerHTML = \`<div class="empty"><div><h1>Nothing is being collected yet</h1>
+        app.innerHTML = \`<div class="empty"><div><h1>Claude has not reported any quota yet</h1>
           <p>\${esc(data.setup.collection.headline)}</p>
           <p class="meta">\${esc(data.setup.collection.detail)}</p>
           \${data.setup.collection.actionLabel ? '<p><button id="collection-action">'+esc(data.setup.collection.actionLabel)+'</button></p>' : ''}
@@ -643,11 +694,11 @@ export class DashboardProvider implements vscode.Disposable {
           </div>
         </header>
         \${setupBanner}
+        \${quotaSection(data)}
         \${lock}
-        <div class="grid summary">
-          \${quotaCard('Five-hour window', 'fiveHour', data)}
-          \${quotaCard('Seven-day window', 'sevenDay', data)}
-        </div>
+        <details class="secondary" \${data.quota.windows.length ? '' : 'open'}>
+        <summary>Locally collected detail — tokens, cost, tools, and daily history since Workspace Accounts was installed</summary>
+        <div class="disclaimer">None of the numbers below measure plan headroom. They are this extension's own observations of Claude Code, they begin when it was installed, and they are shown because they are occasionally useful — not because they say anything about your quota.</div>
         <section class="card spaced">
           <div class="metric-row"><h2>Current session context</h2><span class="badge">\${current ? 'Locally observed' : 'Unavailable'}</span></div>
           \${current ? \`<div class="context-labels"><span><strong>\${esc(current.modelDisplayName || current.modelId || 'Unknown model')}</strong> · \${esc(current.effort || 'default')} effort\${current.thinkingEnabled ? ' · thinking on' : ''}</span><span>\${used == null ? 'Usage unavailable' : Math.round(used)+'% used · '+Math.round(current.contextWindow?.remainingPercentage ?? Math.max(0, 100-used))+'% remaining'}</span></div>
@@ -699,7 +750,8 @@ export class DashboardProvider implements vscode.Disposable {
           <div class="mini"><div class="meta">Commits</div><div class="metric">\${num(totals.commits)}</div></div>
           <div class="mini"><div class="meta">Pull requests</div><div class="metric">\${num(totals.prs)}</div></div>
         </div><div class="disclaimer">Activity is not a measure of code quality or developer performance.</div></section>
-        <footer class="provenance"><div><strong>\${esc(data.setup.collection.headline)}</strong><div class="meta">\${esc(data.setup.collection.detail)}</div><div class="meta">Account in play · \${esc(data.setup.runtimeRegistered ? ((data.profiles.find(p => p.id === data.runtimeProfileId)?.displayName || 'known') + (data.setup.boundProfileName ? ' (this workspace)' : ' (default)')) : 'not tracked ('+data.setup.runtimeConfigDir+')')} · Status-line bridge for that account · \${data.setup.profileTelemetryEnabled ? 'installed' : 'not installed'} · Claude Code integration · \${esc(data.setup.wrapperState === 'guard' ? 'on' : data.setup.wrapperState === 'foreign' ? 'another wrapper' : 'off')}</div><div class="meta">\${esc(data.collection.source)} · Last event \${esc(when(data.collection.lastEventAt, data.timezone))} · Times shown in \${esc(data.timezone)}</div></div><button class="secondary" id="export">Export local data</button></footer>
+        </details>
+        <footer class="provenance"><div><strong>\${esc(data.setup.collection.headline)}</strong><div class="meta">\${esc(data.setup.collection.detail)}</div><div class="meta">Account in play · \${esc(data.setup.runtimeRegistered ? ((data.profiles.find(p => p.id === data.runtimeProfileId)?.displayName || 'known') + (data.setup.boundProfileName ? ' (this workspace)' : ' (default)')) : 'not tracked ('+data.setup.runtimeConfigDir+')')} · Status-line bridge for that account · \${data.setup.profileTelemetryEnabled ? 'installed' : 'not installed'} · Claude Code integration · \${esc(data.setup.wrapperState === 'guard' ? 'on' : data.setup.wrapperState === 'foreign' ? 'another wrapper' : 'off')}</div><div class="meta">Quota · reported by Claude, never calculated here · Local detail · \${esc(data.collection.source)} · Last local event \${esc(when(data.collection.lastEventAt, data.timezone))} · Times shown in \${esc(data.timezone)}</div></div><button class="secondary" id="export">Export local data</button></footer>
       \`;
       document.getElementById('profile-select')?.addEventListener('change', event => vscode.postMessage({ type: 'setProfile', profileId: event.target.value }));
       document.getElementById('range-select')?.addEventListener('change', event => vscode.postMessage({ type: 'setRange', range: event.target.value }));
@@ -757,7 +809,7 @@ export class DashboardProvider implements vscode.Disposable {
     const renderError = (message) => {
       app.innerHTML = \`<div class="empty"><div><h1>The usage dashboard could not be built</h1>
         <p class="meta">\${esc(message || 'Unknown error')}</p>
-        <p class="meta">Local usage storage or the account registry could not be read. Account switching and workspace locks are unaffected.</p>
+        <p class="meta">Local usage storage or the account registry could not be read. Account switching and workspace bindings are unaffected.</p>
         <p><button id="retry">Try again</button></p>
         <p class="meta">Run “Claude Workspace Accounts: Show Diagnostics” for a redacted report.</p>
       </div></div>\`;

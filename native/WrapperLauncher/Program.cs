@@ -234,6 +234,7 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
         private readonly WorkspaceBinding binding;
         private readonly string telemetryProfileId;
         private readonly string category;
+        private readonly bool bypassed;
 
         public GuardResolution(
             JsonValue registry,
@@ -241,11 +242,23 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
             string telemetryProfileId,
             string category
         )
+            : this(registry, binding, telemetryProfileId, category, false)
+        {
+        }
+
+        private GuardResolution(
+            JsonValue registry,
+            WorkspaceBinding binding,
+            string telemetryProfileId,
+            string category,
+            bool bypassed
+        )
         {
             this.registry = registry;
             this.binding = binding;
             this.telemetryProfileId = telemetryProfileId;
             this.category = category;
+            this.bypassed = bypassed;
         }
 
         /// <summary>The validated registry, or null when there was none to read.</summary>
@@ -275,9 +288,26 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
             get { return category; }
         }
 
+        /// <summary>
+        /// True only for the kill switch. <c>CLAUDE_WORKSPACE_ACCOUNTS_DISABLE=1</c> - or the name
+        /// v0.1.0 shipped - has to make the wrapper a pure passthrough: no binding, no probe, and
+        /// not one environment variable of ours, including the content-telemetry flags forced off on
+        /// every other path. An escape hatch that still edits the environment cannot be used to
+        /// escape a defect in the way this wrapper edits the environment.
+        /// </summary>
+        public bool Bypassed
+        {
+            get { return bypassed; }
+        }
+
         public static GuardResolution Unbound(JsonValue registry, string profileId, string category)
         {
             return new GuardResolution(registry, null, profileId, category);
+        }
+
+        public static GuardResolution KillSwitch()
+        {
+            return new GuardResolution(null, null, null, null, true);
         }
     }
 
@@ -305,7 +335,27 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
     internal static class Program
     {
         private const int GuardExitCode = 78;
+
+        /// <summary>
+        /// Nothing to launch: a usage error in how the wrapper itself was invoked. Deliberately not
+        /// the guard's own exit code, because <c>78</c> and the blocked marker mean one thing - an
+        /// identity mismatch a user has to resolve - and a diagnostics reader that saw them here
+        /// would report a refusal the guard never made.
+        /// </summary>
+        private const int InvocationExitCode = 64;
+
         private const string DisableVariable = "CLAUDE_WORKSPACE_ACCOUNTS_DISABLE";
+
+        /// <summary>
+        /// The kill switch v0.1.0 documented and shipped, under the product's old name.
+        ///
+        /// A permanent alias, not a courtesy. A persistent <c>setx</c> value or a checked-in
+        /// workspace <c>terminal.integrated.env.windows</c> entry survives a rename and no migration
+        /// can reach either, so honouring only the new name left a user who had set the documented
+        /// escape hatch believing the wrapper was bypassed while binding and telemetry were quietly
+        /// active again. Either name, set to <c>1</c>, bypasses everything.
+        /// </summary>
+        private const string LegacyDisableVariable = "CLAUDE_ACCOUNT_GUARD_DISABLE";
         private const string WorkspaceKeyVariable = "CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY";
         private const string ConfigDirectoryVariable = "CLAUDE_CONFIG_DIR";
         private const string SecureStorageDirectoryVariable = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
@@ -357,13 +407,11 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
         public static int Main(string[] args)
         {
             // An empty vector is the only input with nothing to forward, so it is the only
-            // input the wrapper itself can be blamed for.
+            // input the wrapper itself can be blamed for. Reported as an ordinary launch failure:
+            // the guard has made no decision here and must not appear to have made one.
             if (args.Length == 0 || string.IsNullOrWhiteSpace(args[0]))
             {
-                return Block(
-                    "binary_missing",
-                    "The Claude process wrapper did not receive the bundled Claude executable."
-                );
+                return InvalidInvocation();
             }
 
             LaunchTarget target;
@@ -373,18 +421,15 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
             }
             catch (Exception)
             {
-                return Block(
-                    "binary_missing",
-                    "The Claude process wrapper did not receive the bundled Claude executable."
-                );
+                return InvalidInvocation();
             }
 
             // An explicit kill switch: the guard steps aside completely - no binding, no
-            // probe, no telemetry - so a user is never one wrapper defect away from being
-            // unable to start Claude.
+            // probe, no telemetry, not one environment variable of ours - so a user is never one
+            // wrapper defect away from being unable to start Claude.
             if (IsGuardDisabled())
             {
-                return Forward(target, GuardResolution.Unbound(null, null, null), "launch_failed");
+                return Forward(target, GuardResolution.KillSwitch(), "launch_failed");
             }
 
             // Claude Code also configures the wrapper with no CLI at all, in which case the
@@ -420,10 +465,15 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
 
         private static bool IsGuardDisabled()
         {
+            return IsSetToOne(DisableVariable) || IsSetToOne(LegacyDisableVariable);
+        }
+
+        private static bool IsSetToOne(string name)
+        {
             try
             {
                 return string.Equals(
-                    Environment.GetEnvironmentVariable(DisableVariable),
+                    Environment.GetEnvironmentVariable(name),
                     "1",
                     StringComparison.Ordinal
                 );
@@ -443,6 +493,11 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
             string currentDirectory = GuardPaths.Normalize(Directory.GetCurrentDirectory());
             string registryPath = GuardSupport.RegistryPath;
             string cachePath = GuardSupport.Combine("binding-cache.json");
+            // Before anything decides whether the cache will be read or written at all: a cache
+            // written by an earlier release recorded literal workspace directories, and several of
+            // the paths below - a missing registry above all - touch the cache nowhere else, so a
+            // purge anywhere later would leave those paths on disk indefinitely.
+            BindingCache.PurgeLiteralPaths(cachePath);
 
             if (registryPath == null || !File.Exists(registryPath))
             {
@@ -768,6 +823,18 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
             string launchFailureCategory
         )
         {
+            // First, and outside the injection path entirely. The five content flags used to be set
+            // only where a collector registration was successfully injected, so every early return
+            // out of that method - no registry, no registration, a stale one, telemetry off for the
+            // profile or globally - forwarded whatever the environment happened to carry. With an
+            // inherited CLAUDE_CODE_ENABLE_TELEMETRY=1 and no endpoint configured, OTLP falls back
+            // to its default localhost endpoint, so an inherited OTEL_LOG_USER_PROMPTS=1 exported
+            // prompt and response content to whatever was listening there.
+            if (!resolution.Bypassed)
+            {
+                ForceContentTelemetryOff();
+            }
+
             try
             {
                 ApplyCollectorEnvironment(resolution.Registry, resolution.TelemetryProfileId);
@@ -840,9 +907,11 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
         /// than a minute is treated as dead, the profile and the integration must both have
         /// telemetry enabled, and a user who has configured any part of their own OTEL pipeline
         /// keeps all of it - the guard will not silently redirect their telemetry, and will not
-        /// inject half a configuration over a wire format it cannot satisfy. The five content
-        /// flags are forced off unconditionally so prompts, responses, tool detail and raw API
-        /// bodies are never emitted, whatever else is configured.
+        /// inject half a configuration over a wire format it cannot satisfy.
+        ///
+        /// The five content flags are deliberately not set here. They belong to every launch, not
+        /// to the one path that reaches the end of this method: see
+        /// <see cref="ForceContentTelemetryOff"/>.
         ///
         /// Spans are deliberately not collected: they require
         /// <c>CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1</c>, and opting a user into a beta collection
@@ -914,11 +983,49 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
                     ? guardAttributes
                     : existingAttributes + "," + guardAttributes
             );
-            Environment.SetEnvironmentVariable("OTEL_LOG_USER_PROMPTS", "0");
-            Environment.SetEnvironmentVariable("OTEL_LOG_ASSISTANT_RESPONSES", "0");
-            Environment.SetEnvironmentVariable("OTEL_LOG_TOOL_DETAILS", "0");
-            Environment.SetEnvironmentVariable("OTEL_LOG_TOOL_CONTENT", "0");
-            Environment.SetEnvironmentVariable("OTEL_LOG_RAW_API_BODIES", "0");
+        }
+
+        /// <summary>
+        /// Turns Claude Code's five content-logging flags off for this launch, so prompts,
+        /// responses, tool detail and raw API bodies cannot be exported by anything downstream of
+        /// the wrapper.
+        ///
+        /// Applied on every forward and before any other environment work. The ordering is load
+        /// bearing in one direction: the check for a user's own pipeline reads the very variables
+        /// collector injection writes, so running this afterwards would decide that the wrapper's own
+        /// loopback exporter was somebody else's and skip the flags entirely.
+        ///
+        /// Two cases are exempt, both deliberately.
+        ///
+        /// The kill switch, because an escape hatch has to be total to be worth documenting.
+        ///
+        /// And a user who has configured their own OpenTelemetry pipeline: on that path the wrapper
+        /// injects nothing, so no Workspace Accounts collector can receive content, and the
+        /// destination is a collector the user chose. Their content flags are part of a configuration
+        /// they wrote on purpose - an enterprise pipeline that logs prompts is a legitimate thing to
+        /// have - and quietly turning it off would be the wrapper overriding an explicit choice
+        /// rather than protecting anything of ours. <c>docs/privacy.md</c> states the guarantee at
+        /// exactly that strength, and no higher.
+        /// </summary>
+        private static void ForceContentTelemetryOff()
+        {
+            try
+            {
+                if (HasUserExporterConfiguration())
+                {
+                    return;
+                }
+                Environment.SetEnvironmentVariable("OTEL_LOG_USER_PROMPTS", "0");
+                Environment.SetEnvironmentVariable("OTEL_LOG_ASSISTANT_RESPONSES", "0");
+                Environment.SetEnvironmentVariable("OTEL_LOG_TOOL_DETAILS", "0");
+                Environment.SetEnvironmentVariable("OTEL_LOG_TOOL_CONTENT", "0");
+                Environment.SetEnvironmentVariable("OTEL_LOG_RAW_API_BODIES", "0");
+            }
+            catch (Exception)
+            {
+                // Fail open: an environment the wrapper cannot write to is never a reason to
+                // refuse a launch.
+            }
         }
 
         /// <summary>
@@ -937,12 +1044,39 @@ namespace ClaudeWorkspaceAccounts.WrapperLauncher
             return false;
         }
 
+        /// <summary>
+        /// The guard's one refusal. The only caller is the handler for
+        /// <see cref="GuardBlockException"/>, which is the only place the refusal is constructed, so
+        /// the blocked marker and exit <see cref="GuardExitCode"/> cannot be reached by anything
+        /// except a genuine identity mismatch on an enforcing binding.
+        /// </summary>
         private static int Block(string category, string message)
         {
             WriteGuardHealth(category, GuardExitCode);
             Console.Error.WriteLine("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED category=" + category);
             Console.Error.WriteLine(message);
             return GuardExitCode;
+        }
+
+        /// <summary>
+        /// The wrapper was handed nothing it could launch.
+        ///
+        /// This is a usage error, not a guard decision, and it used to report itself as one: it
+        /// emitted the blocked marker and exited 78, so a malformed invocation was indistinguishable
+        /// from the single refusal the product is allowed to make. It now fails the way any launch
+        /// failure fails, with its own exit code and a message that says where the invocation comes
+        /// from, because the person reading it is not the person a block is written for.
+        /// </summary>
+        private static int InvalidInvocation()
+        {
+            WriteGuardHealth("invalid_invocation", InvocationExitCode);
+            Console.Error.WriteLine(
+                "Claude Workspace Accounts received no Claude executable to launch. This program is "
+                    + "started by the Claude Code extension through its "
+                    + "claudeCode.claudeProcessWrapper setting, which passes the Claude CLI as its "
+                    + "first argument; it does nothing useful when run on its own."
+            );
+            return InvocationExitCode;
         }
 
         /// <summary>

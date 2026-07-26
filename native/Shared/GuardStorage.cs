@@ -64,7 +64,8 @@ namespace ClaudeWorkspaceAccounts
     /// </summary>
     internal sealed class WorkspaceBinding
     {
-        private readonly string workspace;
+        private readonly string workspaceHash;
+        private readonly string workspaceLabel;
         private readonly string profileId;
         private readonly string configDirectory;
         private readonly string mode;
@@ -74,6 +75,11 @@ namespace ClaudeWorkspaceAccounts
         private readonly string updatedAt;
         private readonly bool fromRegistry;
 
+        /// <summary>
+        /// A binding resolved for a live launch. The workspace directory it was resolved for is
+        /// reduced to a hash and a sanitized label here and is not kept: this object is the one that
+        /// gets serialized, so the path it can never write down is the path it never holds.
+        /// </summary>
         public WorkspaceBinding(
             string workspace,
             string profileId,
@@ -85,8 +91,36 @@ namespace ClaudeWorkspaceAccounts
             string updatedAt,
             bool fromRegistry
         )
+            : this(
+                HashFor(workspace),
+                GuardPaths.LabelFor(workspace),
+                profileId,
+                configDirectory,
+                mode,
+                expectedAccountId,
+                expectedEmail,
+                expectedOrganizationId,
+                updatedAt,
+                fromRegistry
+            )
         {
-            this.workspace = workspace;
+        }
+
+        private WorkspaceBinding(
+            string workspaceHash,
+            string workspaceLabel,
+            string profileId,
+            string configDirectory,
+            string mode,
+            string expectedAccountId,
+            string expectedEmail,
+            string expectedOrganizationId,
+            string updatedAt,
+            bool fromRegistry
+        )
+        {
+            this.workspaceHash = workspaceHash;
+            this.workspaceLabel = workspaceLabel;
             this.profileId = profileId;
             this.configDirectory = configDirectory;
             this.mode = mode;
@@ -97,10 +131,29 @@ namespace ClaudeWorkspaceAccounts
             this.fromRegistry = fromRegistry;
         }
 
-        /// <summary>The normalized workspace directory this binding was recorded for.</summary>
-        public string Workspace
+        /// <summary>
+        /// The key a remembered binding is stored and looked up under: the first 16 hex characters
+        /// of the SHA-256 of the normalized workspace directory. Null when there was no usable
+        /// directory, which is what stops an unresolvable workspace matching every other one
+        /// through the hash of the empty string.
+        /// </summary>
+        public static string HashFor(string normalizedWorkspace)
         {
-            get { return workspace; }
+            return string.IsNullOrWhiteSpace(normalizedWorkspace)
+                ? null
+                : GuardPaths.WorkspaceHash(normalizedWorkspace);
+        }
+
+        /// <summary>The hash the cache keys this binding on.</summary>
+        public string WorkspaceHash
+        {
+            get { return workspaceHash; }
+        }
+
+        /// <summary>The sanitized leaf directory name, so the cache is readable in diagnostics.</summary>
+        public string WorkspaceLabel
+        {
+            get { return workspaceLabel; }
         }
 
         public string ProfileId
@@ -170,7 +223,8 @@ namespace ClaudeWorkspaceAccounts
         public WorkspaceBinding WithUpdatedAt(string value)
         {
             return new WorkspaceBinding(
-                workspace,
+                workspaceHash,
+                workspaceLabel,
                 profileId,
                 configDirectory,
                 mode,
@@ -182,11 +236,15 @@ namespace ClaudeWorkspaceAccounts
             );
         }
 
-        /// <summary>True when nothing a launch depends on has changed.</summary>
+        /// <summary>
+        /// True when nothing a launch depends on has changed. Workspaces are compared by hash,
+        /// because an entry read back from the cache has no path to compare - and if this reported
+        /// every cached entry as different, the cache would be rewritten on every single launch.
+        /// </summary>
         public bool Equivalent(WorkspaceBinding other)
         {
             return other != null
-                && string.Equals(workspace, other.workspace, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(workspaceHash, other.workspaceHash, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(profileId, other.profileId, StringComparison.Ordinal)
                 && string.Equals(configDirectory, other.configDirectory, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(mode, other.mode, StringComparison.OrdinalIgnoreCase)
@@ -195,10 +253,19 @@ namespace ClaudeWorkspaceAccounts
                 && string.Equals(expectedOrganizationId ?? string.Empty, other.expectedOrganizationId ?? string.Empty, StringComparison.Ordinal);
         }
 
+        /// <summary>
+        /// The on-disk form.
+        ///
+        /// The workspace is written as a hash and a sanitized label, never as a path. This file used
+        /// to carry the literal directory for every workspace that had ever been bound, which broke
+        /// the promise that a workspace path is stored only as a label plus a SHA-256 prefix unless
+        /// the user opts in - and it outlives an uninstall, so nothing later could take it back.
+        /// </summary>
         public string ToJson()
         {
             var builder = new StringBuilder();
-            builder.Append("{\"workspace\":").Append(JsonText.Quote(workspace));
+            builder.Append("{\"workspaceHash\":").Append(JsonText.Quote(workspaceHash));
+            builder.Append(",\"workspaceLabel\":").Append(JsonText.Quote(workspaceLabel));
             builder.Append(",\"profileId\":").Append(JsonText.Quote(profileId));
             builder.Append(",\"configDir\":").Append(JsonText.Quote(configDirectory));
             builder.Append(",\"mode\":").Append(JsonText.Quote(mode));
@@ -212,14 +279,25 @@ namespace ClaudeWorkspaceAccounts
 
         public static WorkspaceBinding FromJson(JsonValue value)
         {
-            string workspace = value["workspace"].AsText();
+            string hash = value["workspaceHash"].AsText();
+            string label = value["workspaceLabel"].AsText();
+            if (string.IsNullOrWhiteSpace(hash))
+            {
+                // An entry written before the workspace was hashed. It is still usable: hashing the
+                // path it recorded produces exactly the key this version looks it up under, so the
+                // user keeps the binding, and rewriting the file is what gets the path off disk.
+                string legacyPath = GuardPaths.Normalize(value["workspace"].AsText());
+                hash = HashFor(legacyPath);
+                label = GuardPaths.LabelFor(legacyPath);
+            }
             string configDirectory = value["configDir"].AsText();
-            if (string.IsNullOrWhiteSpace(workspace) || string.IsNullOrWhiteSpace(configDirectory))
+            if (string.IsNullOrWhiteSpace(hash) || string.IsNullOrWhiteSpace(configDirectory))
             {
                 return null;
             }
             return new WorkspaceBinding(
-                workspace,
+                hash,
+                label,
                 value["profileId"].AsText(),
                 configDirectory,
                 value["mode"].AsText() ?? "enforce",
@@ -229,6 +307,15 @@ namespace ClaudeWorkspaceAccounts
                 value["updatedAt"].AsText(),
                 false
             );
+        }
+
+        /// <summary>
+        /// True for a document member that still carries a literal workspace path, which is the
+        /// signal that the file has to be replaced rather than left as it is.
+        /// </summary>
+        public static bool CarriesLiteralPath(JsonValue value)
+        {
+            return value != null && !string.IsNullOrWhiteSpace(value["workspace"].AsText());
         }
     }
 
@@ -245,24 +332,64 @@ namespace ClaudeWorkspaceAccounts
     {
         private const int MaximumEntries = 32;
 
-        /// <summary>The longest workspace prefix that covers the current directory.</summary>
+        /// <summary>
+        /// How far the ancestor walk will climb. A path deeper than this is pathological rather
+        /// than real, and the walk hashes once per level.
+        /// </summary>
+        private const int MaximumDepth = 64;
+
+        /// <summary>What the cache currently holds, and whether the file itself has to be replaced.</summary>
+        private sealed class CacheDocument
+        {
+            private readonly List<WorkspaceBinding> entries;
+            private readonly bool carriesLiteralPaths;
+
+            public CacheDocument(List<WorkspaceBinding> entries, bool carriesLiteralPaths)
+            {
+                this.entries = entries;
+                this.carriesLiteralPaths = carriesLiteralPaths;
+            }
+
+            public List<WorkspaceBinding> Entries
+            {
+                get { return entries; }
+            }
+
+            /// <summary>
+            /// True for a cache written by a version that recorded literal workspace paths. Its
+            /// entries are still usable, but the file must be rewritten rather than left holding
+            /// them.
+            /// </summary>
+            public bool CarriesLiteralPaths
+            {
+                get { return carriesLiteralPaths; }
+            }
+        }
+
+        /// <summary>
+        /// The remembered binding whose workspace is the closest ancestor of a directory.
+        ///
+        /// Hashes cannot be compared for containment, so the lookup walks the launch directory's own
+        /// ancestors from the deepest upwards and asks for each hash in turn. That yields exactly the
+        /// longest-prefix answer comparing literal paths used to yield - a nested workspace bound to
+        /// one account still wins over the tree it sits in - without the cache holding a path.
+        /// </summary>
         public static WorkspaceBinding Match(string cachePath, string normalizedWorkspace)
         {
             try
             {
-                WorkspaceBinding best = null;
-                foreach (WorkspaceBinding candidate in Read(cachePath))
+                CacheDocument document = Read(cachePath);
+                foreach (string hash in AncestorHashes(normalizedWorkspace))
                 {
-                    if (!Covers(candidate.Workspace, normalizedWorkspace))
+                    foreach (WorkspaceBinding candidate in document.Entries)
                     {
-                        continue;
-                    }
-                    if (best == null || candidate.Workspace.Length > best.Workspace.Length)
-                    {
-                        best = candidate;
+                        if (SameWorkspace(candidate, hash))
+                        {
+                            return candidate;
+                        }
                     }
                 }
-                return best;
+                return null;
             }
             catch (Exception)
             {
@@ -274,19 +401,23 @@ namespace ClaudeWorkspaceAccounts
         {
             try
             {
-                List<WorkspaceBinding> entries = Read(cachePath);
-                WorkspaceBinding existing = Find(entries, binding.Workspace);
-                if (existing != null && existing.Equivalent(binding))
+                string hash = binding.WorkspaceHash;
+                if (string.IsNullOrEmpty(hash))
+                {
+                    return;
+                }
+                CacheDocument document = Read(cachePath);
+                List<WorkspaceBinding> entries = document.Entries;
+                WorkspaceBinding existing = Find(entries, hash);
+                if (existing != null
+                    && existing.Equivalent(binding)
+                    && !document.CarriesLiteralPaths)
                 {
                     return;
                 }
                 entries.RemoveAll(delegate(WorkspaceBinding candidate)
                 {
-                    return string.Equals(
-                        candidate.Workspace,
-                        binding.Workspace,
-                        StringComparison.OrdinalIgnoreCase
-                    );
+                    return SameWorkspace(candidate, hash);
                 });
                 entries.Add(binding.WithUpdatedAt(
                     DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture)
@@ -303,18 +434,15 @@ namespace ClaudeWorkspaceAccounts
         {
             try
             {
-                List<WorkspaceBinding> entries = Read(cachePath);
-                int removed = entries.RemoveAll(delegate(WorkspaceBinding candidate)
+                string hash = WorkspaceBinding.HashFor(normalizedWorkspace);
+                CacheDocument document = Read(cachePath);
+                int removed = document.Entries.RemoveAll(delegate(WorkspaceBinding candidate)
                 {
-                    return string.Equals(
-                        candidate.Workspace,
-                        normalizedWorkspace,
-                        StringComparison.OrdinalIgnoreCase
-                    );
+                    return SameWorkspace(candidate, hash);
                 });
-                if (removed > 0)
+                if (removed > 0 || document.CarriesLiteralPaths)
                 {
-                    Write(cachePath, entries);
+                    Write(cachePath, document.Entries);
                 }
             }
             catch (Exception)
@@ -323,11 +451,116 @@ namespace ClaudeWorkspaceAccounts
             }
         }
 
-        private static WorkspaceBinding Find(List<WorkspaceBinding> entries, string workspace)
+        /// <summary>
+        /// Replaces a cache that still records literal workspace paths.
+        ///
+        /// Called on every launch, before anything decides whether the cache will be read or written
+        /// at all, because the paths that need removing were written by a release that is no longer
+        /// running and some launches touch the cache on no other code path. An unparseable file is
+        /// deleted rather than kept: it cannot be rewritten, it may still hold paths, and unlike the
+        /// registry it is regenerated from the next bound launch and is never the only copy of
+        /// anything.
+        /// </summary>
+        public static void PurgeLiteralPaths(string cachePath)
+        {
+            if (cachePath == null || !File.Exists(cachePath))
+            {
+                return;
+            }
+            try
+            {
+                CacheDocument document = Read(cachePath);
+                if (document.CarriesLiteralPaths)
+                {
+                    Write(cachePath, document.Entries);
+                }
+            }
+            catch (Exception)
+            {
+                // A cache that cannot be parsed cannot be rewritten either, so it is deleted - but
+                // only once its bytes are seen to still record a literal path. A transient read
+                // failure, two launches racing over the same file, must not throw away a cache that
+                // was already in the hashed form.
+                if (RecordsLiteralPath(cachePath))
+                {
+                    Delete(cachePath);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Whether the file's bytes still contain a <c>workspace</c> member. Deliberately textual:
+        /// it is asked only about a document that would not parse. <c>"workspaceHash"</c> does not
+        /// match, because the quote after the name is part of what is searched for.
+        /// </summary>
+        private static bool RecordsLiteralPath(string cachePath)
+        {
+            try
+            {
+                return File.ReadAllText(cachePath, new UTF8Encoding(false))
+                    .IndexOf("\"workspace\"", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// The hash of a directory and of every directory above it, deepest first. Deepest first is
+        /// what makes the first hit the longest matching prefix.
+        /// </summary>
+        private static List<string> AncestorHashes(string normalizedWorkspace)
+        {
+            var hashes = new List<string>();
+            string current = normalizedWorkspace;
+            while (!string.IsNullOrWhiteSpace(current) && hashes.Count < MaximumDepth)
+            {
+                hashes.Add(GuardPaths.WorkspaceHash(current));
+                string parent = ParentOf(current);
+                if (parent == null || string.Equals(parent, current, StringComparison.Ordinal))
+                {
+                    break;
+                }
+                current = parent;
+            }
+            return hashes;
+        }
+
+        private static string ParentOf(string normalizedPath)
+        {
+            string trimmed = normalizedPath.TrimEnd('\\');
+            int separator = trimmed.LastIndexOf('\\');
+            if (separator <= 0)
+            {
+                return null;
+            }
+            string parent = trimmed.Substring(0, separator);
+            if (parent.Length == 2 && parent[1] == ':')
+            {
+                // A bare drive root keeps its separator, the way Normalize records it, or `d:`
+                // would never match the `d:\` an entry was written under.
+                parent += "\\";
+            }
+            return parent;
+        }
+
+        private static bool SameWorkspace(WorkspaceBinding candidate, string hash)
+        {
+            return candidate != null
+                && !string.IsNullOrEmpty(hash)
+                && string.Equals(
+                    candidate.WorkspaceHash,
+                    hash,
+                    StringComparison.OrdinalIgnoreCase
+                );
+        }
+
+        private static WorkspaceBinding Find(List<WorkspaceBinding> entries, string hash)
         {
             foreach (WorkspaceBinding candidate in entries)
             {
-                if (string.Equals(candidate.Workspace, workspace, StringComparison.OrdinalIgnoreCase))
+                if (SameWorkspace(candidate, hash))
                 {
                     return candidate;
                 }
@@ -335,36 +568,45 @@ namespace ClaudeWorkspaceAccounts
             return null;
         }
 
-        private static bool Covers(string candidate, string normalizedWorkspace)
+        private static void Delete(string cachePath)
         {
-            if (string.IsNullOrEmpty(candidate) || string.IsNullOrEmpty(normalizedWorkspace))
+            try
             {
-                return false;
+                if (File.Exists(cachePath))
+                {
+                    File.Delete(cachePath);
+                }
             }
-            string prefix = candidate.TrimEnd('\\') + "\\";
-            return string.Equals(candidate, normalizedWorkspace, StringComparison.OrdinalIgnoreCase)
-                || normalizedWorkspace.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+            catch (Exception)
+            {
+                // A cache that cannot be removed is still never read for anything but a binding.
+            }
         }
 
-        private static List<WorkspaceBinding> Read(string cachePath)
+        private static CacheDocument Read(string cachePath)
         {
             var entries = new List<WorkspaceBinding>();
             if (cachePath == null || !File.Exists(cachePath))
             {
-                return entries;
+                return new CacheDocument(entries, false);
             }
             JsonValue document = JsonReader.Parse(
                 File.ReadAllText(cachePath, new UTF8Encoding(false))
             );
+            bool carriesLiteralPaths = false;
             foreach (JsonValue candidate in document["bindings"].Elements)
             {
+                if (WorkspaceBinding.CarriesLiteralPath(candidate))
+                {
+                    carriesLiteralPaths = true;
+                }
                 WorkspaceBinding binding = WorkspaceBinding.FromJson(candidate);
                 if (binding != null)
                 {
                     entries.Add(binding);
                 }
             }
-            return entries;
+            return new CacheDocument(entries, carriesLiteralPaths);
         }
 
         private static void Write(string cachePath, List<WorkspaceBinding> entries)

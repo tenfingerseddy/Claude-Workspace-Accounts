@@ -26,7 +26,8 @@ import { TelemetryCollector } from "./telemetry/telemetryCollector.js";
 import {
   STATUSLINE_EXE,
   WRAPPER_EXE,
-  WrapperIntegrationService
+  WrapperIntegrationService,
+  isManagedWrapperPath
 } from "./wrapper/wrapperIntegrationService.js";
 
 interface RuntimeServices {
@@ -93,10 +94,19 @@ async function reportMigration(
   }
   if (report.failures.length > 0) {
     output.error(`Migration left ${report.failures.length} item(s) unfinished.`);
+    // A blocked migration is a different message from a partial one. Nothing was repointed, the old
+    // installation is still the one Claude Code launches through, and the old support directory is
+    // the only complete copy of the user's accounts — so it must not read as "mostly fine".
     void vscode.window.showWarningMessage(
-      `Claude Workspace Accounts could not finish migrating your previous installation: `
-      + `${report.failures.length} item${report.failures.length === 1 ? "" : "s"} need your `
-      + "attention. Nothing was deleted, and Claude Code keeps working.",
+      report.blockedBy
+        ? "Claude Workspace Accounts stopped migrating your previous installation before changing "
+          + "anything, because it could not confirm your accounts and workspace bindings had been "
+          + `copied (${report.blockedBy}). Claude Account Guard is still the version in charge, `
+          + "nothing was deleted, and Claude Code keeps working. Do not delete "
+          + `${report.legacyRoot ?? "your previous support directory"} yet.`
+        : `Claude Workspace Accounts could not finish migrating your previous installation: `
+          + `${report.failures.length} item${report.failures.length === 1 ? "" : "s"} need your `
+          + "attention. Nothing was deleted, and Claude Code keeps working.",
       "Show Details",
       "Show Diagnostics"
     ).then(async (choice) => {
@@ -106,6 +116,11 @@ async function reportMigration(
           content: `# Claude Workspace Accounts — upgrade report\n\n`
             + `Your previous installation is still in place at `
             + `${report.legacyRoot ?? "its original location"}; nothing was deleted.\n\n`
+            + (report.blockedBy
+              ? `**The migration stopped before changing anything: ${report.blockedBy}.** The `
+                + "wrapper setting, the settings namespace and your Claude account directories were "
+                + "left exactly as Claude Account Guard had them, so nothing is half-moved.\n\n"
+              : "")
             + `## Still to do by hand\n\n${manual.map((step) => `- ${step}`).join("\n") || "- Nothing."}\n\n`
             + `## Every step\n\n${report.steps.map((step) =>
               `- **${step.artifact}** — ${step.state}${step.detail ? `: ${step.detail}` : ""}`
@@ -141,6 +156,182 @@ async function reportMigration(
       }
     });
   }
+}
+
+/** Every command id the manifest contributes, read from the manifest rather than duplicated here. */
+function contributedCommandIds(context: vscode.ExtensionContext): string[] {
+  const contributes = (context.extension.packageJSON as {
+    contributes?: { commands?: { command?: unknown }[] };
+  }).contributes;
+  return (contributes?.commands ?? [])
+    .map((entry) => entry.command)
+    .filter((id): id is string => typeof id === "string");
+}
+
+/**
+ * Activate just enough to explain a registry that cannot be loaded, and to undo the integration.
+ *
+ * `ProfileRegistry` refuses to overwrite a registry it cannot validate, because it may be the only
+ * copy of somebody's bindings — and activation used to rethrow at that point. That left the whole
+ * command surface, the diagnostics report, the status bar and the repair UI unregistered while
+ * `claudeCode.claudeProcessWrapper` still pointed at the wrapper. The wrapper then fails open to the
+ * ambient account, so bindings silently stop applying, and there is nothing left in the product able
+ * to say so or to undo it: a global setting the user can no longer manage from the UI, which is the
+ * exact defect this extension exists to prevent. So activation degrades instead of dying.
+ *
+ * Two things genuinely work without a registry: saying what is wrong, and detaching Claude Code.
+ * Every other contributed command is registered too, so invoking one explains the state rather than
+ * failing with "command not found".
+ */
+async function activateRegistryRepairOnly(
+  context: vscode.ExtensionContext,
+  output: vscode.LogOutputChannel,
+  paths: ReturnType<typeof resolveSupportPaths>,
+  failure: unknown,
+  migration: LegacyMigrationReport
+): Promise<void> {
+  const detail = failure instanceof Error ? failure.message : "unknown error";
+  const explanation =
+    "Claude Workspace Accounts is running in repair mode: its shared registry at "
+    + `${paths.registry} could not be loaded (${detail}), so per-workspace accounts are not being `
+    + "applied. The registry was preserved exactly as it is, in case it is the only copy of your "
+    + "accounts and bindings. Repair or move it aside and reload the window.";
+  output.error(explanation);
+
+  const configuredWrapper = (): string | undefined => {
+    const value = vscode.workspace
+      .getConfiguration("claudeCode")
+      .get<string>("claudeProcessWrapper");
+    return value && value.trim() ? value : undefined;
+  };
+
+  const showDiagnostics = async (): Promise<void> => {
+    const wrapper = configuredWrapper();
+    const document = await vscode.workspace.openTextDocument({
+      language: "markdown",
+      content: `# Claude Workspace Accounts — repair mode\n\n${explanation}\n\n`
+        + `## State\n\n`
+        + `- Registry: \`${paths.registry}\`\n`
+        + `- Why it could not be loaded: ${detail}\n`
+        + `- Support directory: \`${paths.root}\`\n`
+        + `- Claude Code wrapper setting: ${wrapper ? `\`${wrapper}\`` : "not set"}\n`
+        + `- Wrapper belongs to this extension: ${isManagedWrapperPath(wrapper) ? "yes" : "no"}\n\n`
+        + `## What is and is not happening\n\n`
+        + "- Claude Code still launches. The wrapper fails open, so it launches on whichever "
+        + "account is ambient.\n"
+        + "- No workspace binding is being applied, and no usage is being collected.\n"
+        + "- Nothing has been deleted, and the registry has not been rewritten.\n\n"
+        + `## Upgrade from Claude Account Guard\n\n`
+        + `- Previous installation found: ${migration.legacyInstallationFound ? "yes" : "no"}\n`
+        + (migration.blockedBy ? `- Migration halted because: ${migration.blockedBy}\n` : "")
+        + (migration.legacyRoot ? `- Previous support directory: \`${migration.legacyRoot}\`\n` : "")
+        + `${migration.steps.map((step) =>
+          `- **${step.artifact}** — ${step.state}${step.detail ? `: ${step.detail}` : ""}`
+        ).join("\n")}\n\n`
+        + `## How to get out of repair mode\n\n`
+        + `1. Open \`${paths.registry}\` and fix it, or rename it so a fresh one is created.\n`
+        + "2. Reload the window.\n"
+        + "3. If you would rather Claude Code stopped launching through this extension entirely, "
+        + "run \"Claude Workspace Accounts: Disconnect From Claude Code\".\n"
+        + `${migrationManualSteps(migration).map((step) => `- ${step}`).join("\n")}\n`
+    });
+    await vscode.window.showTextDocument(document, { preview: true });
+  };
+
+  /**
+   * Clear the global wrapper setting without the registry.
+   *
+   * `WrapperIntegrationService.disable` reads the registry to restore a chained upstream wrapper,
+   * which is exactly what is unavailable here, so this does the one thing that is always safe:
+   * remove our own wrapper and leave anybody else's alone.
+   */
+  const disconnect = async (): Promise<void> => {
+    const wrapper = configuredWrapper();
+    if (!wrapper) {
+      void vscode.window.showInformationMessage(
+        "Claude Code is not configured to launch through Claude Workspace Accounts."
+      );
+      return;
+    }
+    if (!isManagedWrapperPath(wrapper)) {
+      void vscode.window.showWarningMessage(
+        `claudeCode.claudeProcessWrapper names ${wrapper}, which is not a wrapper this extension `
+        + "installed, so it was left alone."
+      );
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `Remove ${wrapper} from claudeCode.claudeProcessWrapper? Claude Code will launch directly `
+      + "afterwards, and per-workspace accounts will not be applied until you reconnect.",
+      { modal: true },
+      "Disconnect"
+    );
+    if (choice !== "Disconnect") {
+      return;
+    }
+    await vscode.workspace
+      .getConfiguration("claudeCode")
+      .update("claudeProcessWrapper", undefined, vscode.ConfigurationTarget.Global);
+    output.info("Repair mode: cleared claudeCode.claudeProcessWrapper.");
+    void vscode.window.showInformationMessage(
+      "Claude Code no longer launches through Claude Workspace Accounts. Reload the window to "
+      + "finish."
+    );
+  };
+
+  const handlers = new Map<string, () => Promise<void>>([
+    ["claudeAccounts.diagnostics", showDiagnostics],
+    ["claudeAccounts.disableWrapper", disconnect]
+  ]);
+  for (const id of new Set(contributedCommandIds(context))) {
+    const handler = handlers.get(id) ?? (async (): Promise<void> => {
+      const choice = await vscode.window.showErrorMessage(
+        explanation,
+        "Show Diagnostics",
+        "Reveal Registry"
+      );
+      if (choice === "Show Diagnostics") {
+        await showDiagnostics();
+      } else if (choice === "Reveal Registry") {
+        await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(paths.registry));
+      }
+    });
+    context.subscriptions.push(
+      vscode.commands.registerCommand(id, () => handler().catch((error: unknown) => output.error(
+        `${id} failed in repair mode: ${error instanceof Error ? error.message : "unknown error"}`
+      )))
+    );
+  }
+
+  // Visible rather than only announced: a modal the user dismissed is not a diagnosis they can
+  // come back to.
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  item.text = "$(error) Claude Accounts";
+  item.tooltip = explanation;
+  item.command = "claudeAccounts.diagnostics";
+  item.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
+  item.show();
+  context.subscriptions.push(item);
+
+  void vscode.window.showErrorMessage(
+    explanation,
+    "Show Diagnostics",
+    "Reveal Registry",
+    "Disconnect From Claude Code"
+  ).then(async (choice) => {
+    if (choice === "Show Diagnostics") {
+      await showDiagnostics();
+    } else if (choice === "Reveal Registry") {
+      await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(paths.registry));
+    } else if (choice === "Disconnect From Claude Code") {
+      await disconnect();
+    }
+  });
+
+  await reportMigration(migration, output).catch((error: unknown) => output.error(
+    `Upgrade reporting failed: ${error instanceof Error ? error.message : "unknown error"}`
+  ));
+  output.info("Claude Workspace Accounts is active in repair mode only.");
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -186,17 +377,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   try {
     await registry.initialize();
   } catch (error) {
-    output.error(
-      `Shared registry validation failed: ${error instanceof Error ? error.message : "unknown error"}`
-    );
-    const choice = await vscode.window.showErrorMessage(
-      "Claude Workspace Accounts preserved an invalid shared registry, so per-workspace accounts are not being applied. Restore or repair the registry before continuing.",
-      "Reveal Registry"
-    );
-    if (choice === "Reveal Registry") {
-      await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(paths.registry));
-    }
-    throw error;
+    // Deliberately not rethrown. Everything below needs a registry, but the user needs a way to
+    // find out why nothing works and a way to detach Claude Code far more than the extension host
+    // needs an activation error.
+    await activateRegistryRepairOnly(context, output, paths, error, migration);
+    return;
   }
 
   const repository = new UsageRepository(paths.database);

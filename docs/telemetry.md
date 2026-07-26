@@ -31,6 +31,10 @@ It also normalizes API request/error spans and events, trace-derived request lat
 
 Only these analysis attributes are allowlisted: model, query source, token type, hashed workspace plus short label, safe skill/plugin/agent labels, durations, success, decision source, status/error category, and server/tool name. Attribute strings are bounded before persistence. User email, command lines, request bodies, and other unlisted resource/span attributes are discarded.
 
+The wrapper sets Claude Code's five content-logging flags (`OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_RAW_API_BODIES`) to `0` on every launch it wraps, independently of whether a collector is registered, fresh, or enabled — see [privacy.md](privacy.md) for the two deliberate exemptions, a pipeline you configured yourself and the kill switch, and for why neither lets this extension collect content.
+
+Injection is refused outright — not partially applied — if any OTLP endpoint, protocol, compression, header, exporter-selection, or client-certificate variable is already set. A partial override produces a collector that listens and rejects everything.
+
 Changing `claudeAccounts.telemetry.enabled` to false removes the collector registration and updates the shared account state immediately. Extension shutdown also disables collection; the next activation restores it only when the setting remains enabled.
 
 ## Provenance

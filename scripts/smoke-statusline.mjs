@@ -344,6 +344,37 @@ try {
     `status ${viaMirrorAgain.status}, stdout ${JSON.stringify(viaMirrorAgain.stdout)}`
   );
 
+  // v0.1.0 wrote the same file into `.claude-account-guard`. The rename migration moves that
+  // directory, but it can fail to rename *and* fail to copy, and in that state the legacy
+  // directory holds the only record of the user's previous status line. Read-only, and after the
+  // migrated location, so a migrated directory always wins.
+  await clearInbox();
+  await rm(profileBackupPath, { force: true });
+  await rm(mirrorBackupPath, { force: true });
+  const legacyBackupDirectory = path.join(configDir, ".claude-account-guard");
+  await mkdir(legacyBackupDirectory, { recursive: true });
+  const legacyBackupPath = path.join(legacyBackupDirectory, "statusline-next.json");
+  await writeFile(legacyBackupPath, backupDocument(chainCommand), "utf8");
+  const viaLegacy = runBridge(sessionPayload());
+  check(
+    "a status line recorded under the pre-rename directory is still chained",
+    viaLegacy.status === 0 && viaLegacy.stdout.includes("CHAINED_STATUS"),
+    `status ${viaLegacy.status}, stdout ${JSON.stringify(viaLegacy.stdout)}`
+  );
+  await clearInbox();
+  await writeFile(profileBackupPath, backupDocument("cmd /c echo MIGRATED_STATUS"), "utf8");
+  const migratedWins = runBridge(sessionPayload());
+  check(
+    "the migrated directory wins over the pre-rename one",
+    migratedWins.status === 0
+      && migratedWins.stdout.includes("MIGRATED_STATUS")
+      && !migratedWins.stdout.includes("CHAINED_STATUS"),
+    `status ${migratedWins.status}, stdout ${JSON.stringify(migratedWins.stdout)}`
+  );
+  await rm(legacyBackupDirectory, { recursive: true, force: true });
+  await rm(profileBackupPath, { force: true });
+  await writeFile(mirrorBackupPath, backupDocument(chainCommand), "utf8");
+
   // ---------------------------------------------------------------- never blank
   await rm(profileBackupPath, { force: true });
   await rm(mirrorBackupPath, { force: true });

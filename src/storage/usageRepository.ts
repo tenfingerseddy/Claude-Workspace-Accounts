@@ -167,6 +167,22 @@ function derivePhase(input: {
   if (input.context.telemetryEnabled === false) {
     return "telemetry_disabled";
   }
+  // A storage failure outranks everything from the collector's socket inwards, because a database
+  // refusing writes makes the rest moot: a perfectly healthy collector still stores nothing, and a
+  // rejection counted as `storage_transient` is this same fault seen from the socket.
+  //
+  // It used to rank nowhere at all, which was a silent failure with three faces —
+  // `lastSuccessfulWriteAt` stays set forever after the first successful write, so a database that
+  // went locked, full, read-only or corrupt afterwards reported "collecting" to the dashboard,
+  // "active / no blocker" to diagnostics, and left the status bar showing a quota reading nothing
+  // was updating.
+  //
+  // The record is present only while unresolved: a successful write erases it. That, rather than a
+  // clock or a comparison against `lastSuccessfulWriteAt` — which is an *event* timestamp from the
+  // payload, not a write time — is what makes this self-clearing and cheap.
+  if (storageIsFailing(input.storage)) {
+    return "storage_failed";
+  }
   if (input.collector.bindError && !input.collector.listening) {
     return "port_bind_failed";
   }
@@ -189,6 +205,17 @@ function derivePhase(input: {
     return "collecting";
   }
   return "awaiting_data";
+}
+
+/**
+ * True while an unresolved storage failure is on record.
+ *
+ * Deliberately not a comparison against `lastSuccessfulWriteAt`: that field carries the *event*
+ * timestamp out of the payload, so a batch of yesterday's events would look like a write that
+ * never happened, and a batch with a clock-skewed future timestamp would clear a real failure.
+ */
+export function storageIsFailing(storage: CollectionHealth["storage"]): boolean {
+  return Boolean(storage.lastFailureAt);
 }
 
 interface DailyDimensions {
@@ -256,6 +283,12 @@ export class UsageRepository {
   private readonly startupDegradations: Array<[CollectionDegradationReason, string]> = [];
   /** Survives a database that is too locked to record its own unavailability. */
   private lastStorageFailure?: { at: string; category: StorageFailureCategory };
+  /**
+   * State keys whose recorded storage failure has already been cleared by a successful write in
+   * this session. A key absent from here may still carry a failure recorded by a previous window,
+   * which is why the first successful write per key does the clearing even with nothing in memory.
+   */
+  private readonly storageCleared = new Set<string>();
   private readonly busyTimeoutMs: number;
 
   public constructor(
@@ -1036,6 +1069,7 @@ export class UsageRepository {
     // In memory first, and unconditionally. The failure we most need to report is the database being
     // unavailable — and in exactly that case the database cannot accept the record of it.
     this.lastStorageFailure = { at: now, category };
+    this.storageCleared.delete(this.stateKey(profileId));
     if (category === "busy" || category === "locked") {
       // Writing would block on the same lock that just failed, for the full busy timeout again.
       return;
@@ -1528,6 +1562,32 @@ export class UsageRepository {
       this.recordStorageFailure(profileId, failure.category);
       throw failure;
     }
+    this.recordStorageRecovery(profileId);
+  }
+
+  /**
+   * Erase a recorded storage failure, because a write has just succeeded.
+   *
+   * Without this the `storage_failed` phase would be permanent: nothing else ever cleared the
+   * record, so one transient `busy` would have condemned the account forever. Runs at most once
+   * per state key per session, so the common path stays a plain transaction.
+   */
+  private recordStorageRecovery(profileId: string | undefined): void {
+    const key = this.stateKey(profileId);
+    if (this.storageCleared.has(key)) {
+      return;
+    }
+    this.storageCleared.add(key);
+    this.lastStorageFailure = undefined;
+    this.safely(() => {
+      // The anonymous bucket is cleared alongside it: a failure recorded before the profile was
+      // known is resolved by the same successful write.
+      this.database.prepare(`
+        UPDATE collection_state
+        SET updated_at = ?, last_failure_at = NULL, last_failure_category = NULL
+        WHERE profile_id IN (?, '')
+      `).run(new Date().toISOString(), key);
+    });
   }
 
   private migrate(): void {

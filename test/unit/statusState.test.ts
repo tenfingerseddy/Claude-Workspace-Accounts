@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { AccountProfile, GuardStatusInput } from "../../src/core/models.js";
 import {
   bindingIdentityState,
+  buildQuotaReport,
   deriveGuardStatus,
+  formatQuotaAge,
+  formatQuotaDuration,
+  quotaStatusLabel,
   selectUsage
 } from "../../src/core/statusState.js";
 
@@ -178,6 +182,210 @@ describe("status state machine", () => {
       70,
       90
     )).toMatchObject({ window: "seven_day", percentage: 86, severity: "warning" });
+  });
+
+  it("leads the status bar with quota, not with the account name", () => {
+    // The owner's complaint: the surfaces led with locally accumulated numbers, which begin when
+    // the extension is installed and say nothing about plan headroom.
+    const result = deriveGuardStatus({
+      ...base,
+      snapshot: {
+        schemaVersion: 1,
+        capturedAt: new Date().toISOString(),
+        profileId: "work",
+        sessionId: "live",
+        rateLimits: {
+          fiveHour: { usedPercentage: 42, resetsAt: Math.floor(Date.now() / 1000) + 9_600 },
+          sevenDay: { usedPercentage: 18 }
+        }
+      }
+    });
+    expect(result.text).toBe("$(account) 5h 42% · 7d 18% · Work");
+    expect(result.text.indexOf("42%")).toBeLessThan(result.text.indexOf("Work"));
+    expect(result.detail).toContain("58% left");
+    expect(result.detail).toMatch(/resets in 2h 40m/);
+    expect(result.detail).toMatch(/Reported by Claude/);
+  });
+
+  it("says a storage failure is happening instead of showing a healthy quota reading", () => {
+    // Storage went bad after one successful write. Every surface used to keep reporting the last
+    // figure as current, because the phase stayed "collecting" and the status bar ignored health.
+    const result = deriveGuardStatus({
+      ...base,
+      collectionPhase: "storage_failed",
+      collectionDetail: "disk_full",
+      snapshot: {
+        schemaVersion: 1,
+        capturedAt: new Date().toISOString(),
+        profileId: "work",
+        sessionId: "live",
+        rateLimits: { fiveHour: { usedPercentage: 42 } }
+      }
+    });
+    expect(result.text).toContain("storage failing");
+    expect(result.severity).toBe("warning");
+    expect(result.collectionWarning).toContain("disk_full");
+    expect(result.collectionWarning).toMatch(/frozen/);
+  });
+
+  it("keeps a real identity mismatch as the error even while storage is failing", () => {
+    const result = deriveGuardStatus({
+      ...base,
+      verification: {
+        state: "signed_in",
+        checkedAt: "2026-07-23T00:00:00Z",
+        email: "someone.else@example.com"
+      },
+      lock: lock("enforce"),
+      requiredProfile: profile,
+      collectionPhase: "storage_failed"
+    });
+    expect(result.kind).toBe("wrong_account");
+    expect(result.severity).toBe("error");
+    expect(result.collectionWarning).toBeDefined();
+  });
+
+  it("names an absent window rather than implying zero use", () => {
+    const result = deriveGuardStatus({
+      ...base,
+      snapshot: {
+        schemaVersion: 1,
+        capturedAt: new Date().toISOString(),
+        profileId: "work",
+        sessionId: "live"
+      }
+    });
+    expect(result.text).toContain("quota not reported for this account");
+    expect(result.text).not.toContain("0%");
+    expect(result.detail).toContain("Claude.ai subscription accounts");
+  });
+
+  it("distinguishes never having run from a plan that reports nothing", () => {
+    const result = deriveGuardStatus(base);
+    expect(result.text).toContain("no quota reported yet");
+    expect(result.detail).toContain("No Claude Code session has run under this account yet");
+  });
+
+  it("respects the setting that turns the quota label off", () => {
+    const result = deriveGuardStatus({
+      ...base,
+      showUsage: false,
+      snapshot: {
+        schemaVersion: 1,
+        capturedAt: new Date().toISOString(),
+        profileId: "work",
+        sessionId: "live",
+        rateLimits: { fiveHour: { usedPercentage: 42 } }
+      }
+    });
+    expect(result.text).toBe("$(account) Claude · Work");
+  });
+});
+
+describe("buildQuotaReport", () => {
+  const now = Date.parse("2026-07-27T12:00:00Z");
+  const report = (
+    rateLimits: NonNullable<GuardStatusInput["snapshot"]>["rateLimits"],
+    capturedAt = "2026-07-27T11:58:00Z"
+  ) => buildQuotaReport({
+    snapshot: { capturedAt, rateLimits },
+    warningThreshold: 70,
+    criticalThreshold: 90,
+    now
+  });
+
+  it("treats resets_at as Unix epoch seconds, which is what Claude reports", () => {
+    // Read as milliseconds, every reset landed in 1970 and every window looked expired.
+    const result = report({
+      fiveHour: { usedPercentage: 42, resetsAt: Math.floor(now / 1000) + 9_600 }
+    });
+    expect(result.windows[0]?.resetsAtIso).toBe("2026-07-27T14:40:00.000Z");
+    expect(result.windows[0]?.resetsInLabel).toBe("in 2h 40m");
+    expect(result.windows[0]?.expired).toBe(false);
+  });
+
+  it("reports headroom alongside the used percentage", () => {
+    const result = report({ sevenDay: { usedPercentage: 86 } });
+    expect(result.windows[0]).toMatchObject({
+      window: "seven_day",
+      usedPercentage: 86,
+      remainingPercentage: 14,
+      severity: "warning"
+    });
+  });
+
+  it("marks a window whose reset time has already passed", () => {
+    const result = report({
+      fiveHour: { usedPercentage: 90, resetsAt: Math.floor(now / 1000) - 60 }
+    });
+    expect(result.windows[0]?.expired).toBe(true);
+    expect(result.windows[0]?.resetsInLabel).toBe("due now");
+  });
+
+  it("carries the reading's age, because a percentage without one is not a measurement", () => {
+    expect(report({ fiveHour: { usedPercentage: 10 } })).toMatchObject({
+      freshness: "fresh",
+      ageMs: 120_000,
+      ageLabel: "2 minutes ago"
+    });
+    expect(report({ fiveHour: { usedPercentage: 10 } }, "2026-07-27T09:00:00Z")).toMatchObject({
+      freshness: "stale",
+      ageLabel: "3 hours ago"
+    });
+  });
+
+  it("explains each absent window differently, and never as 0%", () => {
+    const none = buildQuotaReport({ warningThreshold: 70, criticalThreshold: 90, now });
+    expect(none.freshness).toBe("none");
+    expect(none.windows).toHaveLength(0);
+    expect(none.absent.map((entry) => entry.reason)).toEqual(["no_session", "no_session"]);
+    expect(none.absent[0]?.detail).toContain("No Claude Code session has run");
+
+    // A team subscription can legitimately never report quota; that is a fact about the plan.
+    const plan = report({});
+    expect(plan.absent.map((entry) => entry.reason))
+      .toEqual(["not_reported_for_account", "not_reported_for_account"]);
+    expect(plan.absent[0]?.detail).toContain("Claude.ai subscription accounts");
+
+    // The documentation says the two windows are independently optional.
+    const one = report({ fiveHour: { usedPercentage: 42 } });
+    expect(one.windows).toHaveLength(1);
+    expect(one.absent).toEqual([expect.objectContaining({
+      window: "seven_day",
+      reason: "window_not_reported"
+    })]);
+    expect(one.absent[0]?.detail).toContain("independently optional");
+    for (const entry of [...none.absent, ...plan.absent, ...one.absent]) {
+      expect(entry.detail).not.toContain("0%");
+    }
+  });
+
+  it("picks the more severe window for the status bar and labels both", () => {
+    const result = report({
+      fiveHour: { usedPercentage: 42 },
+      sevenDay: { usedPercentage: 95 }
+    });
+    expect(result.worst?.window).toBe("seven_day");
+    expect(result.worst?.severity).toBe("critical");
+    expect(quotaStatusLabel(result)).toBe("5h 42% · 7d 95%");
+  });
+});
+
+describe("quota time formatting", () => {
+  it("is coarse and readable rather than a stopwatch", () => {
+    expect(formatQuotaDuration(9_600_000)).toBe("2h 40m");
+    expect(formatQuotaDuration(2_700_000)).toBe("45m");
+    expect(formatQuotaDuration(273_600_000)).toBe("3d 4h");
+    expect(formatQuotaDuration(7_200_000)).toBe("2h");
+    expect(formatQuotaDuration(1_000)).toBe("under a minute");
+  });
+
+  it("reports an age in whole units", () => {
+    expect(formatQuotaAge(30_000)).toBe("seconds ago");
+    expect(formatQuotaAge(60_000)).toBe("1 minute ago");
+    expect(formatQuotaAge(600_000)).toBe("10 minutes ago");
+    expect(formatQuotaAge(3_600_000)).toBe("1 hour ago");
+    expect(formatQuotaAge(172_800_000)).toBe("2 days ago");
   });
 });
 

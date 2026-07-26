@@ -7,11 +7,15 @@
 // completely alone, and that every fault forwards the launch instead of refusing it.
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn, spawnSync } from "node:child_process";
-import { FOREIGN_OTEL_VARIABLES } from "../src/telemetry/otelEnvironment.ts";
+import {
+  FORCED_PRIVACY_VARIABLES,
+  FOREIGN_OTEL_VARIABLES
+} from "../src/telemetry/otelEnvironment.ts";
 
 const WRAPPER = path.resolve("bin/native/win-x64/claude-workspace-accounts-wrapper.exe");
 const CLI_SCRIPT = path.resolve("test/fixtures/fake-claude-cli.js");
@@ -43,16 +47,30 @@ const supportRoot = path.join(directory, "ClaudeWorkspaceAccounts");
 await mkdir(supportRoot, { recursive: true });
 const registryPath = path.join(supportRoot, "registry.json");
 const healthPath = path.join(supportRoot, "wrapper-health.json");
+const cachePath = path.join(supportRoot, "binding-cache.json");
 
 // Real directories, because binding resolves against the launch's working directory.
 const parentWorkspace = path.join(directory, "parent");
 const childWorkspace = path.join(parentWorkspace, "child");
+const nestedWorkspace = path.join(childWorkspace, "deep", "deeper");
 const unboundWorkspace = path.join(directory, "unbound");
-await mkdir(childWorkspace, { recursive: true });
+await mkdir(nestedWorkspace, { recursive: true });
 await mkdir(unboundWorkspace, { recursive: true });
 
 const normalize = (value) =>
   path.win32.normalize(value).replace(/[\\/]+$/, "").toLowerCase();
+
+/** The same digest `GuardPaths.WorkspaceHash` produces: 16 hex characters of SHA-256. */
+const workspaceHash = (value) =>
+  createHash("sha256").update(normalize(value), "utf8").digest("hex").slice(0, 16);
+
+/** The five flags that must never let prompt, response, or tool content leave the machine. */
+const CONTENT_FLAGS = Object.keys(FORCED_PRIVACY_VARIABLES);
+/** An environment that would leak: telemetry on, and every content flag inherited as on. */
+const INHERITED_CONTENT_TELEMETRY = {
+  CLAUDE_CODE_ENABLE_TELEMETRY: "1",
+  ...Object.fromEntries(CONTENT_FLAGS.map((name) => [name, "1"]))
+};
 
 const workProfile = {
   id: "work",
@@ -119,12 +137,15 @@ function baseEnvironment() {
     CLAUDE_CONFIG_DIR: undefined,
     CLAUDE_SECURESTORAGE_CONFIG_DIR: undefined,
     CLAUDE_WORKSPACE_ACCOUNTS_DISABLE: undefined,
+    CLAUDE_ACCOUNT_GUARD_DISABLE: undefined,
     CLAUDE_WORKSPACE_ACCOUNTS_WORKSPACE_KEY: undefined,
     CLAUDE_CODE_ENABLE_TELEMETRY: undefined,
     OTEL_RESOURCE_ATTRIBUTES: undefined,
     // Every variable the guard treats as somebody else's exporter, so the injection checks
     // measure the guard rather than the developer's shell.
     ...Object.fromEntries(FOREIGN_OTEL_VARIABLES.map((name) => [name, undefined])),
+    // And the content flags, so what the child receives is what this launch decided.
+    ...Object.fromEntries(CONTENT_FLAGS.map((name) => [name, undefined])),
     FAKE_EMAIL: "work@example.com",
     FAKE_ACCOUNT_ID: "acct-work",
     FAKE_ORG_ID: "org-work"
@@ -488,6 +509,65 @@ try {
       + `CLAUDE_CONFIG_DIR ${JSON.stringify(disabled.environment.CLAUDE_CONFIG_DIR)}`
   );
 
+  // The name v0.1.0 documented and shipped. A persistent `setx` value or a checked-in workspace
+  // `terminal.integrated.env.windows` entry survives an extension rename and no migration can
+  // reach either, so a user who set the documented escape hatch would have believed the wrapper
+  // was bypassed while binding and telemetry were quietly active again.
+  const legacyDisabled = await launchAndCaptureEnvironment({
+    cwd: parentWorkspace,
+    env: {
+      ...INHERITED_CONTENT_TELEMETRY,
+      CLAUDE_CONFIG_DIR: AMBIENT_CONFIG_DIR,
+      CLAUDE_ACCOUNT_GUARD_DISABLE: "1",
+      FAKE_ACCOUNT_ID: "acct-somebody-else"
+    }
+  });
+  check(
+    "the kill switch v0.1.0 shipped still bypasses binding and blocking",
+    legacyDisabled.result.status === 0
+      && legacyDisabled.environment.CLAUDE_CONFIG_DIR === AMBIENT_CONFIG_DIR
+      && !legacyDisabled.result.stderr.includes("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED"),
+    `status ${legacyDisabled.result.status}, `
+      + `CLAUDE_CONFIG_DIR ${JSON.stringify(legacyDisabled.environment.CLAUDE_CONFIG_DIR)}, `
+      + `stderr ${JSON.stringify(legacyDisabled.result.stderr)}`
+  );
+  check(
+    "a bypassed launch is left entirely alone, including its content flags",
+    CONTENT_FLAGS.every((name) => legacyDisabled.environment[name] === "1")
+      && CONTENT_FLAGS.every((name) => disabled.environment[name] === undefined),
+    `legacy ${JSON.stringify(legacyDisabled.environment)}`
+  );
+
+  // ================================================================ invalid invocation
+  // Exit 78 and the blocked marker mean one thing: an identity mismatch a user has to resolve.
+  // An empty argument vector used to emit both, so a malformed invocation was indistinguishable
+  // from the single refusal the product is allowed to make.
+  for (const [label, vector] of [
+    ["an empty invocation", []],
+    ["a blank executable argument", [""]],
+    ["a whitespace executable argument", ["   "]]
+  ]) {
+    const invalid = spawnSync(WRAPPER, vector, {
+      cwd: parentWorkspace,
+      env: baseEnvironment(),
+      encoding: "utf8",
+      windowsHide: true
+    });
+    const invalidHealth = await readHealth();
+    check(
+      `${label} is an ordinary launch failure, not a guard block`,
+      invalid.status === 64
+        && !invalid.stderr.includes("CLAUDE_WORKSPACE_ACCOUNTS_BLOCKED")
+        && invalid.stderr.includes("claudeCode.claudeProcessWrapper"),
+      `status ${invalid.status}, stderr ${JSON.stringify(invalid.stderr)}`
+    );
+    check(
+      `${label} is recorded as an invocation error, never as a refusal`,
+      invalidHealth?.category === "invalid_invocation" && invalidHealth?.exitCode === 64,
+      JSON.stringify(invalidHealth)
+    );
+  }
+
   // ================================================================ pass-through
   const stdinForwarded = launch(scriptPrefix, ["--echo-stdin"], {
     cwd: parentWorkspace,
@@ -635,6 +715,207 @@ try {
     "a stale collector registration is ignored",
     stale.environment.OTEL_EXPORTER_OTLP_ENDPOINT === undefined,
     JSON.stringify(stale.environment)
+  );
+
+  // ================================================================ content telemetry
+  // The five content flags were assigned at the *end* of collector injection, so every early
+  // return out of it — no registry, no registration, a stale one, telemetry off for the profile or
+  // globally — forwarded whatever the environment happened to carry. That is not only a false
+  // documentation claim: with CLAUDE_CODE_ENABLE_TELEMETRY=1 inherited and no endpoint configured,
+  // OTLP falls back to its default localhost endpoint, so an inherited OTEL_LOG_USER_PROMPTS=1
+  // exported prompt and response content to whatever was listening there. Each path is exercised
+  // with all five inherited as "1", and asserted against what the child actually received.
+  const contentFlagPaths = [
+    ["a successful collector injection", collectorRegistry(new Date().toISOString()), {}],
+    ["no registry at all", null, {}],
+    ["a registry with no collector registration", registryDocument(), {}],
+    [
+      "a stale collector registration",
+      collectorRegistry(new Date(Date.now() - 600_000).toISOString()),
+      {}
+    ],
+    [
+      "telemetry disabled for the profile",
+      registryDocument({
+        profiles: [{ ...workProfile, telemetryEnabled: false }, personalProfile],
+        collectors: {
+          work: {
+            profileId: "work",
+            port: 45999,
+            token: "collector-token",
+            pid: process.pid,
+            updatedAt: new Date().toISOString()
+          }
+        }
+      }),
+      {}
+    ],
+    [
+      "telemetry disabled globally",
+      collectorRegistry(new Date().toISOString()).replace(
+        "\"integration\":{}",
+        "\"integration\":{\"telemetryEnabled\":false}"
+      ),
+      {}
+    ],
+    ["an unbound workspace", registryDocument(), { cwd: unboundWorkspace }],
+    ["a corrupt registry", "{corrupt", {}],
+    ["an unsupported registry schema", JSON.stringify({ schemaVersion: 2 }), {}]
+  ];
+  for (const [label, content, options] of contentFlagPaths) {
+    if (content === null) {
+      await rm(registryPath, { force: true });
+    } else {
+      await useRegistry(content);
+    }
+    const forced = await launchAndCaptureEnvironment({
+      cwd: parentWorkspace,
+      ...options,
+      env: { ...INHERITED_CONTENT_TELEMETRY, ...(options.env ?? {}) }
+    });
+    check(
+      `every content flag is forced off with ${label}`,
+      forced.result.status === 0
+        && CONTENT_FLAGS.every((name) => forced.environment[name] === "0"),
+      `status ${forced.result.status}, `
+        + `${JSON.stringify(Object.fromEntries(
+          CONTENT_FLAGS.map((name) => [name, forced.environment[name]])
+        ))}`
+    );
+  }
+  check(
+    "the integration override the previous case relied on was actually applied",
+    collectorRegistry(new Date().toISOString()).includes("\"integration\":{}"),
+    "registryDocument no longer emits an empty integration object"
+  );
+
+  // The one exemption, and it is a decision rather than an oversight: when the user has configured
+  // their own OpenTelemetry pipeline the wrapper injects nothing, so no Workspace Accounts
+  // collector can receive content — and their content flags are part of a configuration they wrote
+  // deliberately, aimed at a collector they chose. Overriding them would be the wrapper vetoing an
+  // explicit user choice, not protecting anything of ours. docs/privacy.md states it at exactly
+  // this strength.
+  await useRegistry(collectorRegistry(new Date().toISOString()));
+  for (const name of FOREIGN_OTEL_VARIABLES) {
+    const foreign = await launchAndCaptureEnvironment({
+      cwd: parentWorkspace,
+      env: {
+        ...INHERITED_CONTENT_TELEMETRY,
+        [name]: name.endsWith("_PROTOCOL") ? "http/protobuf" : "user-value"
+      }
+    });
+    check(
+      `a user's own ${name} keeps their content flags as they set them`,
+      foreign.result.status === 0
+        && CONTENT_FLAGS.every((flag) => foreign.environment[flag] === "1")
+        && foreign.environment.OTEL_EXPORTER_OTLP_ENDPOINT !== "http://127.0.0.1:45999",
+      JSON.stringify(Object.fromEntries(
+        CONTENT_FLAGS.map((flag) => [flag, foreign.environment[flag]])
+      ))
+    );
+  }
+
+  // ================================================================ binding cache
+  // The cache outlives an uninstall, so what it records is a durable record. It used to record the
+  // literal workspace directory for every workspace that had ever been bound.
+  await useRegistry(registryDocument());
+  await rm(cachePath, { force: true });
+  await launchAndCaptureEnvironment({ cwd: parentWorkspace });
+  await launchAndCaptureEnvironment({ cwd: childWorkspace });
+  const cacheText = existsSync(cachePath) ? await readFile(cachePath, "utf8") : "";
+  const cache = await readJson(cachePath);
+  check(
+    "a bound launch is remembered",
+    (cache?.bindings?.length ?? 0) === 2,
+    JSON.stringify(cache)
+  );
+  check(
+    "a remembered workspace is a hash and a label, never a path",
+    (cache?.bindings ?? []).every((entry) =>
+      entry.workspace === undefined
+      && /^[0-9a-f]{16}$/.test(entry.workspaceHash ?? "")
+      && typeof entry.workspaceLabel === "string"),
+    cacheText
+  );
+  check(
+    "each entry is keyed on the SHA-256 prefix of its workspace",
+    JSON.stringify((cache?.bindings ?? []).map((entry) => entry.workspaceHash).sort())
+      === JSON.stringify([
+        workspaceHash(parentWorkspace),
+        workspaceHash(childWorkspace)
+      ].sort()),
+    cacheText
+  );
+  check(
+    "no workspace path appears anywhere in the cache",
+    ![parentWorkspace, childWorkspace, directory]
+      .flatMap((value) => [value, normalize(value), value.replace(/\\/g, "/")])
+      .some((value) => cacheText.toLowerCase().includes(value.toLowerCase())),
+    cacheText
+  );
+
+  // Longest-prefix resolution has to survive hashing, or a nested workspace falls back to the
+  // account of the tree it sits in the moment the registry cannot be read.
+  await useRegistry("{corrupt");
+  const nestedFromCache = await launchAndCaptureEnvironment({
+    cwd: nestedWorkspace,
+    env: { CLAUDE_CONFIG_DIR: AMBIENT_CONFIG_DIR }
+  });
+  check(
+    "a directory below a cached workspace resolves to the closest one",
+    nestedFromCache.environment.CLAUDE_CONFIG_DIR === PERSONAL_CONFIG_DIR,
+    JSON.stringify(nestedFromCache.environment.CLAUDE_CONFIG_DIR)
+  );
+  const parentFromCache = await launchAndCaptureEnvironment({
+    cwd: parentWorkspace,
+    env: { CLAUDE_CONFIG_DIR: AMBIENT_CONFIG_DIR }
+  });
+  check(
+    "a cached workspace still resolves to its own account",
+    parentFromCache.environment.CLAUDE_CONFIG_DIR === WORK_CONFIG_DIR,
+    JSON.stringify(parentFromCache.environment.CLAUDE_CONFIG_DIR)
+  );
+
+  // A cache left behind by a release that stored literal paths must keep working and must not
+  // survive as it is: discarding it silently would drop the binding, and leaving it would leave
+  // the paths.
+  await writeFile(cachePath, JSON.stringify({
+    schemaVersion: 1,
+    bindings: [{
+      workspace: normalize(parentWorkspace),
+      profileId: "work",
+      configDir: WORK_CONFIG_DIR,
+      mode: "enforce",
+      accountId: "acct-work",
+      email: "work@example.com",
+      organizationId: "org-work",
+      updatedAt: new Date().toISOString()
+    }]
+  }), "utf8");
+  const fromLegacyCache = await launchAndCaptureEnvironment({
+    cwd: parentWorkspace,
+    env: { CLAUDE_CONFIG_DIR: AMBIENT_CONFIG_DIR }
+  });
+  const rewritten = existsSync(cachePath) ? await readFile(cachePath, "utf8") : "";
+  check(
+    "a cache written with literal paths still resolves its binding",
+    fromLegacyCache.environment.CLAUDE_CONFIG_DIR === WORK_CONFIG_DIR,
+    JSON.stringify(fromLegacyCache.environment.CLAUDE_CONFIG_DIR)
+  );
+  check(
+    "a cache written with literal paths does not survive a single launch",
+    !rewritten.toLowerCase().includes(normalize(parentWorkspace))
+      && rewritten.includes(workspaceHash(parentWorkspace)),
+    rewritten
+  );
+
+  // An unparseable cache cannot be rewritten and may still hold paths, so it goes.
+  await writeFile(cachePath, `{"bindings":[{"workspace":"${normalize(parentWorkspace)}"`, "utf8");
+  const afterUnparseable = launch(scriptPrefix, ["--print"], { cwd: parentWorkspace });
+  check(
+    "an unparseable cache is deleted rather than left holding paths",
+    afterUnparseable.status === 0 && !existsSync(cachePath),
+    `status ${afterUnparseable.status}, exists ${existsSync(cachePath)}`
   );
 
   // ================================================================ upstream chaining

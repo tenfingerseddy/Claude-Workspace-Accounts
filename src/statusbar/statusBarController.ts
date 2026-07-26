@@ -4,13 +4,15 @@ import * as vscode from "vscode";
 import type {
   AccountProfile,
   AuthVerification,
+  CollectionHealth,
   GuardStatus,
+  QuotaReport,
   RuntimeProfile,
   StatusSnapshot,
   WorkspaceLock
 } from "../core/models.js";
 import { compareIdentity } from "../core/identity.js";
-import { deriveGuardStatus } from "../core/statusState.js";
+import { buildQuotaReport, deriveGuardStatus, withStatusText } from "../core/statusState.js";
 import type { WorkspaceLockService } from "../locks/workspaceLockService.js";
 import type { ProfileRegistry } from "../profiles/registryStore.js";
 import type { RuntimeProfileDetector } from "../profiles/runtimeProfileDetector.js";
@@ -134,6 +136,8 @@ export class StatusBarController implements vscode.Disposable {
       document.profiles.length > 0
     );
 
+    const health = this.collectionHealth(activeProfile?.id);
+
     this.render(this.present(deriveGuardStatus({
       runtime: effectiveRuntime,
       lock: undefined,
@@ -141,7 +145,9 @@ export class StatusBarController implements vscode.Disposable {
       warningThreshold: this.warningThreshold(),
       criticalThreshold: this.criticalThreshold(),
       showUsage: this.showUsage(),
-      verifying: Boolean(activeProfile)
+      verifying: Boolean(activeProfile),
+      collectionPhase: health?.phase,
+      collectionDetail: health?.storage.lastFailureCategory
     }), runtime, bound), effectiveRuntime, lock, requiredProfile);
 
     // A 30-second cache can report a healthy account after the wrapper's own live probe has
@@ -165,7 +171,9 @@ export class StatusBarController implements vscode.Disposable {
       warningThreshold: this.warningThreshold(),
       criticalThreshold: this.criticalThreshold(),
       showUsage: this.showUsage(),
-      verifying: false
+      verifying: false,
+      collectionPhase: health?.phase,
+      collectionDetail: health?.storage.lastFailureCategory
     }), runtime, bound, verification);
     this.context = {
       runtime: effectiveRuntime,
@@ -182,10 +190,31 @@ export class StatusBarController implements vscode.Disposable {
       "claudeAccounts.identityNeedsAttention",
       status.kind === "wrong_account"
         || status.kind === "wrong_account_warning"
-        || status.text.includes("unverified")
+        || status.identityCheckInactive === true
     );
     this.onChange();
     return this.context;
+  }
+
+  /**
+   * The collection-health record, or nothing.
+   *
+   * The status bar ignored this entirely, which is how a database that had gone locked, full,
+   * read-only or corrupt after one successful write kept a frozen quota figure on screen with no
+   * indication that it had stopped moving. Reading it must never be able to break the item, so a
+   * failure here degrades to "no phase reported".
+   */
+  private collectionHealth(profileId?: string): CollectionHealth | undefined {
+    try {
+      return this.repository.collectionHealth(profileId, {
+        telemetryEnabled: vscode.workspace.getConfiguration("claudeAccounts")
+          .get<boolean>("telemetry.enabled", true),
+        runtimeProfileRegistered: Boolean(profileId)
+      });
+    } catch (error) {
+      this.report("reading collection health", error);
+      return undefined;
+    }
   }
 
   /**
@@ -206,8 +235,7 @@ export class StatusBarController implements vscode.Disposable {
         return status;
       }
       return {
-        ...status,
-        text: "$(account) Claude · Default account",
+        ...withStatusText(status, "$(account) Claude · Default account"),
         severity: "normal",
         detail: `This workspace uses the default Claude account (${runtime.configDir}), which Workspace Accounts does not track. Choose an account for this workspace, or track this one to collect its usage.`
       };
@@ -223,8 +251,7 @@ export class StatusBarController implements vscode.Disposable {
         };
       }
       return {
-        ...status,
-        text: `$(lock) Claude · ${bound.displayName}`,
+        ...withStatusText(status, `$(link) Claude · ${bound.displayName}`),
         severity: status.severity === "error" ? "warning" : status.severity,
         detail: `This workspace uses ${bound.displayName}. Its Claude identity has not been confirmed, so a change of account inside it would not be noticed.`
       };
@@ -248,9 +275,10 @@ export class StatusBarController implements vscode.Disposable {
       // The account is applied and launches are allowed, but drift detection is inactive.
       // Silence here would be indistinguishable from a working check.
       return {
-        ...status,
+        ...withStatusText(status, `$(warning) Claude · ${bound.displayName} · unverified`),
         kind: "usage_unavailable",
-        text: `$(warning) Claude · ${bound.displayName} · unverified`,
+        // A flag, not a word in the text for three consumers to grep for.
+        identityCheckInactive: true,
         severity: "warning",
         detail: `This workspace uses ${bound.displayName}, but Claude did not return an identity comparable with the one stored, so a wrong-account change would not be detected. Launches are still allowed. Update the expected identity to restore the check.`
       };
@@ -267,6 +295,8 @@ export class StatusBarController implements vscode.Disposable {
     snapshot?: StatusSnapshot
   ): void {
     const activeLock = lock?.mode === "off" ? undefined : lock;
+    // Every rewrite of this text goes through `withStatusText`, so a storage warning cannot be
+    // dropped by a presentation rule and nothing here has to inspect the string to find out.
     this.item.text = status.text;
     this.item.command = this.commandFor(status, requiredProfile);
     this.item.backgroundColor = status.severity === "error"
@@ -277,6 +307,16 @@ export class StatusBarController implements vscode.Disposable {
     const tooltip = new vscode.MarkdownString(undefined, true);
     tooltip.isTrusted = true;
     tooltip.appendMarkdown(`**Claude Workspace Accounts**\n\n`);
+    // Quota first, because it is the only figure here that measures plan headroom. Everything
+    // else — the account, the integration, the local history — is context for it.
+    this.appendQuota(tooltip, status.quota ?? buildQuotaReport({
+      snapshot,
+      warningThreshold: this.warningThreshold(),
+      criticalThreshold: this.criticalThreshold()
+    }));
+    if (status.collectionWarning) {
+      tooltip.appendMarkdown(`$(warning) ${this.escape(status.collectionWarning)}  \n\n`);
+    }
     if (activeLock && requiredProfile) {
       tooltip.appendMarkdown(
         `This workspace uses **${this.escape(requiredProfile.displayName)}**  \n`
@@ -298,18 +338,7 @@ export class StatusBarController implements vscode.Disposable {
       tooltip.appendMarkdown(`Confirmed identity: ${this.escape(verification.email)}  \n`);
     }
     tooltip.appendMarkdown(`Claude Code integration: ${this.escape(this.describeIntegration())}  \n`);
-    if (snapshot?.rateLimits?.fiveHour) {
-      tooltip.appendMarkdown(
-        `Five-hour: ${Math.round(snapshot.rateLimits.fiveHour.usedPercentage)}% used${this.resetText(snapshot.rateLimits.fiveHour.resetsAt)}  \n`
-      );
-    }
-    if (snapshot?.rateLimits?.sevenDay) {
-      tooltip.appendMarkdown(
-        `Seven-day: ${Math.round(snapshot.rateLimits.sevenDay.usedPercentage)}% used${this.resetText(snapshot.rateLimits.sevenDay.resetsAt)}  \n`
-      );
-    }
     tooltip.appendMarkdown(`Last verification: ${verification ? new Date(verification.checkedAt).toLocaleString() : "Never"}  \n`);
-    tooltip.appendMarkdown(`Usage freshness: ${snapshot ? new Date(snapshot.capturedAt).toLocaleString() : "Unavailable"}  \n`);
     tooltip.appendMarkdown(
       `Workspace: ${this.escape(snapshot?.workspaceLabel ?? activeLock?.workspaceLabel ?? vscode.workspace.name ?? "Unknown")}  \n`
     );
@@ -376,7 +405,7 @@ export class StatusBarController implements vscode.Disposable {
         title: `Resolve the identity mismatch in ${requiredProfile.displayName}`
       };
     }
-    if (status.kind === "usage_unavailable" && status.text.includes("unverified")) {
+    if (status.identityCheckInactive === true) {
       return {
         command: "claudeAccounts.updateExpectedIdentity",
         title: "Restore identity checking for this workspace's account"
@@ -406,8 +435,36 @@ export class StatusBarController implements vscode.Disposable {
     };
   }
 
-  private resetText(timestamp: number | undefined): string {
-    return timestamp ? `; resets ${new Date(timestamp * 1000).toLocaleString()}` : "";
+  /**
+   * The quota block: used, left, reset, and how old the reading is.
+   *
+   * The age is not decoration. A five-hour percentage from ninety minutes ago is not current
+   * headroom, and showing the number without its age was the difference between information and
+   * a guess.
+   */
+  private appendQuota(tooltip: vscode.MarkdownString, quota: QuotaReport): void {
+    tooltip.appendMarkdown(`**Quota reported by Claude**  \n`);
+    for (const entry of quota.windows) {
+      const reset = entry.resetsAtIso
+        ? entry.expired
+          ? " · reset due now"
+          : ` · resets ${new Date(entry.resetsAtIso).toLocaleString()} (${entry.resetsInLabel})`
+        : " · reset time not reported";
+      tooltip.appendMarkdown(
+        `${this.escape(entry.label)}: **${Math.round(entry.usedPercentage)}% used**, ${Math.round(entry.remainingPercentage)}% left${this.escape(reset)}  \n`
+      );
+    }
+    for (const entry of quota.absent) {
+      tooltip.appendMarkdown(`${this.escape(entry.label)}: ${this.escape(entry.detail)}  \n`);
+    }
+    if (quota.windows.length > 0) {
+      tooltip.appendMarkdown(
+        `Reading: ${quota.ageLabel ? this.escape(quota.ageLabel) : "age unknown"}${quota.freshness === "stale" ? " — stale" : ""}  \n`
+      );
+    }
+    tooltip.appendMarkdown(
+      `Per\\-model and credit\\-pool quotas are not exposed to third\\-party extensions.  \n\n`
+    );
   }
 
   private escape(value: string): string {

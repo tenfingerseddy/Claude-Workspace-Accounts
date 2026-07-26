@@ -52,6 +52,58 @@ function isStatusLineObject(value: unknown): value is NonNullable<ClaudeSettings
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/** The bridge this release installs, invoked directly. */
+const BRIDGE_EXECUTABLE = "statusline-bridge.exe";
+/** v0.1.0's bridge, which a PowerShell host ran via `-File`. */
+const BRIDGE_SCRIPT = "statusline-bridge.ps1";
+/** The hosts v0.1.0 could have been launched through. Only these make a `.ps1` argument ours. */
+const SCRIPT_HOSTS = new Set(["powershell.exe", "powershell", "pwsh.exe", "pwsh"]);
+/** PowerShell's script parameter, and the abbreviations it accepts for it. */
+const SCRIPT_FLAGS = new Set(["-file", "-fil", "-fi", "-f", "/file", "/f"]);
+
+/**
+ * Split a command line into tokens the way a shell would, so a path can be compared as a path.
+ *
+ * Quotes are consumed rather than kept: the bridge is installed quoted because a profile directory
+ * may contain spaces, and `"C:\a b\statusline-bridge.exe"` has to reduce to one token.
+ */
+function commandTokens(command: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: string | undefined;
+  for (const character of command) {
+    if (quote) {
+      if (character === quote) {
+        quote = undefined;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (character === "\"" || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += character;
+  }
+  if (current) {
+    tokens.push(current);
+  }
+  return tokens;
+}
+
+/** The filename a token names, lower-cased. `path.win32` because this ships on Windows only. */
+function tokenFilename(token: string): string {
+  return path.win32.basename(token.trim()).toLocaleLowerCase();
+}
+
 /**
  * Whether a configured status-line command is one of ours, from any release.
  *
@@ -61,15 +113,37 @@ function isStatusLineObject(value: unknown): value is NonNullable<ClaudeSettings
  * status line that is not ours is never rewritten — hence one exported matcher rather than two.
  *
  * The executable name is deliberately unchanged across the rename, which is why matching on it
- * still recognises a bridge installed by the old extension identity.
+ * still recognises a bridge installed by the old extension identity. v0.1.0 installed
+ * `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<path>.ps1"`,
+ * so the script a PowerShell host was told to run counts too.
+ *
+ * The match is on the *filename of the executable or script token*, never on a substring of the
+ * whole command. Callers act on a true answer by overwriting the command without keeping a copy of
+ * it, so a false positive destroys a status line this extension never installed —
+ * `node C:\tools\statusline-bridge.exe-helper.js` and any argument that merely mentions the
+ * filename used to be claimed as ours. Same reasoning as `isManagedWrapperPath`: the false-positive
+ * direction is the one that costs somebody their configuration.
  */
 export function isStatusLineBridgeCommand(command: string | undefined): boolean {
-  if (!command) {
+  if (!command || !command.trim()) {
     return false;
   }
-  const normalized = command.toLocaleLowerCase();
-  return normalized.includes("statusline-bridge.exe")
-    || normalized.includes("statusline-bridge.ps1");
+  const [executable, ...args] = commandTokens(command);
+  if (!executable) {
+    return false;
+  }
+  const executableName = tokenFilename(executable);
+  if (executableName === BRIDGE_EXECUTABLE || executableName === BRIDGE_SCRIPT) {
+    return true;
+  }
+  if (!SCRIPT_HOSTS.has(executableName)) {
+    return false;
+  }
+  const flagIndex = args.findIndex((token) => SCRIPT_FLAGS.has(token.toLocaleLowerCase()));
+  const script = flagIndex >= 0
+    ? args[flagIndex + 1]
+    : args.find((token) => tokenFilename(token).endsWith(".ps1"));
+  return script !== undefined && tokenFilename(script) === BRIDGE_SCRIPT;
 }
 
 export class StatusLineBridgeService {

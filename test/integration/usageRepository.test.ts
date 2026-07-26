@@ -168,6 +168,44 @@ describe("SQLite usage repository", () => {
     const health = repository.collectionHealth("work");
     expect(health.storage.lastFailureCategory).toBe((caught as StorageWriteError).category);
     expect(health.storage.lastFailureAt).toBeDefined();
+    // Recording the failure is not enough: the phase has to say so, because the dashboard, the
+    // diagnostics report and the status bar all decide what to show from the phase alone.
+    expect(health.phase).toBe("storage_failed");
+  });
+
+  it("stops reporting healthy collection once storage fails after a successful write", () => {
+    // The exact scenario that looked healthy on every surface: one batch stored, then SQLite goes
+    // read-only, full or corrupt. `lastSuccessfulWriteAt` stays set forever, so the phase stayed
+    // `collecting`, diagnostics printed "active / no blocker", and the status bar kept the last
+    // quota reading on screen while every OTLP request failed.
+    const repository = openRepository();
+    repository.recordCollectorLifecycle({
+      profileId: "work",
+      listening: true,
+      registrationUpdatedAt: new Date().toISOString(),
+      heartbeatHealthy: true
+    });
+    repository.ingestBatch("work", normalizeOtlp(readFixture("otel-metrics.json")).metrics, []);
+    expect(repository.collectionHealth("work").phase).toBe("collecting");
+
+    repository.recordStorageFailure("work", "readonly");
+    const failing = repository.collectionHealth("work");
+    expect(failing.phase).toBe("storage_failed");
+    expect(failing.storage.lastFailureCategory).toBe("readonly");
+
+    // Self-clearing: it compares the two timestamps rather than consulting a clock, so one
+    // successful write ends it without any recovery bookkeeping of its own.
+    repository.ingestBatch("work", normalizeOtlp(readFixture("otel-metrics.json")).metrics, []);
+    expect(repository.collectionHealth("work").phase).toBe("collecting");
+  });
+
+  it("ranks a storage failure above the rejection it causes", () => {
+    // A `storage_permanent` rejection is this same fault seen from the socket. Reporting
+    // "the collector is turning requests away" sends the user to look at the network.
+    const repository = openRepository();
+    repository.recordRequestRejected("work", "storage_permanent", "corrupt");
+    repository.recordStorageFailure("work", "corrupt");
+    expect(repository.collectionHealth("work").phase).toBe("storage_failed");
   });
 
   it("classifies SQLite result codes without guessing", () => {

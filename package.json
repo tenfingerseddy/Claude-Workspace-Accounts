@@ -94,7 +94,7 @@
       {
         "command": "claudeAccounts.openDashboard",
         "category": "Claude Workspace Accounts",
-        "title": "Usage Dashboard",
+        "title": "Quota and Usage Dashboard",
         "icon": "$(graph)"
       },
       {
@@ -214,8 +214,8 @@
             "warn",
             "off"
           ],
-          "default": "enforce",
-          "description": "How a workspace's Claude account is applied. \"enforce\": set the account and stop the launch if the identity inside it does not match the one you confirmed. \"warn\": set the account and only report a mismatch. \"off\": record the choice without applying it."
+          "default": "warn",
+          "description": "How a workspace's Claude account is applied. \"warn\" (default): set the account and only report a problem. \"enforce\": set the account and additionally stop the launch if Claude returns an identity that does not match the one you confirmed — which requires Claude to return a comparable identity at all. On the current Claude Code version it does not for a per-workspace account (email and orgId come back null whenever CLAUDE_CONFIG_DIR is set), so \"enforce\" behaves exactly like \"warn\" there. \"off\": record the choice without applying it."
         },
         "claudeAccounts.telemetry.enabled": {
           "type": "boolean",
@@ -234,14 +234,14 @@
           "minimum": 1,
           "maximum": 99,
           "default": 70,
-          "description": "Local usage warning threshold. This is not an Anthropic policy threshold."
+          "description": "Percentage of a quota window used at which this extension starts warning. A local preference, not an Anthropic policy threshold."
         },
         "claudeAccounts.usage.criticalThreshold": {
           "type": "number",
           "minimum": 2,
           "maximum": 100,
           "default": 90,
-          "description": "Local usage critical threshold. This is not an Anthropic policy threshold."
+          "description": "Percentage of a quota window used at which this extension escalates its warning. A local preference, not an Anthropic policy threshold."
         },
         "claudeAccounts.context.warningThreshold": {
           "type": "number",
@@ -253,7 +253,7 @@
         "claudeAccounts.statusBar.showUsage": {
           "type": "boolean",
           "default": true,
-          "description": "Show a fresh five-hour or more-severe seven-day percentage in the status bar."
+          "description": "Lead the status bar item with the quota Claude reports: the five-hour and seven-day percentages used, as of the most recent status-line reading. Turn off to show only the account name."
         },
         "claudeAccounts.dashboard.defaultRange": {
           "type": "string",
