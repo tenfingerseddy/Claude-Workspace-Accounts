@@ -7,7 +7,8 @@ import {
   formatQuotaAge,
   formatQuotaDuration,
   quotaStatusLabel,
-  selectUsage
+  selectUsage,
+  selectUsageAccount
 } from "../../src/core/statusState.js";
 
 const lock = (mode: "enforce" | "warn" | "off") => ({
@@ -257,13 +258,13 @@ describe("status state machine", () => {
     });
     expect(result.text).toContain("quota not reported for this account");
     expect(result.text).not.toContain("0%");
-    expect(result.detail).toContain("Claude.ai subscription accounts");
+    expect(result.detail).toContain("a fact about the plan");
   });
 
   it("distinguishes never having run from a plan that reports nothing", () => {
     const result = deriveGuardStatus(base);
     expect(result.text).toContain("no quota reported yet");
-    expect(result.detail).toContain("No Claude Code session has run under this account yet");
+    expect(result.detail).toContain("has not recorded a quota reading for this account yet");
   });
 
   it("respects the setting that turns the quota label off", () => {
@@ -339,13 +340,14 @@ describe("buildQuotaReport", () => {
     expect(none.freshness).toBe("none");
     expect(none.windows).toHaveLength(0);
     expect(none.absent.map((entry) => entry.reason)).toEqual(["no_session", "no_session"]);
-    expect(none.absent[0]?.detail).toContain("No Claude Code session has run");
+    expect(none.absent[0]?.detail).toContain("has not recorded a quota reading");
 
-    // A team subscription can legitimately never report quota; that is a fact about the plan.
+    // Not a claim about which plans report quota. Team accounts do report it — verified against a
+    // live team account, which is why the copy no longer names subscription types at all.
     const plan = report({});
     expect(plan.absent.map((entry) => entry.reason))
       .toEqual(["not_reported_for_account", "not_reported_for_account"]);
-    expect(plan.absent[0]?.detail).toContain("Claude.ai subscription accounts");
+    expect(plan.absent[0]?.detail).toContain("a fact about the plan");
 
     // The documentation says the two windows are independently optional.
     const one = report({ fiveHour: { usedPercentage: 42 } });
@@ -444,5 +446,33 @@ describe("bindingIdentityState", () => {
       boundProfile: profile,
       verification: { state: "signed_in" }
     })).toBe("unidentified");
+  });
+});
+
+describe("the account a usage surface shows", () => {
+  const personal = { id: "personal" };
+  const work = { id: "work" };
+  const profiles = [personal, work];
+
+  it("shows the workspace's bound account rather than the first one registered", () => {
+    // The reported defect, in the configuration that produced it: two accounts, the workspace
+    // bound to the second, and no ambient CLAUDE_CONFIG_DIR in the extension host — so the
+    // ambient directory matched no profile and the page opened on Personal while the status bar
+    // named Work.
+    expect(selectUsageAccount({ profiles, inPlay: work })).toBe(work);
+  });
+
+  it("prefers the account the user explicitly asked to view", () => {
+    expect(selectUsageAccount({ profiles, requestedId: "personal", inPlay: work })).toBe(personal);
+  });
+
+  it("ignores a request naming an account that no longer exists", () => {
+    // Deleting a profile must not strand the page on it; the account in play takes over.
+    expect(selectUsageAccount({ profiles, requestedId: "deleted", inPlay: work })).toBe(work);
+  });
+
+  it("falls back to an arbitrary account only when none is in play", () => {
+    expect(selectUsageAccount({ profiles })).toBe(personal);
+    expect(selectUsageAccount({ profiles: [] })).toBeUndefined();
   });
 });

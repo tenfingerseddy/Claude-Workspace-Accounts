@@ -67,7 +67,9 @@ Check the status bar tooltip and the diagnostics report, which name the account 
 
 Exactly one condition stops a launch: the workspace's account is applied in `enforce` mode, an expected identity was recorded for it, and a **different** Claude identity now answers inside that account directory — usually because the directory was signed into another account. The wrapper exits with code `78` and a non-secret `identity_mismatch` message.
 
-On the current Claude Code version this condition **cannot arise for a per-workspace account**, because applying one sets `CLAUDE_CONFIG_DIR` and the CLI then returns `email` and `orgId` as null, leaving nothing comparable with the recorded identity. `claudeAccounts.defaultBindMode` therefore defaults to `warn`, which describes what actually happens; `enforce` is kept because it is correct and starts working the moment the CLI reports those fields again. See below.
+This is a real condition, not a theoretical one: `claude auth status` reports identity per configuration directory, so a bound directory re-authenticated as somebody else is genuinely detectable. See *Identity reporting, and a correction* below. `claudeAccounts.defaultBindMode` still defaults to `warn`, so the default experience never stops a launch; `enforce` is opt-in, per workspace or as a default.
+
+Being **signed out** is not a mismatch and never blocks. Claude prompting you to sign in inside the bound directory is correct behaviour, and blocking there would leave you unable to ever sign in.
 
 Two ways out, both two clicks:
 
@@ -81,7 +83,7 @@ Everything else fails open. These appear in `wrapper-health.json` and in diagnos
 - `signed_out`: that account has no Claude session. Sign in to it.
 - `registry_unavailable`: the account registry could not be read. The wrapper falls back to `binding-cache.json` so the workspace keeps its account; repair the registry.
 - `required_profile_missing`: the workspace refers to an account that no longer exists. Choose an account again.
-- `identity_unverifiable`: `auth status` returned nothing comparable with the recorded identity. On current CLI versions this is the normal outcome for a per-workspace account, not a fault.
+- `identity_unverifiable`: `auth status` returned nothing comparable with the recorded identity — the probe did not complete, or that account has no identity recorded yet. Not a fault, and never a block.
 - `binary_missing`: the Claude Code extension's bundled executable could not be resolved, so the launch went ahead unguarded and was recorded. No per-workspace account was applied to it.
 
 ### The wrapper exited 64 without launching anything
@@ -92,26 +94,26 @@ One further case is neither a block nor a forward, because there was nothing to 
 
 This used to exit `78` with the blocked marker, which contradicted the rule that an identity mismatch is the only blocking case and made a configuration mistake look like the guard refusing to run Claude.
 
-### Identity reporting is unavailable for per-workspace accounts
+### Identity reporting, and a correction
 
-Claude Code reports `email`, `orgId` and `orgName` as null whenever `CLAUDE_CONFIG_DIR` is set, even when it is set to the directory that was already the default, while still reporting `loggedIn: true` and exiting 0:
+An earlier release of these docs said Claude Code reports `email`, `orgId` and `orgName` as null whenever `CLAUDE_CONFIG_DIR` is set. That was wrong. Against 2.1.220's bundled binary, identity is reported per directory:
 
 ```
+$ set CLAUDE_CONFIG_DIR=%USERPROFILE%\.claude-work
 $ claude.exe auth status
-{"loggedIn":true,"email":"you@example.com","orgId":"...","orgName":"...","subscriptionType":"team"}
+{"loggedIn":true,"email":"you@work.example","orgId":"...","orgName":"nexwave","subscriptionType":"team"}
 
-$ CLAUDE_CONFIG_DIR="%USERPROFILE%\.claude" claude.exe auth status
-{"loggedIn":true,"email":null,"orgId":null,"orgName":null,"subscriptionType":"team"}
+$ set CLAUDE_CONFIG_DIR=%USERPROFILE%\.claude-personal
+$ claude.exe auth status
+{"loggedIn":true,"email":"you@personal.example","orgId":"...","subscriptionType":"max"}
 ```
 
-Consequences, stated plainly:
+So drift detection works for a bound account, and `enforce` genuinely blocks a directory that has been re-authenticated as a different account. There is no `accountId` field; email and organization are the identity.
 
-- An account used by a workspace shows as **signed in, account details not reported**. That is not an error and nothing is wrong with the account.
-- Workspace Accounts cannot detect that such a directory has been signed into a different Claude account, so `enforce` behaves like `warn` for it.
-- Your **default** account is exempt: Workspace Accounts probes it without setting the variable, so the real email and organization are recorded and drift detection works for it.
-- Nothing is gated on identity. Adding, signing in to, binding, and collecting usage for an account all work without it. (An earlier release refused to register an account whose identity it could not read, which is why registration appeared to do nothing.)
+Still true, and still worth stating:
 
-Verified against Claude Code 2.1.220 with its bundled native binary. Whether this is intended is unknown; `subscriptionType` survives while the identity fields do not. If a future version restores them, drift detection resumes with no change here.
+- **Nothing is gated on identity.** Adding, signing in to, binding, and collecting usage for an account all work without it. An earlier release refused to register an account whose identity it could not read, which is why registration appeared to do nothing.
+- An account that is signed out, or a probe that fails, leaves identity unavailable. That is not an error and nothing is wrong with the account.
 
 ### Mismatch detection can go quiet
 
@@ -125,19 +127,23 @@ A workspace bound to an account with **no** recorded identity is different and e
 
 ## What the quota numbers are, and are not
 
-The 5-hour and 7-day percentages are **Claude's own figures**. They arrive in the status-line payload as `rate_limits.five_hour.used_percentage` and `rate_limits.seven_day.used_percentage`, each with a `resets_at` in Unix epoch seconds, and Workspace Accounts displays them without arithmetic of its own. Everything else on the dashboard — tokens, cost, daily history, tool activity — is this extension's own local observation. It begins the day the extension is installed and measures nothing about your plan, which is why it is collapsed under *Locally collected detail*.
+Every percentage is **Claude's own figure**. They are read from `cachedUsageUtilization` in the account's own `%USERPROFILE%\.claude-<name>\.claude.json`, which Claude Code writes there when it refreshes usage, and Workspace Accounts displays them without arithmetic of its own. Everything else on the dashboard — tokens, cost, daily history, tool activity — is this extension's own local observation. It begins the day the extension is installed and measures nothing about your plan, which is why it is collapsed under *Locally collected detail*.
 
-Three documented constraints, all of which the UI states rather than hides:
+Because the source is the account's directory, quota works without a session running, without local collection being enabled, and without anything being installed into the account. Switching which account a workspace uses switches whose quota you see.
 
-- `rate_limits` is present **only for Claude.ai subscription accounts**, and **only after the first API response in a session**. Before that it is legitimately absent.
-- The two windows are **independently optional**. One can be reported while the other is not.
-- Some plans never report it. A `team` subscription in particular may show quota as *not reported for this account* permanently. That is a fact about the plan, not a fault, and it is never shown as `0%`.
+What the UI states rather than hides:
 
-### Per-model and credit-pool quota cannot be shown
+- **The reading is a cache, and its age is shown.** Claude refreshes it, not this extension. A percentage older than 15 minutes is labelled *Stale reading*, because a 5-hour window from an hour ago is not current headroom.
+- The windows are **independently optional**. One can be reported while another is not, and absence is never shown as `0%`.
+- An account Claude has never written a reading for shows *not reported* until the first time Claude answers under it.
 
-There is no 5-hour Opus figure, no Sonnet-only weekly figure, and no extra-usage credit balance in this extension, and there will not be until Claude exposes them. Those values exist — the official Claude Code extension receives `seven_day_sonnet`, `seven_day_opus` and an `extra_usage` object — but only in the response of a private `/api/oauth/usage` endpoint it calls with your OAuth credentials. Nothing of that reaches a status-line hook, which is the only interface a third-party extension has. Verified against the status-line schema embedded in Claude Code 2.1.220's own binary, which lists exactly `five_hour` and `seven_day` and nothing else.
+An earlier release of these docs claimed a `team` subscription may never report quota. It does report it, including a per-model window and a credit pool.
 
-Workspace Accounts will not call that endpoint, and will not approximate a per-model figure from token counts. An invented number that looks authoritative is worse than an absent one.
+### Per-model and credit-pool quota
+
+Both are shown, because both are in that same reading: per-model weekly windows arrive as `limits[]` entries with `kind: "weekly_scoped"` and the model in `scope.model.display_name`, and the extra-usage pool as `extra_usage`, with its currency, monthly limit, credits used and whether the spend limit has been reached.
+
+An earlier release said these were unreachable by a third-party extension and available only through a private `/api/oauth/usage` endpoint. That was wrong about where they are readable from. What has not changed: Workspace Accounts does not call that endpoint, does not touch your credentials, and will not approximate a per-model figure from token counts. An invented number that looks authoritative is worse than an absent one.
 
 ## The dashboard shows no quota
 

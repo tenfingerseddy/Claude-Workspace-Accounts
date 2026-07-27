@@ -396,6 +396,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Code launches changes here: the global wrapper setting is written only after explicit
   // consent, and only when an enforced lock or local usage actually needs it.
   const supportFiles = await wrapperIntegration.installSupportFiles();
+  for (const failure of supportFiles.failures) {
+    // Refreshing is best-effort. The already-installed copy keeps launches working, and the
+    // next activation with no Claude running will pick the new build up.
+    output.warn(`Could not refresh ${failure.name}: ${failure.reason}`);
+  }
 
   // Assigned once the collector plumbing further down exists. Commands must be able to
   // restart collection the moment a profile is registered, deleted, or switched, instead

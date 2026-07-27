@@ -1,4 +1,4 @@
-import { access, copyFile, mkdir, rm } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import * as vscode from "vscode";
 import type { ProfileRegistry } from "../profiles/registryStore.js";
@@ -34,9 +34,19 @@ export type WrapperRepairOutcome =
   | "reinstalled"
   | "cleared";
 
+export interface SupportFileFailure {
+  readonly name: string;
+  readonly reason: string;
+}
+
 export interface InstalledSupportFiles {
   wrapperPath: string;
   statusLineBridgePath: string;
+  /**
+   * Support files that could not be refreshed. Almost always a running Claude holding a lock on
+   * the previous build; the installed copy still works, so this is reportable rather than fatal.
+   */
+  failures: readonly SupportFileFailure[];
 }
 
 /**
@@ -59,6 +69,27 @@ async function exists(candidate: string): Promise<boolean> {
   }
 }
 
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * True when the destination is already byte-identical to the source.
+ *
+ * Windows locks a running executable, so overwriting the wrapper fails with EBUSY for as long as a
+ * wrapped Claude is alive. Nearly every activation re-copies a file that is already in place, so
+ * comparing first turns the common case into a no-op and never touches the lock at all. The
+ * executables are a few kilobytes, which is why this reads both rather than hashing.
+ */
+async function isUnchanged(source: string, destination: string): Promise<boolean> {
+  try {
+    const [from, to] = await Promise.all([readFile(source), readFile(destination)]);
+    return from.equals(to);
+  } catch {
+    return false;
+  }
+}
+
 export class WrapperIntegrationService {
   public constructor(
     private readonly context: vscode.ExtensionContext,
@@ -73,23 +104,51 @@ export class WrapperIntegrationService {
     return path.join(this.registry.paths.wrapperDirectory, STATUSLINE_EXE);
   }
 
+  /**
+   * Refresh the wrapper and bridge in the support directory.
+   *
+   * This runs on the activation path, so it reports failures instead of throwing them: a locked
+   * executable must never be able to stop the extension from activating. That is the same
+   * fail-open rule the wrapper itself follows, and breaking it here cost a whole activation —
+   * `install --force` followed by a reload while a wrapped Claude was still running left the
+   * extension dead with no commands and no status bar.
+   */
   public async installSupportFiles(): Promise<InstalledSupportFiles> {
-    await mkdir(this.registry.paths.wrapperDirectory, { recursive: true });
+    const failures: SupportFileFailure[] = [];
+    try {
+      await mkdir(this.registry.paths.wrapperDirectory, { recursive: true });
+    } catch (error) {
+      failures.push({ name: this.registry.paths.wrapperDirectory, reason: describe(error) });
+    }
     for (const file of SUPPORT_FILES) {
       const source = this.context.asAbsolutePath(file.source);
       if (!(await exists(source))) {
         continue;
       }
-      await copyFile(source, path.join(this.registry.paths.wrapperDirectory, file.name));
+      const destination = path.join(this.registry.paths.wrapperDirectory, file.name);
+      if (await isUnchanged(source, destination)) {
+        continue;
+      }
+      try {
+        await copyFile(source, destination);
+      } catch (error) {
+        failures.push({ name: file.name, reason: describe(error) });
+      }
     }
     await Promise.all(
-      OBSOLETE_SUPPORT_FILES.map((name) =>
-        rm(path.join(this.registry.paths.wrapperDirectory, name), { force: true })
-      )
+      OBSOLETE_SUPPORT_FILES.map(async (name) => {
+        // A superseded wrapper can be running too, and failing to delete one is cosmetic.
+        try {
+          await rm(path.join(this.registry.paths.wrapperDirectory, name), { force: true });
+        } catch (error) {
+          failures.push({ name, reason: describe(error) });
+        }
+      })
     );
     return {
       wrapperPath: this.wrapperPath,
-      statusLineBridgePath: this.statusLineBridgePath
+      statusLineBridgePath: this.statusLineBridgePath,
+      failures
     };
   }
 

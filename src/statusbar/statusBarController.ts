@@ -3,6 +3,7 @@ import path from "node:path";
 import * as vscode from "vscode";
 import type {
   AccountProfile,
+  AccountQuotaCache,
   AuthVerification,
   CollectionHealth,
   GuardStatus,
@@ -18,6 +19,7 @@ import type { ProfileRegistry } from "../profiles/registryStore.js";
 import type { RuntimeProfileDetector } from "../profiles/runtimeProfileDetector.js";
 import type { UsageRepository } from "../storage/usageRepository.js";
 import type { AuthVerifier } from "../auth/authVerifier.js";
+import { readQuotaCache } from "../usage/quotaCache.js";
 
 export interface CurrentGuardContext {
   runtime: RuntimeProfile;
@@ -162,12 +164,18 @@ export class StatusBarController implements vscode.Disposable {
     const snapshot = activeProfile
       ? this.repository.latestStatusSnapshot(activeProfile.id)
       : undefined;
+    // Quota comes from the account's own configuration directory, so it is available without a
+    // session, without the status line, and without local collection being enabled at all.
+    const quotaCache = activeProfile
+      ? await readQuotaCache(activeProfile.configDir)
+      : undefined;
     const status = this.present(deriveGuardStatus({
       runtime: effectiveRuntime,
       verification,
       lock: comparable(verification),
       requiredProfile: bound,
       snapshot,
+      quotaCache,
       warningThreshold: this.warningThreshold(),
       criticalThreshold: this.criticalThreshold(),
       showUsage: this.showUsage(),
@@ -183,7 +191,7 @@ export class StatusBarController implements vscode.Disposable {
       snapshot,
       status
     };
-    this.render(status, effectiveRuntime, lock, requiredProfile, verification, snapshot);
+    this.render(status, effectiveRuntime, lock, requiredProfile, verification, snapshot, quotaCache);
     // Surfaces the recovery command in the palette exactly when it is the thing to run.
     void vscode.commands.executeCommand(
       "setContext",
@@ -292,7 +300,8 @@ export class StatusBarController implements vscode.Disposable {
     lock?: WorkspaceLock,
     requiredProfile?: AccountProfile,
     verification?: AuthVerification,
-    snapshot?: StatusSnapshot
+    snapshot?: StatusSnapshot,
+    quotaCache?: AccountQuotaCache
   ): void {
     const activeLock = lock?.mode === "off" ? undefined : lock;
     // Every rewrite of this text goes through `withStatusText`, so a storage warning cannot be
@@ -310,6 +319,7 @@ export class StatusBarController implements vscode.Disposable {
     // Quota first, because it is the only figure here that measures plan headroom. Everything
     // else — the account, the integration, the local history — is context for it.
     this.appendQuota(tooltip, status.quota ?? buildQuotaReport({
+      cache: quotaCache,
       snapshot,
       warningThreshold: this.warningThreshold(),
       criticalThreshold: this.criticalThreshold()
@@ -462,8 +472,14 @@ export class StatusBarController implements vscode.Disposable {
         `Reading: ${quota.ageLabel ? this.escape(quota.ageLabel) : "age unknown"}${quota.freshness === "stale" ? " — stale" : ""}  \n`
       );
     }
+    if (quota.creditPool) {
+      const pool = quota.creditPool;
+      tooltip.appendMarkdown(
+        `Extra usage credits: **${Math.round(pool.utilization)}% used**${pool.spendLimitReached ? " · spend limit reached" : ""}  \n`
+      );
+    }
     tooltip.appendMarkdown(
-      `Per\\-model and credit\\-pool quotas are not exposed to third\\-party extensions.  \n\n`
+      `Read from this account's own usage reading, never calculated here.  \n\n`
     );
   }
 

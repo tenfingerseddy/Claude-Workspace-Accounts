@@ -365,14 +365,19 @@ describe("legacy command aliases", () => {
     }
   });
 
-  it("does not default to a bind mode whose distinguishing behaviour cannot occur", () => {
-    // `enforce` only differs from `warn` when Claude returns a comparable identity, which it never
-    // does for a bound account on this CLI, so defaulting to it promised enforcement that is
-    // structurally impossible.
+  it("defaults to the mode that never stops a launch, and describes enforce truthfully", () => {
+    // This assertion previously required the description to say `enforce` "behaves exactly like"
+    // `warn` because identity was believed unreadable for a bound account. Re-verified against
+    // 2.1.220, `claude auth status` reports identity per configuration directory, so a mismatch is
+    // genuinely detectable and `enforce` is a real mode. The default stays `warn` because a
+    // first-run default should not be able to stop a launch — not because enforcing is impossible.
     const setting = manifest.contributes.configuration.properties["claudeAccounts.defaultBindMode"];
     expect(setting?.default).toBe("warn");
-    expect(setting?.description).toMatch(/behaves exactly like/i);
-    expect(setting?.description).toMatch(/CLAUDE_CONFIG_DIR/);
+    expect(setting?.description).not.toMatch(/behaves exactly like/i);
+    expect(setting?.description).not.toMatch(/come back null|returns? .*null/i);
+    // The one blocking case, and the one that is explicitly not blocking, both stated.
+    expect(setting?.description).toMatch(/stop the launch/i);
+    expect(setting?.description).toMatch(/signed out is not a mismatch/i);
   });
 });
 

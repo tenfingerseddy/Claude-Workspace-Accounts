@@ -130,14 +130,25 @@ export interface StatusSnapshot {
 /**
  * Quota, as Claude reports it.
  *
- * These are the only plan-headroom figures any third party can obtain: the status-line payload
- * carries `rate_limits.five_hour` and `rate_limits.seven_day`, each with a `used_percentage` and a
- * `resets_at` in Unix epoch seconds. Verified against the schema embedded in Claude Code 2.1.220's
- * own binary. Per-model windows (`seven_day_sonnet`, `seven_day_opus`) and the `extra_usage` credit
- * pool exist, but only in the response of the private `/api/oauth/usage` endpoint the official
- * extension calls — they never reach a status line, so nothing here may pretend to know them.
+ * The source is `cachedUsageUtilization` in `<configDir>\.claude.json`, which Claude Code writes
+ * itself after it refreshes usage. It is per configuration directory, which is per account, which
+ * is exactly this product's unit — and it needs no session, no status line and no collection.
+ *
+ * This replaced the status line as the quota source because the status line is a terminal-UI
+ * feature: the official extension launches the CLI with `--output-format stream-json`, which never
+ * renders one, so on the launch path this product exists to manage, `statusLine` is never invoked
+ * and quota never arrived at all. Verified by launching the bundled 2.1.220 binary that way and
+ * watching the snapshot inbox stay empty.
+ *
+ * The same file carries what earlier revisions of this code claimed no third party could see:
+ * per-model weekly windows, as `limits[]` entries with `kind: "weekly_scoped"` and a
+ * `scope.model.display_name`, and the `extra_usage` credit pool. Both are read; neither is guessed.
  */
-export type QuotaWindowKey = "five_hour" | "seven_day";
+export type QuotaWindowKey =
+  | "five_hour"
+  | "seven_day"
+  /** A per-model weekly window. Several can be present, one per model, so this key repeats. */
+  | "weekly_scoped";
 
 export interface QuotaWindowReading {
   window: QuotaWindowKey;
@@ -159,6 +170,68 @@ export interface QuotaWindowReading {
    * exists. Showing it as current headroom would be actively misleading.
    */
   expired: boolean;
+  /** The model a per-model window applies to, exactly as Claude named it. */
+  scopeModel?: string;
+  /**
+   * Claude's own severity for this window, when it gave one.
+   *
+   * Kept beside `severity`, never merged into it: `severity` is this extension's thresholds, which
+   * the UI says are its own preferences and not Anthropic policy. Claiming Claude said "warning"
+   * because a local threshold fired would turn that disclaimer into a lie.
+   */
+  reportedSeverity?: string;
+  /** Whether Claude considers this the window currently in force. */
+  active?: boolean;
+}
+
+/**
+ * The extra-usage credit pool, when the account has one.
+ *
+ * Not a percentage of a time window, so it is deliberately not a `QuotaWindowReading`: it has a
+ * currency, a monthly limit and a spend cap that can be reached independently of any window.
+ */
+export interface QuotaCreditPool {
+  enabled: boolean;
+  utilization: number;
+  /**
+   * The cap and the spend so far, in **minor units** — cents, not dollars.
+   *
+   * Named for the unit because the raw fields are not: Claude reports `monthly_limit: 5000` and
+   * `used_credits: 5813` for a A$50.00 cap with A$58.13 spent, and a field called `usedCredits`
+   * holding 5813 was rendered as "A$5,813 of A$5,000" — off by two orders of magnitude, on the one
+   * card that names an amount of the user's money. `currencyExponent` is how many decimal places
+   * those minor units carry; without it the amounts are not renderable and are omitted rather than
+   * guessed.
+   */
+  limitMinorUnits?: number;
+  usedMinorUnits?: number;
+  currencyExponent?: number;
+  currency?: string;
+  spendLimitReached: boolean;
+  /** Claude's own reason the pool is unavailable, e.g. `org_spend_cap_reached`. */
+  disabledReason?: string;
+}
+
+/**
+ * One account's quota reading, straight out of `cachedUsageUtilization`.
+ *
+ * `fetchedAt` is Claude's own timestamp for the reading, not the time this file was read. A cache
+ * can be arbitrarily old, and a percentage whose age is unknown is not a measurement.
+ */
+export interface AccountQuotaCache {
+  fetchedAt: string;
+  windows: readonly QuotaCacheWindow[];
+  creditPool?: QuotaCreditPool;
+}
+
+export interface QuotaCacheWindow {
+  window: QuotaWindowKey;
+  usedPercentage: number;
+  /** ISO 8601, as this file states it — unlike the status line, which used epoch seconds. */
+  resetsAt?: string;
+  scopeModel?: string;
+  reportedSeverity?: string;
+  active?: boolean;
 }
 
 /** Why a window has no figure. Absence is always explained; it is never rendered as 0%. */
@@ -190,6 +263,8 @@ export interface QuotaReport {
   freshness: "fresh" | "stale" | "none";
   /** The window that decides the status bar's severity. */
   worst?: QuotaWindowReading;
+  /** The extra-usage credit pool, when the account has one. */
+  creditPool?: QuotaCreditPool;
 }
 
 export interface GuardStatusInput {
@@ -198,6 +273,8 @@ export interface GuardStatusInput {
   lock?: WorkspaceLock;
   requiredProfile?: AccountProfile;
   snapshot?: StatusSnapshot;
+  /** The bound account's quota reading. The status bar's headline figure comes from here. */
+  quotaCache?: AccountQuotaCache;
   warningThreshold: number;
   criticalThreshold: number;
   showUsage: boolean;

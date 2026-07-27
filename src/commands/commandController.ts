@@ -532,10 +532,8 @@ export class CommandController {
     if (plan.kind === "already_configured") {
       // Claiming "connected" while the executable is absent is the exact state that breaks
       // every launch, so the file is checked rather than assumed after installing.
-      try {
-        await this.wrapper.installSupportFiles();
-      } catch (error) {
-        this.report("refreshing the Workspace Accounts wrapper files", error);
+      for (const failure of (await this.wrapper.installSupportFiles()).failures) {
+        this.log(`Could not refresh ${failure.name}: ${failure.reason}`);
       }
       if (!(await this.wrapperExecutableExists())) {
         void vscode.window.showWarningMessage(
@@ -598,6 +596,17 @@ export class CommandController {
 
     try {
       const supportFiles = await this.wrapper.installSupportFiles();
+      for (const failure of supportFiles.failures) {
+        this.log(`Could not refresh ${failure.name}: ${failure.reason}`);
+      }
+      // Installing is best-effort, so connecting has to prove the wrapper is actually there.
+      // Pointing the global setting at a path with no executable breaks every Claude launch.
+      if (!(await this.wrapperExecutableExists())) {
+        void vscode.window.showErrorMessage(
+          `Workspace Accounts could not install its wrapper to ${this.wrapper.wrapperPath}, so Claude Code was left unchanged. Close any running Claude sessions and try again.`
+        );
+        return "failed";
+      }
       if (plan.kind === "ask_chain") {
         const chaining = await this.wrapper.resolveConflict(
           supportFiles.wrapperPath,
@@ -1718,7 +1727,7 @@ export class CommandController {
       const structural = classifyVerification(verification) === "signed_in_unidentified";
       const choice = await vscode.window.showWarningMessage(
         structural
-          ? `${profile.displayName} is signed in, but this version of Claude Code does not report account details when a per-workspace account is in use, so there is no identity to record. The account works normally; Workspace Accounts simply cannot tell you if that directory is signed into a different account.${enforcing ? " Because it can never confirm a match, this workspace's enforcing setting behaves like warn." : ""}`
+          ? `${profile.displayName} is signed in, but Claude returned no email or organization for it, so there is no identity to record. The account works normally; without one, Workspace Accounts cannot tell you if that directory is later signed into a different account.${enforcing ? " Until an identity is recorded, this workspace's enforcing setting has nothing to compare against and behaves like warn." : ""}`
           : `Claude could not be asked about ${profile.displayName} (${verification.errorCategory ?? "unavailable"}), so the expected identity was not changed.${enforcing ? " While this workspace enforces its account, a mismatch the wrapper has already found will keep stopping launches." : ""}`,
         ...(enforcing ? ["Only Warn In This Workspace"] : []),
         "Show Diagnostics"
@@ -1811,7 +1820,7 @@ export class CommandController {
           ? `${profile.displayName} is no longer a known account, so nothing was recorded.`
           : identified
             ? `${profile.displayName} is signed in as ${verification.email ?? verification.accountId}. Workspace Accounts will notice if that changes.`
-            : `${profile.displayName} is signed in and ready to use. This version of Claude Code does not report account details when a per-workspace account is in use, so Workspace Accounts cannot record which account it is — or warn you if it changes.`
+            : `${profile.displayName} is signed in and ready to use. Claude returned no email or organization for it, so there is no identity to record — and no way to warn you if that directory is later signed into a different account.`
       );
     }
   }

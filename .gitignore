@@ -11,3 +11,4 @@ Thumbs.db
 # Local scratch
 artifacts/
 .agents/
+.semanticus/

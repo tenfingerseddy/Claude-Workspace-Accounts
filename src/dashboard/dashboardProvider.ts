@@ -8,7 +8,7 @@ import type {
   QuotaReport,
   SharedRegistryDocument
 } from "../core/models.js";
-import { bindingIdentityState, buildQuotaReport } from "../core/statusState.js";
+import { bindingIdentityState, buildQuotaReport, selectUsageAccount } from "../core/statusState.js";
 import type { CollectionDiagnosis, WrapperState } from "../commands/uxModel.js";
 import type { BindingIdentityState } from "../core/statusState.js";
 import type { WorkspaceLockService } from "../locks/workspaceLockService.js";
@@ -16,6 +16,7 @@ import type { ProfileRegistry } from "../profiles/registryStore.js";
 import type { RuntimeProfileDetector } from "../profiles/runtimeProfileDetector.js";
 import type { UsageRepository } from "../storage/usageRepository.js";
 import { parseDashboardMessage } from "./dashboardMessages.js";
+import { readQuotaCache } from "../usage/quotaCache.js";
 
 /**
  * The parts of the command controller the dashboard needs. Declared as an interface so the
@@ -60,6 +61,14 @@ interface DashboardPayload extends DashboardData {
   };
 }
 
+/**
+ * Kept in workspace state, unlike every other preference here.
+ *
+ * Which account you are looking at is a fact about one workspace; a range or a thread scope is a
+ * preference about the page. Stored globally, one look at another account's history followed the
+ * user into every workspace they opened and overrode the binding there — the same wrong-account
+ * dashboard, arrived at a different way.
+ */
 const PROFILE_STATE_KEY = "dashboard.selectedProfileId";
 const RANGE_STATE_KEY = "dashboard.range";
 const THREAD_SCOPE_STATE_KEY = "dashboard.threadScope";
@@ -94,7 +103,7 @@ export class DashboardProvider implements vscode.Disposable {
     private readonly lockService: WorkspaceLockService,
     private readonly log: (message: string) => void = () => undefined
   ) {
-    this.selectedProfileId = context.globalState.get<string>(PROFILE_STATE_KEY);
+    this.selectedProfileId = context.workspaceState.get<string>(PROFILE_STATE_KEY);
     this.range = context.globalState.get<DashboardRange>(
       RANGE_STATE_KEY,
       vscode.workspace.getConfiguration("claudeAccounts").get<DashboardRange>(
@@ -191,7 +200,7 @@ export class DashboardProvider implements vscode.Disposable {
     switch (message.type) {
       case "setProfile":
         this.selectedProfileId = message.profileId;
-        await this.context.globalState.update(PROFILE_STATE_KEY, message.profileId);
+        await this.context.workspaceState.update(PROFILE_STATE_KEY, message.profileId);
         await this.refresh();
         break;
       case "setRange":
@@ -262,10 +271,6 @@ export class DashboardProvider implements vscode.Disposable {
   private async buildData(): Promise<DashboardPayload> {
     const document = await this.registry.read();
     const runtime = this.runtimeDetector.detect(document.profiles);
-    const selected = document.profiles.find((profile) => profile.id === this.selectedProfileId)
-      ?? runtime.profile
-      ?? document.profiles[0];
-    this.selectedProfileId = selected?.id;
     const lock = await this.lockService.currentLock();
     const requiredProfile = lock
       ? document.profiles.find((profile) => profile.id === lock.profileId)
@@ -274,6 +279,15 @@ export class DashboardProvider implements vscode.Disposable {
     // bound one when there is a binding, not whatever this window inherited.
     const bound = lock && lock.mode !== "off" ? requiredProfile : undefined;
     const activeProfile = bound ?? runtime.profile;
+    // Resolved after the binding, and by the shared selector, because this page used to open on
+    // the first account in the registry in exactly the case the product exists for: a workspace
+    // bound to an account other than the ambient default.
+    const selected = selectUsageAccount({
+      profiles: document.profiles,
+      requestedId: this.selectedProfileId,
+      inPlay: activeProfile
+    });
+    this.selectedProfileId = selected?.id;
     const runtimeVerification = activeProfile
       ? this.repository.latestAuthVerification(activeProfile.id)
       : undefined;
@@ -291,8 +305,13 @@ export class DashboardProvider implements vscode.Disposable {
     const lastEventAge = health.lastEventAt ? Date.now() - Date.parse(health.lastEventAt) : Infinity;
     const detailed = this.collectionHealth(selected?.id);
 
+    // Read from the selected account's own directory, so viewing another account's quota works
+    // without that account having a session, a bridge, or collection enabled.
+    const quotaCache = selected ? await readQuotaCache(selected.configDir) : undefined;
+
     return {
       quota: buildQuotaReport({
+        cache: quotaCache,
         snapshot: current,
         warningThreshold: vscode.workspace.getConfiguration("claudeAccounts")
           .get<number>("usage.warningThreshold", 70),
@@ -325,8 +344,9 @@ export class DashboardProvider implements vscode.Disposable {
         displayName: profile.displayName,
         marker: profile.marker,
         email: profile.expectedIdentity?.email,
-        organization: profile.expectedIdentity?.organizationName
-          ?? profile.expectedIdentity?.organizationId,
+        // Name only. The organization ID is a UUID, and printed beside the address in the header it
+        // was the longest string on the page while telling the reader nothing they could use.
+        organization: profile.expectedIdentity?.organizationName,
         authMethod: profile.authMethod,
         lastVerifiedAt: profile.lastVerifiedAt
       })),
@@ -441,19 +461,24 @@ export class DashboardProvider implements vscode.Disposable {
     }
     .shell { max-width: 1180px; margin: 0 auto; }
     .topline, .identity, .toolbar, .metric-row, .legend, .provenance { display: flex; align-items: center; gap: 10px; }
-    .topline { justify-content: space-between; flex-wrap: wrap; margin-bottom: 22px; }
+    .topline { justify-content: space-between; flex-wrap: wrap; margin-bottom: 28px; }
     .identity { min-width: 0; }
     .marker {
-      width: 40px; height: 40px; border: 2px solid var(--vscode-focusBorder);
-      display: grid; place-items: center; border-radius: 11px; font-weight: 700; font-size: 16px;
+      width: 34px; height: 34px; border: 1px solid var(--vscode-panel-border);
+      display: grid; place-items: center; border-radius: 9px; font-weight: 650; font-size: 14px;
       background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
     }
-    h1 { margin: 0; font-size: 24px; line-height: 1.15; }
+    h1 { margin: 0; font-size: 19px; line-height: 1.2; font-weight: 600; }
     h2 { margin: 0 0 14px; font-size: 15px; letter-spacing: .01em; }
     .subtle, .meta { color: var(--vscode-descriptionForeground); }
     .meta { font-size: 12px; }
     .grid { display: grid; gap: var(--gap); }
-    .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    /*
+     * Auto-fit, not a fixed two: the card count varies with what Claude reported — two windows, or
+     * two plus a credit pool, or one plus an absent-window note — and at a fixed two columns an odd
+     * count left the last card alone beside half a row of nothing.
+     */
+    .summary { grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); }
     .secondary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .lower { grid-template-columns: minmax(0, 1.4fr) minmax(280px, .8fr); }
     .card {
@@ -463,7 +488,15 @@ export class DashboardProvider implements vscode.Disposable {
       padding: 16px;
       min-width: 0;
     }
-    .card.hero { border-top: 2px solid var(--vscode-focusBorder); }
+    /*
+     * The accent stripe marks a window worth looking at. It used to be on every hero card, in the
+     * same colour, which made it decoration: three identical marks cannot distinguish anything. Now
+     * an unremarkable window has none, and the one that is nearly spent is the only coloured edge
+     * on the page.
+     */
+    .card.hero { border-top: 2px solid transparent; }
+    .card.hero.warning { border-top-color: var(--vscode-charts-orange); }
+    .card.hero.critical { border-top-color: var(--vscode-charts-red); }
     .metric-row { justify-content: space-between; align-items: baseline; }
     .metric { font-size: 24px; font-weight: 650; font-variant-numeric: tabular-nums; }
     .badge {
@@ -486,20 +519,25 @@ export class DashboardProvider implements vscode.Disposable {
     }
     .lockline.error { border-left-color: var(--vscode-errorForeground); }
     .context-labels { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; }
-    .activity-chart {
-      display: grid; grid-auto-flow: column; grid-auto-columns: minmax(28px, 1fr);
-      align-items: end; gap: 8px; min-height: 190px; border-bottom: 1px solid var(--vscode-panel-border);
-      padding: 12px 6px 0; overflow-x: auto;
+    /* Small multiples, one row per series, each on its own scale. See the activity() renderer
+       for why a single stacked axis cannot represent these four together. */
+    .sparks { display: grid; gap: 15px; margin-top: 2px; }
+    .spark-row { display: grid; gap: 5px; }
+    .spark-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 12px; }
+    .spark-name { font-weight: 600; }
+    .spark-peak { color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+    .spark-plot {
+      display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr);
+      align-items: end; gap: 2px; height: 42px;
+      border-bottom: 1px solid var(--vscode-panel-border);
     }
-    .day-column { min-width: 28px; display: grid; grid-template-rows: 150px auto; gap: 6px; text-align: center; }
-    .stack { align-self: end; display: flex; flex-direction: column-reverse; justify-content: flex-start; height: 150px; }
-    .segment { min-height: 1px; }
-    .input { background: var(--series-input); }
-    .output { background: var(--series-output); }
-    .cache-read { background: var(--series-read); }
-    .cache-create { background: var(--series-create); }
-    .legend { flex-wrap: wrap; font-size: 12px; margin: 10px 0; }
-    .swatch { width: 9px; height: 9px; display: inline-block; margin-right: 4px; border-radius: 2px; }
+    .spark-bar { border-radius: 4px 4px 0 0; background: var(--series-input); }
+    .spark-plot.output .spark-bar { background: var(--series-output); }
+    .spark-plot.cache-read .spark-bar { background: var(--series-read); }
+    .spark-plot.cache-create .spark-bar { background: var(--series-create); }
+    .spark-flat { height: 42px; border-bottom: 1px solid var(--vscode-panel-border); }
+    .spark-axis { display: flex; justify-content: space-between; font-size: 11px; margin-top: 6px; font-variant-numeric: tabular-nums; color: var(--vscode-descriptionForeground); }
+    .spark-note { font-size: 12px; color: var(--vscode-descriptionForeground); margin-top: 11px; }
     .bar-row { display: grid; grid-template-columns: minmax(90px, 1fr) 2fr auto; gap: 10px; align-items: center; margin: 9px 0; }
     .bar-track { height: 8px; background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 999px; overflow: hidden; }
     .bar-fill { height: 100%; background: var(--vscode-charts-blue); border-radius: inherit; }
@@ -520,12 +558,33 @@ export class DashboardProvider implements vscode.Disposable {
     .spaced { margin-top: 16px; }
     .table-scroll { overflow-x: auto; }
     .quota-lead { margin-bottom: 18px; }
-    .quota-lead h2 { margin: 0; font-size: 17px; }
-    .quota-lead .metric-row { margin-bottom: 12px; }
-    .quota-lead .metric { font-size: 30px; }
+    /*
+     * The quota cards are the page. Everything competing with them was removed rather than
+     * restyled: a per-card provenance badge, a per-card reading timestamp and a per-card threshold
+     * disclaimer said the same four things four times over, so they are stated once for the
+     * section and the cards carry only the figure.
+     */
+    .card.hero { padding: 20px; }
+    .quota-lead .metric { font-size: 34px; font-weight: 600; letter-spacing: -.02em; }
+    .quota-lead .card.hero h2 { margin: 0; font-size: 13px; font-weight: 500; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: .06em; }
+    .quota-lead .card.hero .metric-row:first-child { margin-bottom: 10px; }
+    /* A window whose own numbers are unremarkable earns no badge; only an exception gets one. */
+    .card.hero .badge:empty { display: none; }
+    /*
+     * Windows Claude reports but that are inactive and unused — a per-model weekly window nobody
+     * has touched — are true readings and are kept, but at the weight they deserve: one line,
+     * below the cards, instead of a hero tile that reads as headroom news.
+     */
+    .quiet-windows {
+      display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px;
+      font-size: 12px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums;
+    }
+    .provenance-line { margin-top: 14px; font-size: 12px; color: var(--vscode-descriptionForeground); }
+    .provenance-line:empty { display: none; }
     /* Secondary by construction: local history is collapsed so quota is what the page is about. */
-    details.secondary { margin-top: 22px; border-top: 1px solid var(--vscode-panel-border); padding-top: 12px; }
+    details.secondary { margin-top: 26px; border-top: 1px solid var(--vscode-panel-border); padding-top: 12px; }
     details.secondary > summary { font-weight: 600; color: var(--vscode-foreground); }
+    details.secondary .toolbar { margin: 14px 0 4px; flex-wrap: wrap; }
     @media (max-width: 720px) {
       .summary, .secondary-grid, .lower { grid-template-columns: 1fr; }
       .toolbar { width: 100%; flex-wrap: wrap; }
@@ -568,49 +627,127 @@ export class DashboardProvider implements vscode.Disposable {
       }
       return [...map.values()].sort((a,b) => a.day.localeCompare(b.day));
     };
-    // Quota is the headline: Claude's own figure, with the headroom left, when it resets, and how
-    // old the reading is. A percentage without its age is not a measurement, and an absent window
-    // is stated as absent — never as 0%.
-    const quotaCard = (reading, data) => \`<section class="card hero">
-        <div class="metric-row"><h2>\${esc(reading.label)}</h2><span class="badge \${reading.severity === 'critical' ? 'error' : reading.severity === 'warning' ? 'warning' : ''}">\${reading.expired ? 'Window has reset' : data.quota.freshness === 'stale' ? 'Stale reading' : 'Reported by Claude'}</span></div>
-        <div class="metric-row"><span class="metric">\${Math.round(reading.remainingPercentage)}% left</span><span>\${Math.round(reading.usedPercentage)}% used</span></div>
+    // Quota is the headline: Claude's own figure, the headroom left, and when it resets. The age of
+    // the reading and its provenance are stated once for the whole section rather than on each
+    // card — they are identical across cards, because they describe the one reading all of them
+    // come from. An absent window is stated as absent, never as 0%.
+    const quotaCard = (reading, data) => {
+      // Only an exception earns a badge. "Reported by Claude" on a card that is reported by Claude,
+      // beside three other cards saying the same, is chrome that hides the one badge that matters.
+      const note = reading.expired ? 'Window has reset' : data.quota.freshness === 'stale' ? 'Stale reading' : '';
+      return \`<section class="card hero \${pctClass(reading.usedPercentage, data.thresholds.usageWarning, data.thresholds.usageCritical)}">
+        <div class="metric-row"><h2>\${esc(reading.label)}</h2><span class="badge \${reading.severity === 'critical' ? 'error' : reading.severity === 'warning' ? 'warning' : ''}">\${esc(note)}</span></div>
+        <div class="metric-row"><span class="metric">\${Math.round(reading.remainingPercentage)}% left</span><span class="meta">\${Math.round(reading.usedPercentage)}% used</span></div>
         <progress class="\${pctClass(reading.usedPercentage, data.thresholds.usageWarning, data.thresholds.usageCritical)}" max="100" value="\${reading.usedPercentage}" aria-label="\${esc(reading.label)}: \${Math.round(reading.usedPercentage)}% used, \${Math.round(reading.remainingPercentage)}% remaining"></progress>
-        <div class="meta">\${reading.resetsAtIso ? 'Resets ' + esc(when(reading.resetsAtIso, data.timezone)) + ' · ' + esc(reading.expired ? 'due now' : reading.resetsInLabel) : 'Claude did not report a reset time for this window'}</div>
-        <div class="meta">Reading taken \${esc(data.quota.capturedAt ? when(data.quota.capturedAt, data.timezone) : 'unknown')}\${data.quota.ageLabel ? ' · ' + esc(data.quota.ageLabel) : ''}\${data.quota.freshness === 'stale' ? ' · Claude has not refreshed it since, so this may not be current headroom' : ''}</div>
-        <div class="meta">Claude's own figure · Local alerts at \${num(data.thresholds.usageWarning)}% / \${num(data.thresholds.usageCritical)}% used, which are this extension's preferences and not Anthropic policy</div>
+        <div class="meta">\${reading.resetsAtIso ? (reading.expired ? 'Reset due now · ' : 'Resets in ' + esc(reading.resetsInLabel.replace(/^in /, '')) + ' · ') + esc(when(reading.resetsAtIso, data.timezone)) : 'No reset time reported'}</div>
       </section>\`;
+    };
     const quotaAbsentCard = (entry) => \`<section class="card hero">
         <div class="metric-row"><h2>\${esc(entry.label)}</h2><span class="badge">Not reported</span></div>
         <div class="empty">\${esc(entry.detail)}</div>
       </section>\`;
+    /*
+     * The credit pool is not a time window: it has a currency and a cap that can be reached while
+     * every window still has headroom, so it gets its own card rather than a percentage bar.
+     *
+     * The amounts arrive in minor units with the number of decimal places alongside. Applying that
+     * exponent is not cosmetic — without it a A$50.00 cap printed as "A$5,000". When Claude does not
+     * say how many places the amounts carry, no amount is shown, because a wrong one is worse.
+     */
+    const creditCard = (pool, data) => {
+      const amount = (minorUnits) => {
+        if (minorUnits == null || pool.currencyExponent == null) return null;
+        const value = minorUnits / Math.pow(10, pool.currencyExponent);
+        return pool.currency
+          ? new Intl.NumberFormat(undefined, { style: 'currency', currency: pool.currency, minimumFractionDigits: pool.currencyExponent, maximumFractionDigits: pool.currencyExponent }).format(value)
+          : value.toFixed(pool.currencyExponent);
+      };
+      const used = amount(pool.usedMinorUnits);
+      const limit = amount(pool.limitMinorUnits);
+      const spend = used && limit ? used + ' of ' + limit : used || (limit ? 'cap ' + limit : '');
+      const state = pool.spendLimitReached || pool.utilization >= data.thresholds.usageCritical ? 'error' : pool.utilization >= data.thresholds.usageWarning ? 'warning' : '';
+      const note = pool.spendLimitReached ? 'Spend limit reached' : pool.disabledReason ? 'Unavailable' : pool.enabled ? '' : 'Not enabled';
+      return \`<section class="card hero \${pctClass(pool.utilization, data.thresholds.usageWarning, data.thresholds.usageCritical)}">
+        <div class="metric-row"><h2>Extra usage credits</h2><span class="badge \${state}">\${esc(note)}</span></div>
+        <div class="metric-row"><span class="metric">\${spend ? esc(spend) : Math.round(pool.utilization) + '% used'}</span><span class="meta">\${spend ? Math.round(pool.utilization) + '% used' : ''}</span></div>
+        <progress class="\${pctClass(pool.utilization, data.thresholds.usageWarning, data.thresholds.usageCritical)}" max="100" value="\${pool.utilization}" aria-label="Extra usage credits: \${Math.round(pool.utilization)}% used\${spend ? ', ' + esc(spend) : ''}"></progress>
+        <div class="meta">\${pool.disabledReason ? esc(pool.disabledReason) : 'Used only once a plan window is exhausted'}</div>
+      </section>\`;
+    };
+    /** Reported, but neither in force nor touched — true, and not news. One line, not a tile. */
+    const isQuiet = (reading) => reading.window === 'weekly_scoped' && !reading.active && reading.usedPercentage === 0;
     const quotaSection = (data) => {
+      const loud = data.quota.windows.filter((reading) => !isQuiet(reading));
+      const quiet = data.quota.windows.filter(isQuiet);
       const cards = [
-        ...data.quota.windows.map((reading) => quotaCard(reading, data)),
+        ...loud.map((reading) => quotaCard(reading, data)),
+        ...(data.quota.creditPool ? [creditCard(data.quota.creditPool, data)] : []),
         ...data.quota.absent.map(quotaAbsentCard)
       ].join('');
+      const quietLine = quiet.length
+        ? \`<div class="quiet-windows">\${quiet.map((reading) => \`<span>\${esc(reading.label)} · unused</span>\`).join('')}</div>\`
+        : '';
       const storage = data.storage.failing
         ? \`<div class="lockline error"><strong>Local usage storage is failing\${data.storage.category ? ' (' + esc(data.storage.category) + ')' : ''}</strong><div class="meta">Nothing has been written since\${data.storage.lastFailureAt ? ' ' + esc(when(data.storage.lastFailureAt, data.timezone)) : ''}, so any figure on this page may be frozen. Account switching and workspace bindings are unaffected.</div></div>\`
         : '';
-      return \`<section class="quota-lead">
-        <div class="metric-row"><h2>Plan quota, as reported by Claude</h2><span class="badge">\${data.quota.windows.length ? 'Live from Claude' : 'Awaiting Claude'}</span></div>
+      // Said once, for every card above it: whose figure this is, and how old. Anything a threshold
+      // has actually fired on names the threshold — the rest of the time the numbers are unflagged
+      // and there is nothing to disclaim.
+      const fired = loud.some((reading) => reading.severity !== 'normal')
+        || (data.quota.creditPool && data.quota.creditPool.utilization >= data.thresholds.usageWarning);
+      const provenance = data.quota.windows.length || data.quota.creditPool
+        ? \`Claude's own reading, taken \${esc(data.quota.capturedAt ? when(data.quota.capturedAt, data.timezone) : 'at an unknown time')}\${data.quota.ageLabel ? ' · ' + esc(data.quota.ageLabel) : ''}\${data.quota.freshness === 'stale' ? ' · Claude has not refreshed it since, so this may not be current headroom' : ''}. Never calculated or inferred here.\${fired ? ' Colour thresholds are a preference of this extension (' + num(data.thresholds.usageWarning) + '% / ' + num(data.thresholds.usageCritical) + '% used), not Anthropic policy.' : ''}\`
+        : '';
+      // Named for assistive technology, unheaded for everyone else: the cards title themselves, so a
+      // visible "Plan quota" above them was a row of text restating the row of text below it.
+      return \`<section class="quota-lead" aria-label="Plan quota, as reported by Claude">
         \${storage}
         <div class="grid summary">\${cards}</div>
-        <div class="disclaimer">These two windows are all Claude exposes to a status line, so they are all Workspace Accounts can show. Per-model quotas — a Sonnet-only or Opus-only weekly window — and extra-usage credit pools exist, but only inside a private endpoint the official extension calls; they never reach a third-party extension, and Workspace Accounts will not guess at them from token counts.</div>
+        \${quietLine}
+        <div class="provenance-line">\${provenance}</div>
       </section>\`;
     };
+    // Small multiples: one row per series, each scaled to its own peak.
+    //
+    // These four cannot share an axis. Cache reads run three to four orders of magnitude above
+    // input — measured at 97% of all tokens and 4,002x input on real data — so a stacked linear
+    // chart drew one solid block of the cache-read colour with the other three pinned to the
+    // minimum-height floor, on every day and in every range. It looked identical no matter what
+    // had happened. Per-series scales cost comparability between rows, which is why each row
+    // states its own peak and the note below says heights do not compare across rows.
     const activity = (days) => {
       if (!days.length) return '<div class="empty">No local token activity in this range.</div>';
-      const max = Math.max(...days.map(d => d.input+d.output+d.read+d.create), 1);
-      const columns = days.map(day => {
-        const values = [
-          ['input', day.input], ['output', day.output], ['cache-read', day.read], ['cache-create', day.create]
-        ];
-        const segments = values.map(([kind, value]) => \`<span class="segment \${kind}" data-height="\${Math.max(value/max*150, value ? 1 : 0)}" title="\${esc(kind)}: \${num(value)} tokens"></span>\`).join('');
-        const total = day.input+day.output+day.read+day.create;
-        return \`<div class="day-column" tabindex="0" aria-label="\${esc(day.day)}: \${num(total)} total tokens"><div class="stack">\${segments}</div><span class="meta">\${esc(day.day.slice(5))}</span></div>\`;
+      const series = [
+        ['input', 'Input', 'input'],
+        ['output', 'Output', 'output'],
+        ['read', 'Cache read', 'cache-read'],
+        ['create', 'Cache creation', 'cache-create']
+      ];
+      const plotHeight = 42;
+      const rows = series.map(([key, label, kind]) => {
+        const peak = days.reduce((high, day) => Math.max(high, day[key]), 0);
+        if (!peak) {
+          return \`<div class="spark-row"><div class="spark-head"><span class="spark-name">\${esc(label)}</span><span class="spark-peak">none in this range</span></div><div class="spark-flat"></div></div>\`;
+        }
+        const bars = days.map((day) => {
+          const value = day[key];
+          // A real but tiny reading keeps a 2px floor so it stays visible; a genuine zero draws
+          // nothing at all, so "none that day" and "a little that day" never look the same.
+          const height = value ? Math.max(value / peak * plotHeight, 2) : 0;
+          return \`<span class="spark-bar" data-height="\${height.toFixed(2)}" title="\${esc(day.day)} · \${esc(label)}: \${num(value)} tokens"></span>\`;
+        }).join('');
+        // Capped rather than stretched: a single day against grid-auto-columns:1fr previously
+        // expanded to the full panel width and read as a wall rather than one day's bar.
+        return \`<div class="spark-row">
+          <div class="spark-head"><span class="spark-name">\${esc(label)}</span><span class="spark-peak">peak \${num(peak)}/day</span></div>
+          <div class="spark-plot \${kind}" role="img" aria-label="\${esc(label)} per day. Peak \${num(peak)} tokens in one day." data-maxwidth="\${days.length * 26}">\${bars}</div>
+        </div>\`;
       }).join('');
-      return \`<div class="activity-chart" role="img" aria-label="Stacked daily token usage">\${columns}</div>
-        <div class="legend"><span><i class="swatch input"></i>Input</span><span><i class="swatch output"></i>Output</span><span><i class="swatch cache-read"></i>Cache read</span><span><i class="swatch cache-create"></i>Cache creation</span></div>\`;
+      const axis = days.length > 1
+        ? \`<div class="spark-axis"><span>\${esc(days[0].day)}</span><span>\${esc(days[days.length - 1].day)}</span></div>\`
+        : \`<div class="spark-axis"><span>\${esc(days[0].day)}</span></div>\`;
+      return \`<div class="sparks">\${rows}</div>\${axis}
+        <div class="spark-note">Each row is scaled to its own peak, stated on its right. Heights compare within a row, never between rows — cache reads run far above the other three.</div>\`;
     };
     let attributionDimension = 'model';
     let attributionMeasure = 'tokens';
@@ -647,8 +784,22 @@ export class DashboardProvider implements vscode.Disposable {
     const tableRows = (days) => days.length ? days.map(day => \`<tr><td>\${esc(day.day)}</td><td class="num">\${num(day.input)}</td><td class="num">\${num(day.output)}</td><td class="num">\${num(day.read)}</td><td class="num">\${num(day.create)}</td><td class="num">\${money(day.cost)}</td><td class="num">\${duration(day.active)}</td></tr>\`).join('') : '<tr><td colspan="7">No rows.</td></tr>';
     let modelFilter = 'all';
     let workspaceFilter = 'all';
+    /*
+     * Whether the local-detail section is expanded, remembered across renders.
+     *
+     * It has to be: the range, activity, model and workspace filters moved inside it — they only
+     * ever drove the numbers in there, and above the fold they were four controls competing with
+     * the quota — and every one of them re-renders the page. Without this the section a filter
+     * belongs to would slam shut the moment that filter was used. Null means "not chosen yet",
+     * which resolves to open only when there is no quota to be the headline instead.
+     *
+     * No backticks in here: this comment is inside the template literal that builds the page, so
+     * one would end the literal and take the rest of the document with it.
+     */
+    let detailOpen = null;
     function render(data) {
       const selected = profile(data);
+      if (detailOpen === null) detailOpen = data.quota.windows.length === 0;
       if (!selected) {
         app.innerHTML = \`<div class="empty"><div><h1>Claude has not reported any quota yet</h1>
           <p>\${esc(data.setup.collection.headline)}</p>
@@ -681,24 +832,26 @@ export class DashboardProvider implements vscode.Disposable {
       const successRate = data.reliability.requests ? Math.round((data.reliability.requests-data.reliability.errors)/data.reliability.requests*100) : 0;
       app.innerHTML = \`
         <header class="topline">
-          <div class="identity"><div class="marker" aria-hidden="true">\${esc(selected.marker)}</div><div><h1>\${esc(selected.displayName)} \${selected.id === data.runtimeProfileId ? '<span class="badge">Used in this workspace</span>' : '<span class="badge">Viewing only</span>'}</h1><div class="subtle">\${esc(selected.email || 'Identity not yet confirmed')}\${selected.organization ? ' · '+esc(selected.organization) : ''}</div><div class="meta">\${esc(selected.authMethod || 'Authentication method unavailable')} · Verified \${esc(when(selected.lastVerifiedAt, data.timezone))} · Workspace \${esc(current?.workspaceLabel || data.lock?.workspaceLabel || 'unavailable')}</div></div></div>
+          <div class="identity"><div class="marker" aria-hidden="true">\${esc(selected.marker)}</div><div><h1>\${esc(selected.displayName)} \${selected.id === data.runtimeProfileId ? '<span class="badge">This workspace</span>' : '<span class="badge">Viewing only</span>'}</h1><div class="meta">\${esc(selected.email || 'Identity not yet confirmed')}\${selected.organization ? ' · '+esc(selected.organization) : ''}</div></div></div>
           <div class="toolbar">
-            <label>Account <select id="profile-select" aria-label="Dashboard account">\${data.profiles.map(p => \`<option value="\${esc(p.id)}" \${p.id === selected.id ? 'selected' : ''}>\${esc(p.displayName)}</option>\`).join('')}</select></label>
-            <label>Range <select id="range-select" aria-label="Dashboard date range">\${['24h','7d','30d','custom'].map(value => \`<option value="\${value}" \${value === data.range ? 'selected' : ''}>\${value}</option>\`).join('')}</select></label>
-            \${data.range === 'custom' ? \`<label>From <input id="custom-from" type="date" value="\${esc(data.customRange.from)}"></label><label>To <input id="custom-to" type="date" value="\${esc(data.customRange.to)}"></label><button class="secondary" id="apply-custom-range">Apply dates</button>\` : ''}
-            <label>Activity <select id="thread-scope" aria-label="Main thread or all activity"><option value="main" \${data.threadScope === 'main' ? 'selected' : ''}>Main thread</option><option value="all" \${data.threadScope === 'all' ? 'selected' : ''}>All + auxiliary</option></select></label>
-            <label>Model <select id="model-filter" aria-label="Filter activity by model"><option value="all">All models</option>\${models.map(value => \`<option value="\${esc(value)}">\${esc(value)}</option>\`).join('')}</select></label>
-            <label>Workspace <select id="workspace-filter" aria-label="Filter activity by workspace"><option value="all">All workspaces</option>\${workspaces.map(value => \`<option value="\${esc(value)}">\${esc(value)}</option>\`).join('')}</select></label>
-            <button id="switch">Use this account in this workspace</button>
-            <button class="secondary" id="refresh">Verify now</button>
+            <label class="meta">Account <select id="profile-select" aria-label="Dashboard account">\${data.profiles.map(p => \`<option value="\${esc(p.id)}" \${p.id === selected.id ? 'selected' : ''}>\${esc(p.displayName)}</option>\`).join('')}</select></label>
+            \${selected.id === data.runtimeProfileId ? '' : '<button id="switch">Use in this workspace</button>'}
+            <button class="secondary" id="refresh">Verify</button>
           </div>
         </header>
         \${setupBanner}
         \${quotaSection(data)}
         \${lock}
-        <details class="secondary" \${data.quota.windows.length ? '' : 'open'}>
+        <details class="secondary" \${detailOpen ? 'open' : ''} id="local-detail">
         <summary>Locally collected detail — tokens, cost, tools, and daily history since Workspace Accounts was installed</summary>
         <div class="disclaimer">None of the numbers below measure plan headroom. They are this extension's own observations of Claude Code, they begin when it was installed, and they are shown because they are occasionally useful — not because they say anything about your quota.</div>
+        <div class="toolbar">
+          <label class="meta">Range <select id="range-select" aria-label="Dashboard date range">\${['24h','7d','30d','custom'].map(value => \`<option value="\${value}" \${value === data.range ? 'selected' : ''}>\${value}</option>\`).join('')}</select></label>
+          \${data.range === 'custom' ? \`<label class="meta">From <input id="custom-from" type="date" value="\${esc(data.customRange.from)}"></label><label class="meta">To <input id="custom-to" type="date" value="\${esc(data.customRange.to)}"></label><button class="secondary" id="apply-custom-range">Apply dates</button>\` : ''}
+          <label class="meta">Activity <select id="thread-scope" aria-label="Main thread or all activity"><option value="main" \${data.threadScope === 'main' ? 'selected' : ''}>Main thread</option><option value="all" \${data.threadScope === 'all' ? 'selected' : ''}>All + auxiliary</option></select></label>
+          <label class="meta">Model <select id="model-filter" aria-label="Filter activity by model"><option value="all">All models</option>\${models.map(value => \`<option value="\${esc(value)}">\${esc(value)}</option>\`).join('')}</select></label>
+          <label class="meta">Workspace <select id="workspace-filter" aria-label="Filter activity by workspace"><option value="all">All workspaces</option>\${workspaces.map(value => \`<option value="\${esc(value)}">\${esc(value)}</option>\`).join('')}</select></label>
+        </div>
         <section class="card spaced">
           <div class="metric-row"><h2>Current session context</h2><span class="badge">\${current ? 'Locally observed' : 'Unavailable'}</span></div>
           \${current ? \`<div class="context-labels"><span><strong>\${esc(current.modelDisplayName || current.modelId || 'Unknown model')}</strong> · \${esc(current.effort || 'default')} effort\${current.thinkingEnabled ? ' · thinking on' : ''}</span><span>\${used == null ? 'Usage unavailable' : Math.round(used)+'% used · '+Math.round(current.contextWindow?.remainingPercentage ?? Math.max(0, 100-used))+'% remaining'}</span></div>
@@ -751,7 +904,13 @@ export class DashboardProvider implements vscode.Disposable {
           <div class="mini"><div class="meta">Pull requests</div><div class="metric">\${num(totals.prs)}</div></div>
         </div><div class="disclaimer">Activity is not a measure of code quality or developer performance.</div></section>
         </details>
-        <footer class="provenance"><div><strong>\${esc(data.setup.collection.headline)}</strong><div class="meta">\${esc(data.setup.collection.detail)}</div><div class="meta">Account in play · \${esc(data.setup.runtimeRegistered ? ((data.profiles.find(p => p.id === data.runtimeProfileId)?.displayName || 'known') + (data.setup.boundProfileName ? ' (this workspace)' : ' (default)')) : 'not tracked ('+data.setup.runtimeConfigDir+')')} · Status-line bridge for that account · \${data.setup.profileTelemetryEnabled ? 'installed' : 'not installed'} · Claude Code integration · \${esc(data.setup.wrapperState === 'guard' ? 'on' : data.setup.wrapperState === 'foreign' ? 'another wrapper' : 'off')}</div><div class="meta">Quota · reported by Claude, never calculated here · Local detail · \${esc(data.collection.source)} · Last local event \${esc(when(data.collection.lastEventAt, data.timezone))} · Times shown in \${esc(data.timezone)}</div></div><button class="secondary" id="export">Export local data</button></footer>
+        \${/*
+          * Setup state, one line. Collection headline and detail are already the banner above
+          * whenever collection is not simply working, and quota provenance is already stated under
+          * the cards, so repeating either here only buried the integration state — the one fact
+          * this footer holds that nothing else on the page shows.
+          */''}
+        <footer class="provenance"><div class="meta">Claude Code integration \${esc(data.setup.wrapperState === 'guard' ? 'on' : data.setup.wrapperState === 'foreign' ? '· another wrapper is configured' : 'off')} · Local collection \${data.setup.profileTelemetryEnabled ? 'on' : 'off'}, last event \${esc(when(data.collection.lastEventAt, data.timezone))} · Times in \${esc(data.timezone)}</div><button class="secondary" id="export">Export local data</button></footer>
       \`;
       document.getElementById('profile-select')?.addEventListener('change', event => vscode.postMessage({ type: 'setProfile', profileId: event.target.value }));
       document.getElementById('range-select')?.addEventListener('change', event => vscode.postMessage({ type: 'setRange', range: event.target.value }));
@@ -777,6 +936,7 @@ export class DashboardProvider implements vscode.Disposable {
           render(data);
         });
       }
+      document.getElementById('local-detail')?.addEventListener('toggle', event => { detailOpen = event.target.open; });
       document.getElementById('collection-action')?.addEventListener('click', () => vscode.postMessage({ type: 'collectionAction' }));
       document.getElementById('switch')?.addEventListener('click', () => vscode.postMessage({ type: 'switchProfile', profileId: selected.id }));
       document.getElementById('reopen-required')?.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
@@ -804,6 +964,11 @@ export class DashboardProvider implements vscode.Disposable {
       });
       document.querySelectorAll('[data-width]').forEach(element => {
         if (element instanceof HTMLElement) element.style.width = Number(element.dataset.width || 0) + '%';
+      });
+      // Bars stay flexible so a long range fills the panel, but the plot never grows past one
+      // sensible bar width per day — otherwise a single day stretches across the whole card.
+      document.querySelectorAll('[data-maxwidth]').forEach(element => {
+        if (element instanceof HTMLElement) element.style.maxWidth = Number(element.dataset.maxwidth || 0) + 'px';
       });
     }
     const renderError = (message) => {

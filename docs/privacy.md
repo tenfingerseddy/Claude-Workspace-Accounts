@@ -13,9 +13,18 @@ Claude Workspace Accounts is local-first. It does not provide a network service 
 
 Email and organization identifiers are personal data. Profile metadata has an explicit JSON export and deletion path.
 
+### The one file it reads inside a Claude account directory
+
+Plan quota is read from `cachedUsageUtilization` in `<configDir>\.claude.json`, which Claude Code writes there itself when it refreshes usage. The extension only ever reads that file, only that one member of it, and stores only quota fields from it: the percentage, reset time, model name and reported severity of each window, the extra-usage pool's utilization and limit, and Claude's own timestamp for the reading.
+
+`.claude.json` also holds unrelated things, including the account block Claude keeps there. None of it is read, stored, displayed, or exported. `.credentials.json` sits beside it and is still never opened — see below.
+
+This is how quota reaches the status bar and dashboard for an account. It needs no session, no status line, no local collection, and no write of any kind into your account directory.
+
 ## Data the extension never reads or stores
 
 - `.credentials.json`.
+- Any part of `<configDir>\.claude.json` other than `cachedUsageUtilization`.
 - OAuth tokens, API keys, browser cookies, passwords, or raw authorization headers.
 - Prompt or response text.
 - Tool input or output content.

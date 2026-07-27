@@ -102,39 +102,101 @@ directory is correct behaviour, and blocking there would prevent the user from e
 blocks on genuine identity mismatch, `warn` binds and never blocks, `off` disables the binding. The UI
 does not ask — it uses `claudeAccounts.defaultBindMode`.
 
-### Identity verification barely works, and nothing may depend on it
+### Identity verification works — an earlier note here said it did not
 
-Verified by hand against Claude Code 2.1.220's bundled binary: `claude auth status` stops reporting
-account identity whenever `CLAUDE_CONFIG_DIR` is set — **even when set to the directory that was
-already the default**. `subscriptionType` survives; `email`, `orgId` and `orgName` come back `null`.
-There has never been an `accountId` field.
+An earlier revision of this file recorded that `claude auth status` returns `email`, `orgId` and
+`orgName` as `null` whenever `CLAUDE_CONFIG_DIR` is set, and built three layers of the product around
+that. **Re-verified against 2.1.220's bundled binary, it reports full identity, per directory:**
 
 ```
-$ claude auth status                                    -> "email":"someone@example.com","orgId":"..."
-$ CLAUDE_CONFIG_DIR=<the same default dir> claude auth status  -> "email":null,"orgId":null
+$ CLAUDE_CONFIG_DIR=~/.claude-work     claude auth status  -> kane…@nexwave.com.au, orgName "nexwave", team
+$ CLAUDE_CONFIG_DIR=~/.claude-personal claude auth status  -> kanesnyder1@gmail.com, max
+$ claude auth status                                       -> the ambient directory's account
 ```
 
-Since binding always sets `CLAUDE_CONFIG_DIR`, `compareIdentity` yields `unverifiable` for every bound
-profile, so mismatch can never actually be detected and `enforce` is in practice identical to `warn`.
+So `compareIdentity` can genuinely detect a bound directory re-authenticated as somebody else, and
+`enforce` is a real mode rather than a synonym for `warn`. There is still no `accountId` field; email
+and organization are the identity.
 
-This shipped as a hard failure: `AuthVerifier.verify()` always set the variable, so every verification
-returned no identity, and `confirmIdentity` rejected any result lacking an email or account ID — which
-made "Register Current Account" **impossible**, and left profiles without `expectedIdentity`, which the
-old lock command then filtered out. Three layers, one root cause.
+#### Why `CLAUDE_SECURESTORAGE_CONFIG_DIR` cannot replace `CLAUDE_CONFIG_DIR`
 
-Rules that follow:
+Switching `CLAUDE_CONFIG_DIR` relocates chat transcripts along with the account, because the CLI keeps
+them under `<configDir>\projects\`. The official extension resolves that path from the *extension
+host's* environment, which the wrapper never touches, so the history picker reads the default root
+while the CLI writes to the bound one — an empty picker, and a blank window on reload when the
+extension asks to resume a session id the CLI cannot see. There is no setting that fixes this;
+`claudeCode.environmentVariables` configures the launched process, not the host.
 
-- **Never gate registration, binding, or any user action on identity being available.** Signed-in with
-  no identity details is a normal, registrable state, not an error.
-- Verify **without** setting `CLAUDE_CONFIG_DIR` when the profile is the ambient default, which is the
-  one case where real identity is obtainable.
-- Keep `compareIdentity` and the mismatch paths — they are correct and will start working if the CLI
-  reports those fields again. Just never depend on them.
-- Say so in the UI and docs. Do not imply Workspace Accounts can detect a bound directory being
-  re-authenticated as somebody else, because on this CLI it cannot.
+The obvious escape is to inject only `CLAUDE_SECURESTORAGE_CONFIG_DIR`, since the CLI resolves
+`.credentials.json` from it (`bk()` → `_k()` → `CLAUDE_SECURESTORAGE_CONFIG_DIR ?? CLAUDE_CONFIG_DIR`),
+leaving history shared. **Do not.** Tested against 2.1.220, the two variables split what should be one
+answer — `auth status` takes `email`/`orgId`/`orgName` from the *config* directory and the credential
+from the *secure-storage* directory:
 
-Whether this is intended CLI behaviour or an upstream bug is unknown — `subscriptionType` surviving
-while `email` does not looks more like a bug. Either way, build for its absence.
+```
+CONFIG=.claude-personal SECURESTORAGE=.claude-work -> kanesnyder1@gmail.com, subscriptionType "team"
+CONFIG=.claude-work SECURESTORAGE=.claude-personal -> kane…@nexwave.com.au,  subscriptionType "max"
+```
+
+`subscriptionType` is the tell: it follows the credential while the identity fields follow the config
+directory. So a secure-storage-only design would run as one account while `auth status` — the single
+source `compareIdentity`, `expectedIdentity` and `enforce` all depend on — confidently named the other.
+That converts identity verification from a real check into a wrong answer, which is worse than the
+history split it was meant to solve. Pointing secure storage at a directory with no `.credentials.json`
+returns `loggedIn: false`, which is how the split was isolated.
+
+The rules that came out of the wrong finding are mostly still right, for better reasons:
+
+- **Still never gate registration or binding on identity being available.** It is available now, but
+  an account can be signed out, and a probe can fail; neither is a reason to refuse to register.
+- Verify without setting `CLAUDE_CONFIG_DIR` when the profile is the ambient default. Harmless, and
+  it keeps one less variable in play.
+- What must change: UI and docs may no longer claim a wrong-account change cannot be detected, and
+  `defaultBindMode` no longer has a reason to be `warn` — it was set that way solely because
+  `enforce` named a behaviour believed impossible.
+
+The lesson worth keeping is the one about method. That claim was recorded as verified, cited a version
+number, and shaped `defaultBindMode`, the registration flow and the UI copy — and it was wrong. Re-test
+a load-bearing claim about the CLI before building a third layer on it.
+
+### Quota comes from the account's own directory, not the status line
+
+`cachedUsageUtilization` in `<configDir>\.claude.json` is the quota source, read by
+`src/usage/quotaCache.ts`. Claude Code writes it there itself. It is per configuration directory,
+which is per account, which is this product's unit — so quota needs no session, no status line, no
+collection, and no write into the account.
+
+This replaced the status line, which was the original design and could never have worked here. The
+official extension launches the CLI with `--output-format stream-json`, which renders no status line,
+so `statusLine` is never invoked on the launch path this product exists to manage. Verified by
+launching the bundled binary that way and watching the snapshot inbox stay empty. The bridge still
+runs for `claude` in a terminal and its snapshot is still read when there is no cache, but it is a
+fallback, not the source.
+
+Two claims that were in this file and printed in the UI were also false, and both are in that file:
+per-model weekly windows arrive as `limits[]` entries with `kind: "weekly_scoped"` and a
+`scope.model.display_name`, and the extra-usage credit pool as `extra_usage`. Neither is private to
+the official extension. Do not reintroduce a disclaimer that this product cannot know them.
+
+Three things about reading it:
+
+- **`fetchedAtMs` is Claude's timestamp for the reading, not ours.** It is a cache; it can be
+  arbitrarily stale, and an undated reading is reported as ancient rather than assumed fresh.
+- **`limits[]` names the two headline windows again**, as `session` and `weekly_all`. Take
+  `five_hour`/`seven_day` from the dedicated `utilization` members and read `limits[]` only for
+  per-model windows, or the status bar's severity ranking counts each window twice.
+- **`extra_usage.monthly_limit` and `used_credits` are minor units, not dollars.** A A$50.00 cap
+  with A$58.13 spent arrives as `5000` and `5813`, with the scale in `decimal_places` and again in
+  the parallel `spend` block as `{amount_minor, exponent}`. Rendered as major units they became
+  "A$5,813 of A$5,000" — the only figure on the dashboard denominated in the user's own money, wrong
+  by a factor of a hundred, and obvious to the owner at a glance. The model type names them
+  `usedMinorUnits`/`limitMinorUnits` so the next reader cannot repeat it, and when neither source
+  states the exponent no amount is shown at all: a plausible wrong number is worse than none.
+
+Quota is also unrelated to `telemetryEnabled`. That flag gates local collection — the OTLP telemetry
+and the bridge's snapshots — and a profile missing it silently disabled both, which is worth knowing
+because the flag being absent on one account produced a completely empty dashboard with no
+explanation.
 
 ### What this is not
 
