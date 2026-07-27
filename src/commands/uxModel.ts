@@ -482,13 +482,13 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
         action: "updateIdentity"
       });
     } else if (bound && state.identity === "unidentified") {
-      // Not a fault and not fixable from here: current Claude Code versions report no email
-      // or organization whenever a per-workspace account is in use.
+      // Signed in, but the probe returned no email or organization. Not a fault, and re-checking
+      // is worth offering because identity is normally readable per account directory.
       entries.push({
         kind: "item",
         label: `$(check) ${state.boundProfileName} is signed in`,
-        description: "Account details not reported by this Claude version",
-        detail: "The account is applied and working. Claude Code does not report which account it is when a per-workspace account is in use, so Workspace Accounts cannot warn you if that directory is signed into a different account.",
+        description: "No account details recorded",
+        detail: "The account is applied and working, but Claude returned no email or organization for it, so there is nothing to warn you against if that directory is later signed into a different account. Re-check to try recording one.",
         action: "verify"
       });
     } else if (bound && state.identity === "unconfirmed") {
@@ -545,10 +545,10 @@ export function buildAccountMenu(state: MenuState): MenuEntry[] {
     entries.push({
       kind: "item",
       label: `$(check) Verify ${state.accountName} now`,
-      // Do not promise drift detection. Claude Code returns email and orgId as null whenever
-      // CLAUDE_CONFIG_DIR is set, which is always true for a bound account, so the recorded
-      // identity has nothing comparable to answer it and the check cannot fire.
-      detail: `Runs claude auth status for that account and records whatever identity Claude returns. Later mismatch detection only works while Claude returns a comparable identity, which on this Claude version means your default account only — for a per-workspace account it reports being signed in and nothing more. Last verified: ${state.lastVerifiedLabel ?? "never"}.`,
+      // Drift detection is real: `auth status` answers per configuration directory, so a bound
+      // account that was signed into somebody else is detectable. It still cannot fire without a
+      // recorded identity to compare against, which is what this action supplies.
+      detail: `Runs claude auth status for that account and records the identity Claude returns, so a later change of account in that directory can be detected. Last verified: ${state.lastVerifiedLabel ?? "never"}.`,
       action: "verify"
     });
   }

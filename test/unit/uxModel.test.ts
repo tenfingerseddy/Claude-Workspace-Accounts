@@ -484,13 +484,15 @@ describe("buildAccountMenu", () => {
   });
 
   it("presents a signed-in-but-unidentifiable account as working, not broken", () => {
-    // The CLI reports no account details whenever a per-workspace account is in use, so this
-    // must not offer a fix that cannot exist, and must not read as an error.
+    // Signed in, but the probe returned no email or organization. Still a legitimate state, so it
+    // must not read as an error — but it must not be blamed on the Claude version either, which is
+    // what this used to assert. Identity is readable per account directory.
     const entries = buildAccountMenu(menuState({ identity: "unidentified" }));
     expect(actions(menuState({ identity: "unidentified" }))).not.toContain("updateIdentity");
     const row = entries.find((entry) => entry.label.includes("is signed in"));
-    expect(row?.description).toContain("not reported by this Claude version");
-    expect(row?.detail).toContain("cannot warn you");
+    expect(row?.description).toContain("No account details recorded");
+    expect(row?.detail).toContain("applied and working");
+    expect(`${row?.description} ${row?.detail}`).not.toMatch(/this Claude version|does not report/i);
   });
 
   it("treats a never-verified binding as optional, not broken", () => {

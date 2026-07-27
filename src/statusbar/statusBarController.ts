@@ -271,11 +271,12 @@ export class StatusBarController implements vscode.Disposable {
       && verification.state === "signed_in"
       && !verification.email
       && !verification.accountId) {
-      // The CLI reports no identity for any account used through CLAUDE_CONFIG_DIR, so this is
-      // the normal state for a bound account: named, but not treated as a problem.
+      // Signed in, but this probe came back without an email or organization. Identity is
+      // normally readable per directory, so this is unusual rather than the norm — still not a
+      // fault, and never a reason to treat the account as wrong.
       return {
         ...status,
-        detail: `${status.detail} Claude Code does not report which account this is while a per-workspace account is in use, so a change of account inside ${bound.displayName} cannot be detected.`
+        detail: `${status.detail} Claude returned no account details for ${bound.displayName} on the last check, so a change of account inside it cannot be detected until one is recorded.`
       };
     }
     if (verification

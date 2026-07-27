@@ -4,10 +4,14 @@ import path from "node:path";
 /**
  * How one account is probed, kept free of `vscode` so it can be tested directly.
  *
- * Claude Code reports `email`, `orgId` and `orgName` as null whenever `CLAUDE_CONFIG_DIR` is
- * set — even when it is set to the directory that was already the default — while still
- * reporting `loggedIn: true`. The only way to learn a real identity is therefore to leave the
- * variable unset, which is only honest for the account the CLI would use anyway.
+ * `claude auth status` reports `email`, `orgId` and `orgName` for whichever directory
+ * `CLAUDE_CONFIG_DIR` names, so identity is readable per account. The variable is still left
+ * unset when the account is the directory the CLI would use anyway: same answer, one less
+ * variable in play.
+ *
+ * An earlier revision of this comment said those fields come back null whenever the variable is
+ * set, and three layers of the product were built on it. Re-verified against 2.1.220 that is
+ * wrong. Re-test a load-bearing claim about the CLI before building on it again.
  */
 export function defaultConfigDirectory(homeDirectory = os.homedir()): string {
   return path.join(homeDirectory, ".claude");

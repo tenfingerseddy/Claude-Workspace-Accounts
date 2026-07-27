@@ -2130,11 +2130,10 @@ export class CommandController {
   /**
    * Record what a probe found. Never a gate.
    *
-   * Claude Code reports `email`, `orgId` and `orgName` as null whenever `CLAUDE_CONFIG_DIR` is
-   * set, so a per-workspace account is signed in and perfectly usable while being
-   * unidentifiable. Refusing to store the account in that case is what abandoned registration
-   * and left users with an account that no workspace could use. Identity is recorded when the
-   * CLI supplies it and simply omitted when it does not.
+   * Identity is normally readable per account directory, but it is never required: an account can
+   * be signed out, and a probe can fail. Refusing to store the account in either case is what
+   * abandoned registration and left users with an account that no workspace could use. Identity is
+   * recorded when the CLI supplies it and simply omitted when it does not.
    */
   private async confirmIdentity(
     profile: AccountProfile,

@@ -112,7 +112,7 @@ export class DiagnosticsProvider {
     const identityState = identity === "mismatch"
       ? "Mismatch — a different Claude identity answers in that account"
       : identity === "unidentified"
-        ? "Unavailable — this Claude version reports no account details while a per-workspace account is in use, so drift cannot be detected"
+        ? "Unavailable — Claude returned no account details for it, so there is nothing recorded to detect a change against"
         : identity === "unconfirmed"
           ? "Not recorded — the account is used without a confirmed identity"
           : identity === "unverifiable"
