@@ -111,7 +111,7 @@ npm run check
 npm run package
 ```
 
-The packaged extension is written to `artifacts/claude-workspace-accounts.vsix`.
+The packaged extension is written to `artifacts/claude-workspace-account-manager.vsix`.
 
 ## First run
 

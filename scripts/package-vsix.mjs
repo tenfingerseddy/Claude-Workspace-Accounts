@@ -11,7 +11,7 @@ const { stdout, stderr } = await run(process.execPath, [
   "--target",
   "win32-x64",
   "--out",
-  "artifacts/claude-workspace-accounts.vsix"
+  "artifacts/claude-workspace-account-manager.vsix"
 ], { windowsHide: true });
 
 if (stdout) {

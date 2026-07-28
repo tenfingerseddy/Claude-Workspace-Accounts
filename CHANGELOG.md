@@ -6,8 +6,13 @@
 
 The product no longer guards anything — it selects which Claude account a workspace uses — so the
 name has changed. Because the extension `name` changed with it, this is a **new Marketplace listing**
-(`ResonanceLattice-Semanticus.claude-workspace-accounts`) rather than an update to
+(`ResonanceLattice-Semanticus.claude-workspace-account-manager`) rather than an update to
 `ResonanceLattice-Semanticus.claude-account-guard`.
+
+The listing slug is `claude-workspace-account-manager` rather than `claude-workspace-accounts`
+because the latter was already reserved on the Marketplace. That affects the listing ID and the VSIX
+filename only: the display name is still *Claude Workspace Accounts*, and the settings namespace,
+environment prefix, support directory, per-profile directory and wrapper executable are unchanged.
 
 - Display name `Claude Account Guard` → `Claude Workspace Accounts`; output channel and command
   category likewise.

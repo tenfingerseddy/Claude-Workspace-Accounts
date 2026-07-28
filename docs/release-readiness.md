@@ -77,7 +77,7 @@ Run on 2026-07-27 against the v0.2.0 rename, on Windows 11, Node 24:
 | `npm run typecheck` | passed |
 | `npm test` | passed — 219 tests across 18 files |
 | `npm run test:e2e` (includes both wrapper gates) | passed — argument fidelity 69 checks, wrapper guard 70 checks, status-line bridge 25 checks, plus the runtime/core/registry/repository/collector smoke tests |
-| `npm run package` | passed — `artifacts/claude-workspace-accounts.vsix` |
+| `npm run package` | passed — `artifacts/claude-workspace-account-manager.vsix` |
 
 The argument-fidelity gate's check count is unchanged by the rename: 69 before and after.
 

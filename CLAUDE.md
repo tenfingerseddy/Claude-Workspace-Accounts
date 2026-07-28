@@ -6,7 +6,17 @@ Windows-only VS Code extension for developers with more than one Claude Code acc
 signing in somewhere else does not change the account every other workspace uses. Local usage
 collection is a secondary feature.
 
-Published to the Marketplace as `ResonanceLattice-Semanticus.claude-workspace-accounts`.
+Published to the Marketplace as `ResonanceLattice-Semanticus.claude-workspace-account-manager`.
+
+**The Marketplace slug is not the product identity.** `claude-workspace-accounts` was already
+reserved by somebody else — invisible to Marketplace search, which lists nothing under that name, but
+it still refuses a new listing — so `package.json` `name` became `claude-workspace-account-manager`.
+Only the listing ID and the VSIX filename changed. `displayName` is still *Claude Workspace
+Accounts*, and the `claudeAccounts.` namespace, the `CLAUDE_WORKSPACE_ACCOUNTS_` prefix,
+`%LOCALAPPDATA%\ClaudeWorkspaceAccounts`, the `.claude-workspace-accounts` profile directory and
+`claude-workspace-accounts-wrapper.exe` are all independent constants that deliberately did **not**
+move. Nothing about that slug is load-bearing, and no migration is needed for it — do not "tidy" the
+others to match it.
 
 ## The rename, and why nothing may un-migrate
 
@@ -224,7 +234,7 @@ with one environment variable. Documentation must state the guarantee at that st
 npm run check      # lint + typecheck + vitest + full e2e chain. The gate.
 npm run build      # esbuild bundle + csc compile of the wrapper into bin/native/
 npm test           # vitest only
-npm run package    # -> artifacts/claude-workspace-accounts.vsix
+npm run package    # -> artifacts/claude-workspace-account-manager.vsix
 ```
 
 `npm run check` is the contract; run it before declaring anything done. `bin/native/` is gitignored, so
