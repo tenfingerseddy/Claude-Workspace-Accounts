@@ -1,6 +1,6 @@
 {
   "name": "claude-workspace-account-manager",
-  "displayName": "Claude Workspace Accounts",
+  "displayName": "Claude Workspace Account Manager",
   "description": "Give each VS Code workspace its own Claude Code account, see which one is in play, and inspect locally collected usage.",
   "version": "0.2.0",
   "type": "module",
