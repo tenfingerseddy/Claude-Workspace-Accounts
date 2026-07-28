@@ -12,3 +12,7 @@ Thumbs.db
 artifacts/
 .agents/
 .semanticus/
+
+# Working notes that land in this directory but belong to other projects. Two were committed by
+# a `git add -A` before anyone noticed them; ignoring the pattern stops the next one.
+*vision.md
